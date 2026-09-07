@@ -168,6 +168,19 @@ func (a *App) prepareSingleSendCommand(
 			return err
 		}
 		if notify {
+			// Streaming formats expose the durable receipt before the optional
+			// (and potentially slow) wakeup notification completes.
+			stream := format == outputFormatNDJSON || format == outputFormatYAML
+			if stream {
+				if err := a.writeSendOutput(format, full, result); err != nil {
+					return err
+				}
+				if format == outputFormatYAML {
+					if _, err := fmt.Fprintln(a.stdout, "---"); err != nil {
+						return err
+					}
+				}
+			}
 			outcome := SendNotificationOutcome{
 				Status: "failed",
 				Err:    errors.New("send notification is not configured"),
@@ -206,7 +219,7 @@ func (a *App) readBody(bodyFile string) ([]byte, error) {
 func (a *App) writeSendHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost send --to ADDRESS [--to ADDRESS ...] --body-file PATH [options] [--json | --yaml] [--full] [--notify]",
+		"  waypost send --to ADDRESS [--to ADDRESS ...] --body-file PATH [options] [--json | --ndjson | --yaml] [--full] [--notify]",
 		"",
 		"Options:",
 		"  --to ADDRESS           Recipient address (repeatable)",
@@ -218,6 +231,7 @@ func (a *App) writeSendHelp() {
 		"  --body-file PATH|-     Read body from a file or stdin",
 		"  --notify               Best-effort notify the recipient after sending",
 		"  --json                 Emit JSON",
+		"  --ndjson               Emit newline-delimited JSON",
 		"  --yaml                 Emit YAML",
 		"  --full                 Emit the full payload",
 	})

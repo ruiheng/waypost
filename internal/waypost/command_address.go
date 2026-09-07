@@ -82,7 +82,7 @@ func (a *App) writeAddressHelp() {
 func (a *App) writeAddressInspectHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost address inspect --address ADDRESS [--json | --yaml]",
+		"  waypost address inspect --address ADDRESS [--json | --ndjson | --yaml]",
 		"",
 		"Options:",
 		"  --address ADDRESS   Address to inspect",

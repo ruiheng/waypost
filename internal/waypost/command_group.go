@@ -455,7 +455,7 @@ func (a *App) writeGroupHelp() {
 func (a *App) writeGroupListHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost group list [--limit N] [--cursor CURSOR] [--json | --yaml]",
+		"  waypost group list [--limit N] [--cursor CURSOR] [--json | --ndjson | --yaml]",
 		"",
 		"Options:",
 		fmt.Sprintf("  --limit N          Page size (default %d, maximum %d)", DefaultPageSize, MaxPageSize),
@@ -468,7 +468,7 @@ func (a *App) writeGroupListHelp() {
 func (a *App) writeGroupCreateHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost group create --group ADDRESS [--json | --yaml]",
+		"  waypost group create --group ADDRESS [--json | --ndjson | --yaml]",
 		"",
 		"Options:",
 		"  --group ADDRESS     Group address",
@@ -480,7 +480,7 @@ func (a *App) writeGroupCreateHelp() {
 func (a *App) writeGroupAddMemberHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost group add-member --group ADDRESS --person PERSON [--json | --yaml]",
+		"  waypost group add-member --group ADDRESS --person PERSON [--json | --ndjson | --yaml]",
 		"",
 		"Options:",
 		"  --group ADDRESS     Group address",
@@ -493,7 +493,7 @@ func (a *App) writeGroupAddMemberHelp() {
 func (a *App) writeGroupRemoveMemberHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost group remove-member --group ADDRESS --person PERSON [--json | --yaml]",
+		"  waypost group remove-member --group ADDRESS --person PERSON [--json | --ndjson | --yaml]",
 		"",
 		"Options:",
 		"  --group ADDRESS     Group address",
@@ -506,7 +506,7 @@ func (a *App) writeGroupRemoveMemberHelp() {
 func (a *App) writeGroupMembersHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost group members --group ADDRESS [--limit N] [--cursor CURSOR] [--json | --yaml]",
+		"  waypost group members --group ADDRESS [--limit N] [--cursor CURSOR] [--json | --ndjson | --yaml]",
 		"",
 		"Options:",
 		"  --group ADDRESS     Group address",
@@ -520,7 +520,7 @@ func (a *App) writeGroupMembersHelp() {
 func (a *App) writeGroupAddSubscriberHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost group add-subscriber --group ADDRESS --notify-address ADDRESS --person PERSON [--json | --yaml]",
+		"  waypost group add-subscriber --group ADDRESS --notify-address ADDRESS --person PERSON [--json | --ndjson | --yaml]",
 		"",
 		"Options:",
 		"  --group ADDRESS           Group address",
@@ -534,7 +534,7 @@ func (a *App) writeGroupAddSubscriberHelp() {
 func (a *App) writeGroupRemoveSubscriberHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost group remove-subscriber --group ADDRESS --notify-address ADDRESS [--json | --yaml]",
+		"  waypost group remove-subscriber --group ADDRESS --notify-address ADDRESS [--json | --ndjson | --yaml]",
 		"",
 		"Options:",
 		"  --group ADDRESS           Group address",
@@ -547,7 +547,7 @@ func (a *App) writeGroupRemoveSubscriberHelp() {
 func (a *App) writeGroupSubscribersHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost group subscribers --group ADDRESS [--limit N] [--cursor CURSOR] [--json | --yaml]",
+		"  waypost group subscribers --group ADDRESS [--limit N] [--cursor CURSOR] [--json | --ndjson | --yaml]",
 		"",
 		"Options:",
 		"  --group ADDRESS     Group address",

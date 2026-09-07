@@ -1562,7 +1562,7 @@ func TestCLIStaleRequiresStructuredOutput(t *testing.T) {
 	if stale.stdout != "" {
 		t.Fatalf("stale plain-text stdout = %q, want empty", stale.stdout)
 	}
-	if !strings.Contains(stale.stderr, "either --json or --yaml is required") {
+	if !strings.Contains(stale.stderr, "either --json, --ndjson, or --yaml is required") {
 		t.Fatalf("stale plain-text stderr = %q, want structured-output error", stale.stderr)
 	}
 }
@@ -1989,7 +1989,7 @@ func TestCLIHelpExitsZeroAndPrintsUsage(t *testing.T) {
 		{
 			name:         "send help",
 			args:         []string{"send", "--help"},
-			wantContains: "Usage:\n  waypost send --to ADDRESS [--to ADDRESS ...] --body-file PATH [options] [--json | --yaml] [--full] [--notify]",
+			wantContains: "Usage:\n  waypost send --to ADDRESS [--to ADDRESS ...] --body-file PATH [options] [--json | --ndjson | --yaml] [--full] [--notify]",
 		},
 		{
 			name:         "renew help",
@@ -1999,32 +1999,32 @@ func TestCLIHelpExitsZeroAndPrintsUsage(t *testing.T) {
 		{
 			name:         "dead-letter help",
 			args:         []string{"dead-letter", "--help"},
-			wantContains: "Usage:\n  waypost dead-letter --delivery ID --lease-token TOKEN --reason TEXT [--json | --yaml]",
+			wantContains: "Usage:\n  waypost dead-letter --delivery ID --lease-token TOKEN --reason TEXT [--json | --ndjson | --yaml]",
 		},
 		{
 			name:         "stale help",
 			args:         []string{"stale", "--help"},
-			wantContains: "Usage:\n  waypost stale --for ADDRESS [--for ADDRESS ...] --older-than DURATION [--json | --yaml]",
+			wantContains: "Usage:\n  waypost stale --for ADDRESS [--for ADDRESS ...] --older-than DURATION [--json | --ndjson | --yaml]",
 		},
 		{
 			name:         "recv help",
 			args:         []string{"recv", "--help"},
-			wantContains: "Usage:\n  waypost recv --for ADDRESS [--for ADDRESS ...] [--max COUNT] [--json | --yaml] [--full]",
+			wantContains: "Usage:\n  waypost recv --for ADDRESS [--for ADDRESS ...] [--max COUNT] [--json | --ndjson | --yaml] [--full]",
 		},
 		{
 			name:         "read help",
 			args:         []string{"read", "--help"},
-			wantContains: "Usage:\n  waypost read ID [ID ...] [--json | --yaml]",
+			wantContains: "Usage:\n  waypost read ID [ID ...] [--json | --ndjson | --yaml]",
 		},
 		{
 			name:         "show help",
 			args:         []string{"show", "--help"},
-			wantContains: "Usage:\n  waypost read ID [ID ...] [--json | --yaml]",
+			wantContains: "Usage:\n  waypost read ID [ID ...] [--json | --ndjson | --yaml]",
 		},
 		{
 			name:         "watch help",
 			args:         []string{"watch", "--help"},
-			wantContains: "Usage:\n  waypost watch --for ADDRESS [--for ADDRESS ...] [--state STATE] [--timeout DURATION] [--json | --yaml]",
+			wantContains: "Usage:\n  waypost watch --for ADDRESS [--for ADDRESS ...] [--state STATE] [--timeout DURATION] [--json | --ndjson | --yaml]",
 		},
 		{
 			name:         "list help mentions delivery states",
@@ -2034,7 +2034,7 @@ func TestCLIHelpExitsZeroAndPrintsUsage(t *testing.T) {
 		{
 			name:         "wait help",
 			args:         []string{"wait", "--help"},
-			wantContains: "Usage:\n  waypost wait --for ADDRESS [--for ADDRESS ...] [--timeout DURATION] [--json | --yaml] [--full]",
+			wantContains: "Usage:\n  waypost wait --for ADDRESS [--for ADDRESS ...] [--timeout DURATION] [--json | --ndjson | --yaml] [--full]",
 		},
 	}
 
@@ -2070,7 +2070,7 @@ func TestCLIRejectsJSONAndYAMLTogether(t *testing.T) {
 	if send.stdout != "" {
 		t.Fatalf("send stdout = %q, want empty", send.stdout)
 	}
-	if !strings.Contains(send.stderr, "--json and --yaml are mutually exclusive") {
+	if !strings.Contains(send.stderr, "--json, --ndjson, and --yaml are mutually exclusive") {
 		t.Fatalf("send stderr = %q, want mutual exclusion error", send.stderr)
 	}
 }

@@ -617,8 +617,8 @@ func normalizeDirectReadIDs(values []string) ([]string, []string, error) {
 func (a *App) writeListHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost list --for ADDRESS [--from ADDRESS] [--state STATE] [--limit N] [--cursor CURSOR] [--json | --yaml]",
-		"  waypost list --for GROUP_ADDRESS --as PERSON [--from ADDRESS] [--limit N] [--cursor CURSOR] [--json | --yaml]",
+		"  waypost list --for ADDRESS [--from ADDRESS] [--state STATE] [--limit N] [--cursor CURSOR] [--json | --ndjson | --yaml]",
+		"  waypost list --for GROUP_ADDRESS --as PERSON [--from ADDRESS] [--limit N] [--cursor CURSOR] [--json | --ndjson | --yaml]",
 		"",
 		"Options:",
 		"  --for ADDRESS      Recipient address",
@@ -635,8 +635,8 @@ func (a *App) writeListHelp() {
 func (a *App) writeStaleHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost stale --for ADDRESS [--for ADDRESS ...] --older-than DURATION [--json | --yaml]",
-		"  waypost stale --for GROUP_ADDRESS --as PERSON --older-than DURATION [--json | --yaml]",
+		"  waypost stale --for ADDRESS [--for ADDRESS ...] --older-than DURATION [--json | --ndjson | --yaml]",
+		"  waypost stale --for GROUP_ADDRESS --as PERSON --older-than DURATION [--json | --ndjson | --yaml]",
 		"",
 		"Options:",
 		"  --for ADDRESS        Recipient address (repeatable)",
@@ -650,8 +650,8 @@ func (a *App) writeStaleHelp() {
 func (a *App) writeRecvHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost recv --for ADDRESS [--for ADDRESS ...] [--max COUNT] [--json | --yaml] [--full]",
-		"  waypost recv --for GROUP_ADDRESS --as PERSON [--json | --yaml] [--full]",
+		"  waypost recv --for ADDRESS [--for ADDRESS ...] [--max COUNT] [--json | --ndjson | --yaml] [--full]",
+		"  waypost recv --for GROUP_ADDRESS --as PERSON [--json | --ndjson | --yaml] [--full]",
 		"",
 		"Important:",
 		"  Use this CLI command only after confirming that the MCP waypost_recv tool is unavailable.",
@@ -669,10 +669,10 @@ func (a *App) writeRecvHelp() {
 func (a *App) writeReadHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost read ID [ID ...] [--json | --yaml]",
-		"  waypost read --message ID [--message ID ...] [--json | --yaml]",
-		"  waypost read --delivery ID [--delivery ID ...] [--json | --yaml]",
-		"  waypost read --latest --for ADDRESS [--for ADDRESS ...] [--from ADDRESS] [--state STATE] [--limit N] [--cursor CURSOR] [--json | --yaml]",
+		"  waypost read ID [ID ...] [--json | --ndjson | --yaml]",
+		"  waypost read --message ID [--message ID ...] [--json | --ndjson | --yaml]",
+		"  waypost read --delivery ID [--delivery ID ...] [--json | --ndjson | --yaml]",
+		"  waypost read --latest --for ADDRESS [--for ADDRESS ...] [--from ADDRESS] [--state STATE] [--limit N] [--cursor CURSOR] [--json | --ndjson | --yaml]",
 		"",
 		"Options:",
 		"  ID                  Read by id; dlv_ ids are deliveries, all others are messages (repeatable)",
@@ -692,7 +692,7 @@ func (a *App) writeReadHelp() {
 func (a *App) writeWatchHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost watch --for ADDRESS [--for ADDRESS ...] [--state STATE] [--timeout DURATION] [--json | --yaml]",
+		"  waypost watch --for ADDRESS [--for ADDRESS ...] [--state STATE] [--timeout DURATION] [--json | --ndjson | --yaml]",
 		"",
 		"Options:",
 		"  --for ADDRESS        Recipient address (repeatable)",
@@ -706,8 +706,8 @@ func (a *App) writeWatchHelp() {
 func (a *App) writeWaitHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost wait --for ADDRESS [--for ADDRESS ...] [--timeout DURATION] [--json | --yaml] [--full]",
-		"  waypost wait --for GROUP_ADDRESS --as PERSON [--timeout DURATION] [--json | --yaml] [--full]",
+		"  waypost wait --for ADDRESS [--for ADDRESS ...] [--timeout DURATION] [--json | --ndjson | --yaml] [--full]",
+		"  waypost wait --for GROUP_ADDRESS --as PERSON [--timeout DURATION] [--json | --ndjson | --yaml] [--full]",
 		"",
 		"Options:",
 		"  --for ADDRESS        Recipient address (repeatable)",

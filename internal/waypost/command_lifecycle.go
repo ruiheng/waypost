@@ -283,7 +283,7 @@ func (a *App) writeDeferHelp() {
 func (a *App) writeUndeferHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost undefer --delivery ID [--json | --yaml]",
+		"  waypost undefer --delivery ID [--json | --ndjson | --yaml]",
 		"",
 		"Options:",
 		"  --json              Emit JSON",
@@ -294,7 +294,7 @@ func (a *App) writeUndeferHelp() {
 func (a *App) writeFailHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost fail --delivery ID --lease-token TOKEN --reason TEXT [--json | --yaml]",
+		"  waypost fail --delivery ID --lease-token TOKEN --reason TEXT [--json | --ndjson | --yaml]",
 		"",
 		"Options:",
 		"  --json              Emit JSON",
@@ -305,7 +305,7 @@ func (a *App) writeFailHelp() {
 func (a *App) writeDeadLetterHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost dead-letter --delivery ID --lease-token TOKEN --reason TEXT [--json | --yaml]",
+		"  waypost dead-letter --delivery ID --lease-token TOKEN --reason TEXT [--json | --ndjson | --yaml]",
 		"",
 		"Options:",
 		"  --json              Emit JSON",

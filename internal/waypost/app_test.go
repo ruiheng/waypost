@@ -1601,22 +1601,22 @@ func TestHelpCLIPathsDoNotCreateRuntimeState(t *testing.T) {
 		{
 			name:         "send help",
 			args:         []string{"send", "--help"},
-			wantContains: "Usage:\n  waypost send --to ADDRESS [--to ADDRESS ...] --body-file PATH [options] [--json | --yaml] [--full] [--notify]",
+			wantContains: "Usage:\n  waypost send --to ADDRESS [--to ADDRESS ...] --body-file PATH [options] [--json | --ndjson | --yaml] [--full] [--notify]",
 		},
 		{
 			name:         "forward help",
 			args:         []string{"forward", "--help"},
-			wantContains: "Usage:\n  waypost forward (--message ID | --delivery ID) --to ADDRESS [options] [--json | --yaml] [--full]",
+			wantContains: "Usage:\n  waypost forward (--message ID | --delivery ID) --to ADDRESS [options] [--json | --ndjson | --yaml] [--full]",
 		},
 		{
 			name:         "stale help",
 			args:         []string{"stale", "--help"},
-			wantContains: "Usage:\n  waypost stale --for ADDRESS [--for ADDRESS ...] --older-than DURATION [--json | --yaml]\n  waypost stale --for GROUP_ADDRESS --as PERSON --older-than DURATION [--json | --yaml]",
+			wantContains: "Usage:\n  waypost stale --for ADDRESS [--for ADDRESS ...] --older-than DURATION [--json | --ndjson | --yaml]\n  waypost stale --for GROUP_ADDRESS --as PERSON --older-than DURATION [--json | --ndjson | --yaml]",
 		},
 		{
 			name:         "recv help",
 			args:         []string{"recv", "--help"},
-			wantContains: "Usage:\n  waypost recv --for ADDRESS [--for ADDRESS ...] [--max COUNT] [--json | --yaml] [--full]",
+			wantContains: "Usage:\n  waypost recv --for ADDRESS [--for ADDRESS ...] [--max COUNT] [--json | --ndjson | --yaml] [--full]",
 		},
 		{
 			name:         "recv help requires unavailable MCP tool",
@@ -1626,12 +1626,12 @@ func TestHelpCLIPathsDoNotCreateRuntimeState(t *testing.T) {
 		{
 			name:         "read help",
 			args:         []string{"read", "--help"},
-			wantContains: "Usage:\n  waypost read ID [ID ...] [--json | --yaml]",
+			wantContains: "Usage:\n  waypost read ID [ID ...] [--json | --ndjson | --yaml]",
 		},
 		{
 			name:         "watch help",
 			args:         []string{"watch", "--help"},
-			wantContains: "Usage:\n  waypost watch --for ADDRESS [--for ADDRESS ...] [--state STATE] [--timeout DURATION] [--json | --yaml]",
+			wantContains: "Usage:\n  waypost watch --for ADDRESS [--for ADDRESS ...] [--state STATE] [--timeout DURATION] [--json | --ndjson | --yaml]",
 		},
 		{
 			name:         "list help mentions delivery states",
@@ -1641,7 +1641,7 @@ func TestHelpCLIPathsDoNotCreateRuntimeState(t *testing.T) {
 		{
 			name:         "wait help",
 			args:         []string{"wait", "--help"},
-			wantContains: "Usage:\n  waypost wait --for ADDRESS [--for ADDRESS ...] [--timeout DURATION] [--json | --yaml] [--full]",
+			wantContains: "Usage:\n  waypost wait --for ADDRESS [--for ADDRESS ...] [--timeout DURATION] [--json | --ndjson | --yaml] [--full]",
 		},
 		{
 			name:         "undefer help",
@@ -1651,7 +1651,7 @@ func TestHelpCLIPathsDoNotCreateRuntimeState(t *testing.T) {
 		{
 			name:         "dead-letter help",
 			args:         []string{"dead-letter", "--help"},
-			wantContains: "Usage:\n  waypost dead-letter --delivery ID --lease-token TOKEN --reason TEXT [--json | --yaml]",
+			wantContains: "Usage:\n  waypost dead-letter --delivery ID --lease-token TOKEN --reason TEXT [--json | --ndjson | --yaml]",
 		},
 		{
 			name:         "group help",
@@ -1661,12 +1661,12 @@ func TestHelpCLIPathsDoNotCreateRuntimeState(t *testing.T) {
 		{
 			name:         "group list help",
 			args:         []string{"group", "list", "--help"},
-			wantContains: "Usage:\n  waypost group list [--limit N] [--cursor CURSOR] [--json | --yaml]",
+			wantContains: "Usage:\n  waypost group list [--limit N] [--cursor CURSOR] [--json | --ndjson | --yaml]",
 		},
 		{
 			name:         "group create help",
 			args:         []string{"group", "create", "--help"},
-			wantContains: "Usage:\n  waypost group create --group ADDRESS [--json | --yaml]",
+			wantContains: "Usage:\n  waypost group create --group ADDRESS [--json | --ndjson | --yaml]",
 		},
 		{
 			name:         "address help",
@@ -1676,7 +1676,7 @@ func TestHelpCLIPathsDoNotCreateRuntimeState(t *testing.T) {
 		{
 			name:         "address inspect help",
 			args:         []string{"address", "inspect", "--help"},
-			wantContains: "Usage:\n  waypost address inspect --address ADDRESS [--json | --yaml]",
+			wantContains: "Usage:\n  waypost address inspect --address ADDRESS [--json | --ndjson | --yaml]",
 		},
 	}
 

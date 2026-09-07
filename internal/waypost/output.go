@@ -23,27 +23,33 @@ const (
 	outputFormatText outputFormat = iota
 	outputFormatJSON
 	outputFormatYAML
+	outputFormatNDJSON
 )
 
 type outputFlags struct {
-	json bool
-	yaml bool
+	json   bool
+	yaml   bool
+	ndjson bool
 }
 
 func (f *outputFlags) register(fs *flag.FlagSet, jsonUsage, yamlUsage string) {
 	fs.BoolVar(&f.json, "json", false, jsonUsage)
 	fs.BoolVar(&f.yaml, "yaml", false, yamlUsage)
+	fs.BoolVar(&f.ndjson, "ndjson", false, "emit newline-delimited JSON")
 }
 
 func (f outputFlags) resolve() (outputFormat, error) {
-	if f.json && f.yaml {
-		return outputFormatText, errors.New("--json and --yaml are mutually exclusive")
+	if (f.json && f.yaml) || (f.json && f.ndjson) || (f.yaml && f.ndjson) {
+		return outputFormatText, errors.New("--json, --ndjson, and --yaml are mutually exclusive")
 	}
 	if f.yaml {
 		return outputFormatYAML, nil
 	}
 	if f.json {
 		return outputFormatJSON, nil
+	}
+	if f.ndjson {
+		return outputFormatNDJSON, nil
 	}
 	return outputFormatText, nil
 }
@@ -54,7 +60,7 @@ func (f outputFlags) resolveStructured() (outputFormat, error) {
 		return outputFormatText, err
 	}
 	if format == outputFormatText {
-		return outputFormatText, errors.New("either --json or --yaml is required")
+		return outputFormatText, errors.New("either --json, --ndjson, or --yaml is required")
 	}
 	return format, nil
 }
@@ -65,6 +71,8 @@ func (a *App) writeStructuredOutput(format outputFormat, value any) error {
 		encoder := json.NewEncoder(a.stdout)
 		encoder.SetIndent("", "  ")
 		return encoder.Encode(value)
+	case outputFormatNDJSON:
+		return json.NewEncoder(a.stdout).Encode(value)
 	case outputFormatYAML:
 		return writeYAML(a.stdout, value)
 	default:
@@ -633,7 +641,7 @@ func (a *App) newWatchEmitter(format outputFormat) (func(ListedDelivery) error, 
 	switch format {
 	case outputFormatText:
 		return a.writeListedDeliveryText, nil
-	case outputFormatJSON:
+	case outputFormatJSON, outputFormatNDJSON:
 		encoder := json.NewEncoder(a.stdout)
 		return func(delivery ListedDelivery) error {
 			return encoder.Encode(delivery)

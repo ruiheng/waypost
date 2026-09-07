@@ -76,7 +76,7 @@ func (a *App) prepareForwardCommand(args []string) (preparedCommand, error) {
 func (a *App) writeForwardHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost forward (--message ID | --delivery ID) --to ADDRESS [options] [--json | --yaml] [--full]",
+		"  waypost forward (--message ID | --delivery ID) --to ADDRESS [options] [--json | --ndjson | --yaml] [--full]",
 		"",
 		"Options:",
 		"  --message ID        Source message id",

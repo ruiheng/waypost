@@ -254,7 +254,7 @@ func (s *Service) registerWaypostTools(server *mcp.Server) {
 	}, s.waypostSend)
 	addToolRequiringWaypostStatus(server, s, &mcp.Tool{
 		Name:        "waypost_recv",
-		Description: "Claim one available delivery immediately; never blocks. Defaults to all bound addresses, and explicit personal addresses must be bound. After no_message, wait 15 seconds before retrying.",
+		Description: "Claim one available delivery immediately; never blocks. Defaults to all bound addresses, and explicit personal addresses must be bound.",
 		InputSchema: waypostRecvInputSchema(),
 	}, s.waypostRecv)
 	addToolRequiringWaypostStatus(server, s, &mcp.Tool{

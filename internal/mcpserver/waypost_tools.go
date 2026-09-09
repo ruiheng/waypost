@@ -249,17 +249,17 @@ func (s *Service) registerWaypostTools(server *mcp.Server) {
 	}
 	addToolRequiringWaypostStatus(server, s, &mcp.Tool{
 		Name:        "waypost_send",
-		Description: "Send a Waypost message. Set `to` to one recipient address for a single send, or an array of 1-10 recipient addresses for a batch. `from_address`, when supplied, must be one of this MCP server's currently bound personal addresses. Supply the content with exactly one of `body` or `body_file`; the latter is read by the MCP server only from the bound default_workdir. Push-notify a non-local target when supported. Set disable_notify_message=true to skip notification.",
+		Description: "Send a Waypost message to one recipient or a batch of up to 10. Provide exactly one of body or body_file; from_address must be bound, and body_file must be under default_workdir.",
 		InputSchema: waypostSendInputSchema(),
 	}, s.waypostSend)
 	addToolRequiringWaypostStatus(server, s, &mcp.Tool{
 		Name:        "waypost_recv",
-		Description: "Immediately claim an available delivery; never blocks. After a no_message result, wait at least 15 seconds before calling again. Repeated no_message results within 3 minutes warn against meaningless polling. This process's unacknowledged leases return a bounded ID hint; use known_delivery_ids to suppress known leases. On receive_recovery_required, release every returned claim before receiving again. Defaults to all bound addresses; addresses overrides that set for this call.",
+		Description: "Claim one available delivery immediately; never blocks. Defaults to all bound addresses, and explicit personal addresses must be bound. After no_message, wait 15 seconds before retrying.",
 		InputSchema: waypostRecvInputSchema(),
 	}, s.waypostRecv)
 	addToolRequiringWaypostStatus(server, s, &mcp.Tool{
 		Name:        "waypost_claim_history",
-		Description: "List deliveries claimed by this MCP process. By default, returns compact active claims without tokens; set delivery_id and recover_lease_token=true to recover a lost token, or diagnostics=true for claim timing and content-type detail.",
+		Description: "List deliveries claimed by this MCP process. Use delivery_id with recover_lease_token to recover a lease token; diagnostics adds claim details.",
 		InputSchema: waypostClaimHistoryInputSchema(),
 	}, s.waypostClaimHistory)
 	addToolRequiringWaypostStatus(server, s, &mcp.Tool{

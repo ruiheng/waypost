@@ -54,20 +54,20 @@ type sessionRequireInput struct {
 func (s *Service) registerSessionTools(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "session_create",
-		Description: "Create a session in an explicit workdir through Agent Deck or Thurbox; the parent may use a different workdir. Generic Agent Deck creation requires a top-level parent with a non-empty group and uses that parent's preflight group snapshot. The selected adapter consumes its applicable caller-supplied launch value: full_command_line for Agent Deck or thurbox_agent_key for Thurbox.",
+		Description: "Create a session through Agent Deck or Thurbox in an explicit workdir. Provide the selected host's launch value with full_command_line or thurbox_agent_key.",
 	}, s.sessionCreate)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "session_require",
-		Description: "Find and ensure existing sessions in an explicit workdir through Agent Deck or Thurbox. Returns not_found without an MCP error when absent. auto_restart defaults to true; set it false to inspect a stopped session without starting it. Never creates sessions.",
+		Description: "Find or restart existing sessions through Agent Deck or Thurbox in an explicit workdir. Never creates sessions; auto_restart defaults to true.",
 	}, s.sessionRequire)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "agent_deck_create_session",
-		Description: "Create a session in an explicit workdir; target must not exist. Supports group placement, parent linkage, detachment, and startup_instruction passed only to agent-deck launch --message.",
+		Description: "Create a new Agent Deck session in an explicit workdir. Supports group or parent linkage, detachment, and a startup instruction.",
 	}, s.agentDeckCreateSession)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "agent_deck_require_session",
-		Description: "Find and ensure one existing session ID/ref or multiple sessions in an explicit workdir. Returns not_found without an MCP error when absent. auto_restart defaults to true; set it false to inspect without starting. Never creates sessions.",
+		Description: "Find or restart Agent Deck sessions by ID or ref in an explicit workdir. Never creates sessions; auto_restart defaults to true.",
 	}, s.agentDeckRequireSession)
 }
 

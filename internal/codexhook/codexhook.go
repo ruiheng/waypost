@@ -143,7 +143,7 @@ func runWithDependencies(
 		if err := store.Save(input.SessionID, nudgePending); err != nil {
 			return err
 		}
-		availability, probeErr := detectWaypostMCP(ctx, probe)
+		availability, probeErr := probeWaypostMCP(ctx, input.SessionID, probe, store)
 		switch availability {
 		case waypostMCPUnknown:
 			return writeOutputWithSystemMessage(w, "UserPromptSubmit", MCPProbeFailedNudgeContext, mcpProbeFailureMessage(probeErr))
@@ -182,7 +182,7 @@ func runWithDependencies(
 		if waypostMCPCommandAlwaysDenied(command) {
 			return writeDenyOutput(w, denialReason)
 		}
-		availability, probeErr := detectWaypostMCP(ctx, probe)
+		availability, probeErr := probeWaypostMCP(ctx, input.SessionID, probe, store)
 		if availability == waypostMCPUnknown {
 			return writeSystemMessage(w, mcpProbeFailureMessage(probeErr))
 		}
@@ -191,7 +191,10 @@ func runWithDependencies(
 		}
 		return writeDenyOutput(w, denialReason)
 	case "SessionEnd":
-		return store.Clear(input.SessionID)
+		if err := store.Clear(input.SessionID); err != nil {
+			return err
+		}
+		return store.ClearMCPProbe(input.SessionID)
 	default:
 		return nil
 	}
@@ -265,6 +268,9 @@ const (
 type nudgeStateStore interface {
 	Load(sessionID string) (nudgeState, error)
 	Save(sessionID string, state nudgeState) error
+	LoadMCPProbe(sessionID string) (waypostMCPAvailability, bool, error)
+	SaveMCPProbe(sessionID string, availability waypostMCPAvailability) error
+	ClearMCPProbe(sessionID string) error
 	Clear(sessionID string) error
 }
 
@@ -275,6 +281,27 @@ type fileNudgeStateStore struct {
 type nudgeStateRecord struct {
 	SessionID string     `json:"session_id"`
 	State     nudgeState `json:"state"`
+}
+
+func probeWaypostMCP(ctx context.Context, sessionID string, probe waypostMCPProbe, store nudgeStateStore) (waypostMCPAvailability, error) {
+	// Some hook producers omit session_id for tool events. Do not make the
+	// optimization change those events' existing behavior; simply probe.
+	if strings.TrimSpace(sessionID) == "" {
+		return detectWaypostMCP(ctx, probe)
+	}
+	if availability, ok, err := store.LoadMCPProbe(sessionID); err != nil {
+		return waypostMCPUnknown, err
+	} else if ok {
+		return availability, nil
+	}
+	availability, err := detectWaypostMCP(ctx, probe)
+	if err != nil {
+		return availability, err
+	}
+	if err := store.SaveMCPProbe(sessionID, availability); err != nil {
+		return waypostMCPUnknown, err
+	}
+	return availability, nil
 }
 
 func defaultNudgeStateStore() (nudgeStateStore, error) {
@@ -361,6 +388,103 @@ func (store fileNudgeStateStore) Save(sessionID string, state nudgeState) error 
 	return nil
 }
 
+func (store fileNudgeStateStore) LoadMCPProbe(sessionID string) (waypostMCPAvailability, bool, error) {
+	sessionID, err := normalizedSessionID(sessionID)
+	if err != nil {
+		return waypostMCPUnknown, false, err
+	}
+	path, err := store.probePath(sessionID)
+	if err != nil {
+		return waypostMCPUnknown, false, err
+	}
+	contents, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return waypostMCPUnknown, false, nil
+	}
+	if err != nil {
+		return waypostMCPUnknown, false, fmt.Errorf("read Codex Waypost MCP probe %q: %w", path, err)
+	}
+	var record struct {
+		SessionID string `json:"session_id"`
+		Available *bool  `json:"available"`
+	}
+	if err := json.Unmarshal(contents, &record); err != nil {
+		return waypostMCPUnknown, false, fmt.Errorf("parse Codex Waypost MCP probe %q: %w", path, err)
+	}
+	if record.SessionID != sessionID {
+		return waypostMCPUnknown, false, fmt.Errorf("parse Codex Waypost MCP probe %q: session id mismatch", path)
+	}
+	if record.Available == nil {
+		return waypostMCPUnknown, false, fmt.Errorf("parse Codex Waypost MCP probe %q: missing available field", path)
+	}
+	if *record.Available {
+		return waypostMCPAvailable, true, nil
+	}
+	return waypostMCPUnavailable, true, nil
+}
+
+func (store fileNudgeStateStore) SaveMCPProbe(sessionID string, availability waypostMCPAvailability) error {
+	if availability != waypostMCPAvailable && availability != waypostMCPUnavailable {
+		return errors.New("save Codex Waypost MCP probe: invalid availability")
+	}
+	sessionID, err := normalizedSessionID(sessionID)
+	if err != nil {
+		return err
+	}
+	path, err := store.probePath(sessionID)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(store.dir, 0o700); err != nil {
+		return fmt.Errorf("create Codex Waypost nudge state directory %q: %w", store.dir, err)
+	}
+	contents, _ := json.Marshal(struct {
+		SessionID string `json:"session_id"`
+		Available bool   `json:"available"`
+	}{sessionID, availability == waypostMCPAvailable})
+	contents = append(contents, '\n')
+	temporary, err := os.CreateTemp(store.dir, ".mcp-state.tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary Codex Waypost MCP probe: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer func() {
+		_ = temporary.Close()
+		_ = os.Remove(temporaryPath)
+	}()
+	if err := temporary.Chmod(0o600); err != nil {
+		return fmt.Errorf("set Codex Waypost MCP probe permissions: %w", err)
+	}
+	if _, err := temporary.Write(contents); err != nil {
+		return fmt.Errorf("write Codex Waypost MCP probe: %w", err)
+	}
+	if err := temporary.Sync(); err != nil {
+		return fmt.Errorf("sync Codex Waypost MCP probe: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close Codex Waypost MCP probe: %w", err)
+	}
+	if err := replaceHooksFile(temporaryPath, path); err != nil {
+		return fmt.Errorf("replace Codex Waypost MCP probe %q: %w", path, err)
+	}
+	return nil
+}
+
+func (store fileNudgeStateStore) ClearMCPProbe(sessionID string) error {
+	sessionID, err := normalizedSessionID(sessionID)
+	if err != nil {
+		return err
+	}
+	path, err := store.probePath(sessionID)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove Codex Waypost MCP probe %q: %w", path, err)
+	}
+	return nil
+}
+
 func (store fileNudgeStateStore) Clear(sessionID string) error {
 	sessionID, err := normalizedSessionID(sessionID)
 	if err != nil {
@@ -385,12 +509,21 @@ func (store fileNudgeStateStore) path(sessionID string) (string, error) {
 	return filepath.Join(store.dir, fmt.Sprintf("%x.json", digest)), nil
 }
 
+func (store fileNudgeStateStore) probePath(sessionID string) (string, error) {
+	path, err := store.path(sessionID)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(path, ".json") + ".mcp.json", nil
+}
+
 type memoryNudgeStateStore struct {
 	states map[string]nudgeState
+	probes map[string]waypostMCPAvailability
 }
 
 func newMemoryNudgeStateStore() *memoryNudgeStateStore {
-	return &memoryNudgeStateStore{states: make(map[string]nudgeState)}
+	return &memoryNudgeStateStore{states: make(map[string]nudgeState), probes: make(map[string]waypostMCPAvailability)}
 }
 
 func (store *memoryNudgeStateStore) Load(sessionID string) (nudgeState, error) {
@@ -407,6 +540,36 @@ func (store *memoryNudgeStateStore) Save(sessionID string, state nudgeState) err
 		return err
 	}
 	store.states[sessionID] = state
+	return nil
+}
+
+func (store *memoryNudgeStateStore) LoadMCPProbe(sessionID string) (waypostMCPAvailability, bool, error) {
+	sessionID, err := normalizedSessionID(sessionID)
+	if err != nil {
+		return waypostMCPUnknown, false, err
+	}
+	availability, ok := store.probes[sessionID]
+	return availability, ok, nil
+}
+
+func (store *memoryNudgeStateStore) SaveMCPProbe(sessionID string, availability waypostMCPAvailability) error {
+	sessionID, err := normalizedSessionID(sessionID)
+	if err != nil {
+		return err
+	}
+	if availability != waypostMCPAvailable && availability != waypostMCPUnavailable {
+		return errors.New("save Codex Waypost MCP probe: invalid availability")
+	}
+	store.probes[sessionID] = availability
+	return nil
+}
+
+func (store *memoryNudgeStateStore) ClearMCPProbe(sessionID string) error {
+	sessionID, err := normalizedSessionID(sessionID)
+	if err != nil {
+		return err
+	}
+	delete(store.probes, sessionID)
 	return nil
 }
 

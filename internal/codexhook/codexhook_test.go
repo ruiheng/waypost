@@ -354,6 +354,48 @@ printf '%s\n' '{"name":"waypost","enabled":true}'
 	}
 }
 
+func TestRunReusesMCPProbeForSession(t *testing.T) {
+	store := newMemoryNudgeStateStore()
+	probeCalls := 0
+	probe := func(context.Context) (bool, error) {
+		probeCalls++
+		return true, nil
+	}
+	for _, input := range []hookInput{
+		{HookEventName: "UserPromptSubmit", SessionID: "cached-session", Prompt: defaultNudgeMessage},
+		{HookEventName: "UserPromptSubmit", SessionID: "cached-session", Prompt: "ordinary prompt"},
+		{HookEventName: "SessionStart", SessionID: "cached-session", Source: "compact"},
+		{HookEventName: "PreToolUse", SessionID: "cached-session", ToolName: "Bash", ToolInput: json.RawMessage(`{"command":"waypost recv"}`)},
+	} {
+		var output bytes.Buffer
+		encoded, err := json.Marshal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := runWithDependencies(context.Background(), bytes.NewReader(encoded), &output, probe, store); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if probeCalls != 1 {
+		t.Fatalf("probe calls = %d, want 1", probeCalls)
+	}
+}
+
+func TestFileMCPProbeRejectsMissingAvailability(t *testing.T) {
+	store := fileNudgeStateStore{dir: t.TempDir()}
+	sessionID := "incomplete-probe"
+	path, err := store.probePath(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"session_id":"incomplete-probe"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.LoadMCPProbe(sessionID); err == nil || ok {
+		t.Fatalf("LoadMCPProbe() = ok %v, err %v; want parse error", ok, err)
+	}
+}
+
 func TestRunUserPromptSkipsOrdinaryWaypostDiscussion(t *testing.T) {
 	t.Parallel()
 

@@ -52,6 +52,7 @@ const MCPStatusDenialReason = `The Waypost MCP tool waypost_status is available.
 const MCPServerCommandDenialReason = `The Waypost MCP server is managed by Codex. Never run the Waypost CLI command ` + "`waypost mcp`" + `.`
 
 var waypostMCPCommandBlacklist = map[string]string{
+	"ack":     "waypost_ack",
 	"recv":    "waypost_recv",
 	"receive": "waypost_recv",
 	"send":    "waypost_send",

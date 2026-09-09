@@ -417,6 +417,11 @@ func TestRunPreToolUseDeniesMCPPreferredWaypostCLICommands(t *testing.T) {
 			wantReason: "MCP tool waypost_status is available",
 		},
 		{
+			name:       "ack",
+			command:    "waypost ack --delivery dlv_1 --lease-token lease_1",
+			wantReason: "MCP tool waypost_ack is available",
+		},
+		{
 			name:       "recv",
 			command:    "waypost recv --for workflow/reviewer",
 			wantReason: "MCP tool waypost_recv is available",
@@ -614,6 +619,7 @@ func TestWaypostMCPDenialReason(t *testing.T) {
 		wantTool string
 	}{
 		{"waypost status", "waypost_status"},
+		{"waypost ack --delivery dlv_1 --lease-token lease_1", "waypost_ack"},
 		{"/home/alice/.local/bin/waypost --state-dir /tmp/state recv", "waypost_recv"},
 		{`& "C:\Users\alice\.local\bin\waypost.exe" receive`, "waypost_recv"},
 		{"waypost --state-dir=/tmp/state send", "waypost_send"},

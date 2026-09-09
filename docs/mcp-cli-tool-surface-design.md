@@ -294,6 +294,11 @@ Received:
 }
 ```
 
+When the post-receive snapshot contains one or more queued deliveries, the
+default MCP result also includes `notice: "more_messages_available"`. This is
+an informational cue for agents to call `waypost_recv` again; the next call
+still determines whether a queued delivery is currently visible and claimable.
+
 No message:
 
 ```json
@@ -301,6 +306,9 @@ No message:
   "status": "no_message"
 }
 ```
+
+The same `notice` cue is included on `no_message` when queued deliveries
+remain in the mailbox snapshot.
 
 After a `no_message` result, the same MCP connection must wait at least 15
 seconds before calling `waypost_recv` again. If the next result is also

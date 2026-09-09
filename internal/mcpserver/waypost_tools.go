@@ -934,6 +934,13 @@ func (s *Service) waypostRecv(ctx context.Context, req *mcp.CallToolRequest, inp
 		out := map[string]any{
 			"status": "no_message",
 		}
+		// Make remaining queued work visible in the default MCP response. The
+		// diagnostics-only remaining_by_state map is easy for agents to miss.
+		// This is an informational hint; the next receive still decides whether
+		// a queued delivery is currently visible/claimable.
+		if delivery.RemainingByState["queued"] > 0 {
+			out["notice"] = "more_messages_available"
+		}
 		if finishRecv("no_message") {
 			warnings = append(warnings, waypostRecvPollingWarning)
 		}
@@ -988,6 +995,9 @@ func (s *Service) waypostRecv(ctx context.Context, req *mcp.CallToolRequest, inp
 	out := map[string]any{
 		"status":   "received",
 		"delivery": waypost.CompactReceivedMessage(delivery.Messages[0]),
+	}
+	if delivery.RemainingByState["queued"] > 0 {
+		out["notice"] = "more_messages_available"
 	}
 	if len(warnings) > 0 {
 		out["warnings"] = warnings

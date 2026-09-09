@@ -503,6 +503,7 @@ func TestReceiveRecoveryTracksAndRenewsEveryUnreleasedClaim(t *testing.T) {
 	})
 	defer service.Close()
 	service.state.autoBindAttempted = true
+	service.state.boundAddresses = []string{"agent-deck/one", "agent-deck/two"}
 
 	output := callServiceTool(t, service, "waypost_recv", map[string]any{
 		"addresses":   []string{"agent-deck/one", "agent-deck/two"},

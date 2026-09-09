@@ -3891,6 +3891,25 @@ func TestWaypostRecvRejectsInvalidExplicitAddress(t *testing.T) {
 	}
 }
 
+func TestWaypostRecvRejectsUnboundExplicitAddress(t *testing.T) {
+	service := newService(Options{
+		WaypostServiceFactory: fakeWaypostServiceFactory{service: &fakeWaypostService{t: t}},
+		CommandRunner: &fakeRunner{t: t, handler: func(args []string, input string) (RunResult, error) {
+			t.Fatalf("unexpected command call: %v", args)
+			return RunResult{}, nil
+		}},
+	})
+	service.state.autoBindAttempted = true
+	service.state.boundAddresses = []string{"agent-deck/bound"}
+
+	err := callServiceToolExpectError(t, service, "waypost_recv", map[string]any{
+		"addresses": []string{"agent-deck/unbound"},
+	})
+	if err == nil || !strings.Contains(err.Error(), `not bound to this MCP server`) {
+		t.Fatalf("waypost_recv error = %v, want unbound-address error", err)
+	}
+}
+
 func TestServiceServerReturnsStableInstance(t *testing.T) {
 	service := newService(Options{
 		WaypostServiceFactory: fakeWaypostServiceFactory{service: &fakeWaypostService{t: t}},

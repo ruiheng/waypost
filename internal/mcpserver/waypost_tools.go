@@ -861,11 +861,20 @@ func (s *Service) waypostRecv(ctx context.Context, req *mcp.CallToolRequest, inp
 	if err := validateMCPItems("known_delivery_ids", len(input.KnownDeliveryIDs)); err != nil {
 		return nil, nil, err
 	}
-	addresses, err := s.sessions.waypostAddresses(ctx, input.Addresses)
+	person := strings.TrimSpace(input.AsPerson)
+	var addresses []string
+	var err error
+	if person != "" {
+		// Group addresses are not MCP bindings; group membership is the
+		// authorization boundary for this receive mode.
+		addresses, err = s.sessions.waypostAddresses(ctx, input.Addresses)
+	} else {
+		addresses, err = s.sessions.waypostReceiveAddresses(ctx, input.Addresses)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
-	if person := strings.TrimSpace(input.AsPerson); person != "" {
+	if person != "" {
 		return s.waypostRecvGroup(ctx, req, addresses, person, input.Diagnostics)
 	}
 	recvGuard, err := s.waypostRecvGuard.begin(req, s.now, s.waypostRecvActiveSessions())

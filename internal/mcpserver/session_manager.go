@@ -742,6 +742,31 @@ func (m *sessionManager) waypostAddresses(ctx context.Context, addresses []strin
 	return append([]string(nil), bound.BoundAddresses...), nil
 }
 
+// waypostReceiveAddresses resolves a personal receive scope. Explicit
+// addresses are intentionally limited to this MCP server's bound addresses;
+// otherwise waypost_recv could inspect queues outside the session's ownership
+// boundary.
+func (m *sessionManager) waypostReceiveAddresses(ctx context.Context, addresses []string) ([]string, error) {
+	resolved, err := m.waypostAddresses(ctx, addresses)
+	if err != nil {
+		return nil, err
+	}
+	if len(addresses) == 0 {
+		return resolved, nil
+	}
+
+	bound, err := m.boundState(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, address := range resolved {
+		if !slices.Contains(bound.BoundAddresses, address) {
+			return nil, fmt.Errorf("receive address %q is not bound to this MCP server", address)
+		}
+	}
+	return resolved, nil
+}
+
 func (m *sessionManager) senderAddress(ctx context.Context, override string) (string, error) {
 	if strings.TrimSpace(override) != "" {
 		address, err := waypost.NormalizeAddress(override)

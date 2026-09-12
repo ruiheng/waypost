@@ -1,9 +1,9 @@
 //go:build !windows
 
-package codexhook
+package hookcore
 
 import "os"
 
-func replaceHooksFile(replacementPath, destinationPath string) error {
+func replaceFile(replacementPath, destinationPath string) error {
 	return os.Rename(replacementPath, destinationPath)
 }

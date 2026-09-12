@@ -38,7 +38,7 @@ const (
 	defaultStartupInstruction    = ""
 	defaultNotifyMessage         = "NOTICE: There might be new delivery in waypost."
 	agentDeckBindRecoveryHint    = "agent-deck address auto-bind did not find your current session; run `agent-deck session current --json` to find your `agent-deck/<session-id>` address, then call `waypost_bind` with that address."
-	toolSessionBindRecoveryHint  = "AI tool session auto-bind did not find codex/..., claude/..., gemini/..., or opencode/...; expose CODEX_THREAD_ID, CLAUDE_CODE_SESSION_ID, GEMINI_SESSION_ID, or OPENCODE_SESSION_ID, wait for agent-deck state sync for the current session, then call `waypost_status` again or call `waypost_bind` manually."
+	toolSessionBindRecoveryHint  = "AI tool session auto-bind did not find codex/..., claude/..., gemini/..., opencode/..., or devin/...; expose CODEX_THREAD_ID, CLAUDE_CODE_SESSION_ID, GEMINI_SESSION_ID, OPENCODE_SESSION_ID, or DEVIN_SESSION_ID, wait for agent-deck state sync for the current session, then call `waypost_status` again or call `waypost_bind` manually."
 	unsetValue                   = "<unset>"
 )
 

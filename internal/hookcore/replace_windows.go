@@ -1,6 +1,6 @@
 //go:build windows
 
-package codexhook
+package hookcore
 
 import (
 	"errors"
@@ -15,7 +15,7 @@ const replaceFileWriteThrough = 0x00000001
 
 var replaceFileW = syscall.NewLazyDLL("kernel32.dll").NewProc("ReplaceFileW")
 
-func replaceHooksFile(replacementPath, destinationPath string) error {
+func replaceFile(replacementPath, destinationPath string) error {
 	_, err := os.Lstat(destinationPath)
 	switch {
 	case err == nil:

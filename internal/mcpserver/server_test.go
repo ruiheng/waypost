@@ -8598,6 +8598,297 @@ func TestInvalidCodexThreadEnvFallsBackToProcessProbe(t *testing.T) {
 	}
 }
 
+func TestDevinSessionIDValidationFailure(t *testing.T) {
+	t.Parallel()
+
+	for _, sessionID := range []string{
+		"truth-alarm",
+		"grizzled-parakeet",
+		"abc",
+		"session.v2_beta-1",
+		"01234567-89ab-cdef-0123-456789abcdef",
+	} {
+		if failure := devinSessionIDValidationFailure(sessionID); failure != "" {
+			t.Errorf("devinSessionIDValidationFailure(%q) = %q, want valid", sessionID, failure)
+		}
+	}
+	for _, sessionID := range []string{
+		"",
+		"ab",
+		"bad--id",
+		"-leading",
+		"trailing-",
+		"has space",
+		"has/slash",
+		"has:colon",
+	} {
+		if failure := devinSessionIDValidationFailure(sessionID); failure == "" {
+			t.Errorf("devinSessionIDValidationFailure(%q) = valid, want failure", sessionID)
+		}
+	}
+}
+
+func TestInvalidDevinSessionEnvWarnsWithDevinHint(t *testing.T) {
+	isolateAutoBindEnv(t)
+	t.Setenv("CODEX_THREAD_ID", "0123456789abcdef")
+	t.Setenv("DEVIN_SESSION_ID", "bad--id")
+
+	runner := &fakeRunner{t: t}
+	runner.handler = func(args []string, _ string) (RunResult, error) {
+		switch {
+		case len(args) >= 1 && args[0] == "ps":
+			return RunResult{ExitCode: 1}, nil
+		case strings.Join(args, "\x00") == strings.Join([]string{"agent-deck", "session", "current", "--json"}, "\x00"):
+			return RunResult{ExitCode: 1, Stderr: "not in an agent-deck pane"}, nil
+		default:
+			t.Fatalf("unexpected command: %v", args)
+			return RunResult{}, nil
+		}
+	}
+
+	service := newService(Options{
+		WaypostServiceFactory: fakeWaypostServiceFactory{service: &fakeWaypostService{t: t}},
+		CommandRunner:         runner,
+		DisableWakeScheduler:  true,
+		DisableLeaseRenewLoop: true,
+	})
+
+	status := callServiceTool(t, service, "waypost_status", nil)
+	if got := status["default_sender"]; got != "codex/0123456789abcdef" {
+		t.Fatalf("default_sender = %v, want codex fallback", got)
+	}
+	warnings, ok := status["warnings"].([]any)
+	if !ok {
+		t.Fatalf("warnings = %#v, want warning list", status["warnings"])
+	}
+	found := false
+	for _, warning := range warnings {
+		text := fmt.Sprint(warning)
+		if strings.Contains(text, "DEVIN_SESSION_ID") && strings.Contains(text, "does not look like a devin session id") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("warnings = %#v, want invalid DEVIN_SESSION_ID warning", warnings)
+	}
+}
+
+func TestAutoBindFindsDevinSessionFromProcessArgs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process probe requires Unix")
+	}
+	isolateAutoBindEnv(t)
+
+	runner := &fakeRunner{t: t}
+	runner.handler = func(args []string, _ string) (RunResult, error) {
+		switch {
+		case len(args) >= 1 && args[0] == "ps":
+			return RunResult{ExitCode: 0, Stdout: "4242 1 devin /Users/alice/.local/bin/devin --resume grizzled-parakeet"}, nil
+		case len(args) >= 1 && args[0] == "lsof":
+			t.Fatalf("unexpected lsof probe when --resume exposes the session id: %v", args)
+			return RunResult{}, nil
+		default:
+			t.Fatalf("unexpected command: %v", args)
+			return RunResult{}, nil
+		}
+	}
+
+	service := newService(Options{
+		WaypostServiceFactory: fakeWaypostServiceFactory{service: &fakeWaypostService{t: t}},
+		CommandRunner:         runner,
+		DisableWakeScheduler:  true,
+		DisableLeaseRenewLoop: true,
+	})
+	service.sessions.parentPID = func() int { return 4242 }
+
+	ids, warnings := service.sessions.detectCurrentToolSessionIDs(context.Background())
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %#v, want none", warnings)
+	}
+	if got := ids["devin"]; got != "grizzled-parakeet" {
+		t.Fatalf("ids[devin] = %q, want grizzled-parakeet", got)
+	}
+}
+
+func TestAutoBindRejectsInvalidDevinSessionIDFromProcessArgs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process probe requires Unix")
+	}
+	isolateAutoBindEnv(t)
+
+	runner := &fakeRunner{t: t}
+	runner.handler = func(args []string, _ string) (RunResult, error) {
+		switch {
+		case len(args) >= 1 && args[0] == "ps":
+			return RunResult{ExitCode: 0, Stdout: "4242 1 devin /Users/alice/.local/bin/devin --resume abc-"}, nil
+		case len(args) >= 1 && args[0] == "lsof":
+			return RunResult{ExitCode: 0, Stdout: "devin 4242 alice 3r REG 1,4 10240 123 /Users/alice/.local/share/devin/cli/session_locks/truth-alarm.lock"}, nil
+		default:
+			t.Fatalf("unexpected command: %v", args)
+			return RunResult{}, nil
+		}
+	}
+
+	service := newService(Options{
+		WaypostServiceFactory: fakeWaypostServiceFactory{service: &fakeWaypostService{t: t}},
+		CommandRunner:         runner,
+		DisableWakeScheduler:  true,
+		DisableLeaseRenewLoop: true,
+	})
+	service.sessions.parentPID = func() int { return 4242 }
+
+	ids, warnings := service.sessions.detectCurrentToolSessionIDs(context.Background())
+	if len(warnings) != 1 || !strings.Contains(warnings[0], `"abc-"`) {
+		t.Fatalf("warnings = %#v, want one invalid --resume id warning", warnings)
+	}
+	if got := ids["devin"]; got != "truth-alarm" {
+		t.Fatalf("ids[devin] = %q, want truth-alarm from the session lock fallback", got)
+	}
+}
+
+func TestAutoBindRejectsInvalidDevinSessionIDFromSessionLock(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process probe requires Unix")
+	}
+	isolateAutoBindEnv(t)
+
+	runner := &fakeRunner{t: t}
+	runner.handler = func(args []string, _ string) (RunResult, error) {
+		switch {
+		case len(args) >= 1 && args[0] == "ps":
+			return RunResult{ExitCode: 0, Stdout: "4242 1 devin /Users/alice/.local/bin/devin acp"}, nil
+		case len(args) >= 1 && args[0] == "lsof":
+			return RunResult{ExitCode: 0, Stdout: "devin 4242 alice 3r REG 1,4 10240 123 /Users/alice/.local/share/devin/cli/session_locks/ab.lock"}, nil
+		default:
+			t.Fatalf("unexpected command: %v", args)
+			return RunResult{}, nil
+		}
+	}
+
+	service := newService(Options{
+		WaypostServiceFactory: fakeWaypostServiceFactory{service: &fakeWaypostService{t: t}},
+		CommandRunner:         runner,
+		DisableWakeScheduler:  true,
+		DisableLeaseRenewLoop: true,
+	})
+	service.sessions.parentPID = func() int { return 4242 }
+
+	ids, warnings := service.sessions.detectCurrentToolSessionIDs(context.Background())
+	if len(warnings) != 1 || !strings.Contains(warnings[0], `"ab"`) {
+		t.Fatalf("warnings = %#v, want one invalid session lock id warning", warnings)
+	}
+	if got := ids["devin"]; got != "" {
+		t.Fatalf("ids[devin] = %q, want empty for invalid lock id", got)
+	}
+}
+
+func TestAutoBindFindsDevinSessionFromSessionLock(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process probe requires Unix")
+	}
+	isolateAutoBindEnv(t)
+
+	runner := &fakeRunner{t: t}
+	runner.handler = func(args []string, _ string) (RunResult, error) {
+		switch {
+		case len(args) >= 1 && args[0] == "ps":
+			return RunResult{ExitCode: 0, Stdout: "4242 1 devin /Users/alice/.local/bin/devin acp"}, nil
+		case len(args) >= 1 && args[0] == "lsof":
+			return RunResult{ExitCode: 0, Stdout: "COMMAND  PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\ndevin   4242 alice    3r   REG    1,4    10240  123 /Users/alice/.local/share/devin/cli/session_locks/truth-alarm.lock"}, nil
+		default:
+			t.Fatalf("unexpected command: %v", args)
+			return RunResult{}, nil
+		}
+	}
+
+	service := newService(Options{
+		WaypostServiceFactory: fakeWaypostServiceFactory{service: &fakeWaypostService{t: t}},
+		CommandRunner:         runner,
+		DisableWakeScheduler:  true,
+		DisableLeaseRenewLoop: true,
+	})
+	service.sessions.parentPID = func() int { return 4242 }
+
+	ids, warnings := service.sessions.detectCurrentToolSessionIDs(context.Background())
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %#v, want none", warnings)
+	}
+	if got := ids["devin"]; got != "truth-alarm" {
+		t.Fatalf("ids[devin] = %q, want truth-alarm", got)
+	}
+}
+
+func TestAutoBindSkipsDevinProcessProbeWithoutDevinEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process probe requires Unix")
+	}
+	isolateAutoBindEnv(t)
+	t.Setenv("CODEX_THREAD_ID", "0123456789abcdef")
+
+	runner := &fakeRunner{t: t}
+	runner.handler = func(args []string, _ string) (RunResult, error) {
+		t.Fatalf("unexpected command without a Devin process signal: %v", args)
+		return RunResult{}, nil
+	}
+
+	service := newService(Options{
+		WaypostServiceFactory: fakeWaypostServiceFactory{service: &fakeWaypostService{t: t}},
+		CommandRunner:         runner,
+		DisableWakeScheduler:  true,
+		DisableLeaseRenewLoop: true,
+	})
+	service.sessions.parentPID = func() int { return 4242 }
+
+	ids, warnings := service.sessions.detectCurrentToolSessionIDs(context.Background())
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %#v, want none", warnings)
+	}
+	if got := ids["devin"]; got != "" {
+		t.Fatalf("ids[devin] = %q, want empty without a Devin signal", got)
+	}
+	if got := ids["codex"]; got != "0123456789abcdef" {
+		t.Fatalf("ids[codex] = %q, want env session", got)
+	}
+}
+
+func TestAutoBindProbesDevinWhenChiselSessionDBIsSet(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process probe requires Unix")
+	}
+	isolateAutoBindEnv(t)
+	t.Setenv("CODEX_THREAD_ID", "0123456789abcdef")
+	t.Setenv("CHISEL_SESSION_DB", "/Users/alice/.local/share/devin/cli/sessions.db")
+
+	runner := &fakeRunner{t: t}
+	runner.handler = func(args []string, _ string) (RunResult, error) {
+		switch {
+		case len(args) >= 1 && args[0] == "ps":
+			return RunResult{ExitCode: 0, Stdout: "4242 1 devin /Users/alice/.local/bin/devin acp"}, nil
+		case len(args) >= 1 && args[0] == "lsof":
+			return RunResult{ExitCode: 0, Stdout: "devin 4242 alice 3r REG 1,4 10240 123 /Users/alice/.local/share/devin/cli/session_locks/calm-finch.lock"}, nil
+		default:
+			t.Fatalf("unexpected command: %v", args)
+			return RunResult{}, nil
+		}
+	}
+
+	service := newService(Options{
+		WaypostServiceFactory: fakeWaypostServiceFactory{service: &fakeWaypostService{t: t}},
+		CommandRunner:         runner,
+		DisableWakeScheduler:  true,
+		DisableLeaseRenewLoop: true,
+	})
+	service.sessions.parentPID = func() int { return 4242 }
+
+	ids, warnings := service.sessions.detectCurrentToolSessionIDs(context.Background())
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %#v, want none", warnings)
+	}
+	if got := ids["devin"]; got != "calm-finch" {
+		t.Fatalf("ids[devin] = %q, want calm-finch", got)
+	}
+}
+
 func TestAutoBindFindsClaudeCodeSessionFromEnv(t *testing.T) {
 	tests := []struct {
 		name              string
@@ -8630,6 +8921,14 @@ func TestAutoBindFindsClaudeCodeSessionFromEnv(t *testing.T) {
 			wantDefaultSender: "opencode/cccccccccccccccc",
 			wantAddresses:     []any{"opencode/cccccccccccccccc"},
 			wantDetectedKey:   "detected_opencode_session_id",
+		},
+		{
+			name:              "devin",
+			envName:           "DEVIN_SESSION_ID",
+			envValue:          "truth-alarm",
+			wantDefaultSender: "devin/truth-alarm",
+			wantAddresses:     []any{"devin/truth-alarm"},
+			wantDetectedKey:   "detected_devin_session_id",
 		},
 	}
 
@@ -9536,6 +9835,7 @@ func isolateAutoBindEnv(t *testing.T) {
 	for _, name := range toolSessionEnvNames() {
 		t.Setenv(name, "")
 	}
+	t.Setenv("CHISEL_SESSION_DB", "")
 	t.Setenv("AGENTDECK_INSTANCE_ID", "")
 	t.Setenv("AGENTDECK_PROFILE", "")
 }

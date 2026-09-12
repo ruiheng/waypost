@@ -194,10 +194,18 @@ Run the MCP server directly:
 ```
 
 Register the built-in server in Codex's global MCP configuration (and in
-Claude Code or agy when those agents are installed):
+Claude Code, agy, or Devin when those agents are installed):
 
 ```bash
 waypost install mcp-server
+```
+
+Install the Devin lifecycle hooks that keep a Devin session's Waypost nudges
+and compaction context in sync:
+
+```bash
+waypost install devin-hook
+waypost doctor devin-hook
 ```
 
 Windows:
@@ -267,11 +275,14 @@ field. Root-group and nested-parent cases are rejected before launch.
 Call `waypost_status` once after starting each MCP server process. It
 auto-binds detectable session addresses from `agent-deck session current`,
 tool environment variables such as `CODEX_THREAD_ID`, `CLAUDE_CODE_SESSION_ID`,
-`GEMINI_SESSION_ID`, and `OPENCODE_SESSION_ID`. When an agent-deck session is
-already known, it can also use the agent-deck state database to fill in a Codex
-thread synced later for that same workdir and session.
+`GEMINI_SESSION_ID`, `OPENCODE_SESSION_ID`, and `DEVIN_SESSION_ID`, and on Unix
+a parent-process probe that recognizes Codex and Devin sessions. When an
+agent-deck session is already known, it can also use the agent-deck state
+database to fill in a Codex thread synced later for that same workdir and
+session.
 That yields addresses such as `agent-deck/<session-id>`, `codex/<session-id>`,
-`claude/<session-id>`, `gemini/<session-id>`, and `opencode/<session-id>`.
+`claude/<session-id>`, `gemini/<session-id>`, `opencode/<session-id>`, and
+`devin/<session-id>`.
 `waypost_status` returns only `status`, binding state when present, actionable
 warnings, and a non-zero active-lease count by default. Set
 `include_cli_context: true` when you need the authoritative executable and
@@ -286,14 +297,17 @@ current binding state and any recovery warnings before they read, send, claim,
 ack, or alter waypost state. If auto-bind cannot find a supported tool session
 address, call `waypost_status` again after agent-deck has synced state for the
 current session or call `waypost_bind` manually.
-Tool session environment variable values must look like hex session ids; invalid
-values are ignored and reported in the `waypost_status` warnings.
+Tool session environment variable values must look like session ids (hex-like
+for Codex, Claude, Gemini, and OpenCode; a slug such as `truth-alarm` for
+Devin's `DEVIN_SESSION_ID`); invalid values are ignored and reported in the
+`waypost_status` warnings.
 
 When `waypost mcp --include-debug-tool` is in use, `waypost_debug` may run
 before or after `waypost_status` when auto-bind behavior is unclear. It is
 read-only, does not auto-bind, and reports only allowlisted tool session
 environment diagnostics for `CODEX_THREAD_ID`,
-`CLAUDE_CODE_SESSION_ID`, `GEMINI_SESSION_ID`, and `OPENCODE_SESSION_ID`,
+`CLAUDE_CODE_SESSION_ID`, `GEMINI_SESSION_ID`, `OPENCODE_SESSION_ID`, and
+`DEVIN_SESSION_ID`,
 including whether each value is present, accepted by validation, and what
 address it would produce. Its broader debug environment diagnostics also include
 `AGENTDECK_INSTANCE_ID` and `TMUX`. On Linux it inspects the parent process

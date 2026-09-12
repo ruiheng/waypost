@@ -1,20 +1,16 @@
 package codexhook
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
-	"regexp"
 	"runtime"
 	"strings"
 
+	"github.com/ruiheng/waypost/internal/hookcore"
 	"github.com/ruiheng/waypost/internal/launchpath"
 )
 
@@ -28,9 +24,10 @@ const (
 	promptStatusMessage       = "Preparing Waypost receive hint"
 	waitStatusMessage         = "Checking Waypost wait usage"
 	legacyPromptStatusMessage = "Checking Waypost MCP availability"
-	defaultNudgeMessage       = "NOTICE: There might be new delivery in waypost."
 	receiveMCPToolName        = "mcp__waypost__waypost_recv"
+	defaultNudgeMessage       = hookcore.DefaultNudgeMessage
 	hookStateDirectoryName    = "waypost-hook-state"
+	harnessLabel              = "Codex"
 )
 
 const hookTimeoutSeconds int64 = 5
@@ -38,37 +35,15 @@ const hookTimeoutJSON json.Number = "5"
 const cleanupHookTimeoutSeconds int64 = 3
 const cleanupHookTimeoutJSON json.Number = "3"
 
-const AdditionalContext = `A prior Waypost nudge in this session was already handled before compaction (either a receive completed or no message was available). Do not repeat the receive merely because of compaction. Continue from the compacted context.`
-
-const MCPNudgeContext = `The waypost_recv MCP tool is available. Use it instead of the Waypost CLI.`
-
-const CLINudgeContext = `The Waypost MCP tool waypost_recv is unavailable. Receive the pending delivery with ` + "`waypost recv --json`" + `.`
-
-const MCPProbeFailedNudgeContext = `Look for the waypost_recv MCP tool. If it is unavailable, receive the pending delivery with ` + "`waypost recv --json`" + `.`
-
-const WaitPollingContext = `Do not poll Waypost. Continue other available work; if none remains, stop completely.`
-
-const MCPStatusDenialReason = `The Waypost MCP tool waypost_status is available. Use it instead of running waypost status.`
+const AdditionalContext = hookcore.AdditionalContext
+const MCPNudgeContext = hookcore.MCPNudgeContext
+const CLINudgeContext = hookcore.CLINudgeContext
+const MCPProbeFailedNudgeContext = hookcore.MCPProbeFailedNudgeContext
+const WaitPollingContext = hookcore.WaitPollingContext
+const MCPStatusDenialReason = hookcore.StatusDenialReason
 const MCPServerCommandDenialReason = `The Waypost MCP server is managed by Codex. Never run the Waypost CLI command ` + "`waypost mcp`" + `.`
 
-var waypostMCPCommandBlacklist = map[string]string{
-	"ack":     "waypost_ack",
-	"recv":    "waypost_recv",
-	"receive": "waypost_recv",
-	"send":    "waypost_send",
-	// The empty replacement marks a command that must always be denied.
-	"mcp": "",
-}
-
-type hookInput struct {
-	HookEventName string          `json:"hook_event_name"`
-	SessionID     string          `json:"session_id"`
-	Source        string          `json:"source"`
-	Prompt        string          `json:"prompt"`
-	ToolName      string          `json:"tool_name"`
-	ToolInput     json.RawMessage `json:"tool_input"`
-	ToolResponse  json.RawMessage `json:"tool_response"`
-}
+type hookInput = hookcore.HookInput
 
 type hookOutput struct {
 	SystemMessage      string             `json:"systemMessage,omitempty"`
@@ -115,7 +90,7 @@ func runWithDependencies(
 	probe waypostMCPProbe,
 	store nudgeStateStore,
 ) error {
-	input, hasInput, err := readHookInput(r)
+	input, hasInput, err := hookcore.ReadHookInput(r, harnessLabel)
 	if err != nil {
 		return err
 	}
@@ -123,12 +98,19 @@ func runWithDependencies(
 		return writeOutput(w, "SessionStart", AdditionalContext)
 	}
 
+	// Codex sends a stable session_id in every hook payload; a missing value
+	// means the event came from a different producer, so state tracking
+	// degrades gracefully instead of failing the hook.
+	sessionID := strings.TrimSpace(input.SessionID)
 	switch input.HookEventName {
 	case "SessionStart":
 		if input.Source != "compact" {
 			return nil
 		}
-		state, err := store.Load(input.SessionID)
+		if sessionID == "" {
+			return nil
+		}
+		state, err := store.Load(sessionID)
 		if err != nil {
 			return err
 		}
@@ -138,32 +120,37 @@ func runWithDependencies(
 		return writeOutput(w, "SessionStart", AdditionalContext)
 	case "UserPromptSubmit":
 		if !LooksLikeWaypostNudge(input.Prompt) {
-			return store.Clear(input.SessionID)
+			if sessionID == "" {
+				return nil
+			}
+			return store.Clear(sessionID)
 		}
-		if err := store.Save(input.SessionID, nudgePending); err != nil {
-			return err
+		if sessionID != "" {
+			if err := store.Save(sessionID, nudgePending); err != nil {
+				return err
+			}
 		}
-		availability, probeErr := probeWaypostMCP(ctx, input.SessionID, probe, store)
+		availability, probeErr := probeWaypostMCP(ctx, sessionID, probe, store)
 		switch availability {
 		case waypostMCPUnknown:
-			return writeOutputWithSystemMessage(w, "UserPromptSubmit", MCPProbeFailedNudgeContext, mcpProbeFailureMessage(probeErr))
+			return writeOutputWithSystemMessage(w, "UserPromptSubmit", MCPProbeFailedNudgeContext, hookcore.MCPProbeFailureMessage(probeErr))
 		case waypostMCPAvailable:
 			return writeOutput(w, "UserPromptSubmit", MCPNudgeContext)
 		default:
 			return writeOutput(w, "UserPromptSubmit", CLINudgeContext)
 		}
 	case "PostToolUse":
-		if !successfulWaypostReceive(input) {
+		if !successfulWaypostReceive(input) || sessionID == "" {
 			return nil
 		}
-		state, err := store.Load(input.SessionID)
+		state, err := store.Load(sessionID)
 		if err != nil {
 			return err
 		}
 		if state != nudgePending {
 			return nil
 		}
-		return store.Save(input.SessionID, nudgeConsumed)
+		return store.Save(sessionID, nudgeConsumed)
 	case "PreToolUse":
 		if input.ToolName != "Bash" {
 			return nil
@@ -182,19 +169,22 @@ func runWithDependencies(
 		if waypostMCPCommandAlwaysDenied(command) {
 			return writeDenyOutput(w, denialReason)
 		}
-		availability, probeErr := probeWaypostMCP(ctx, input.SessionID, probe, store)
+		availability, probeErr := probeWaypostMCP(ctx, sessionID, probe, store)
 		if availability == waypostMCPUnknown {
-			return writeSystemMessage(w, mcpProbeFailureMessage(probeErr))
+			return writeSystemMessage(w, hookcore.MCPProbeFailureMessage(probeErr))
 		}
 		if availability == waypostMCPUnavailable {
 			return nil
 		}
 		return writeDenyOutput(w, denialReason)
 	case "SessionEnd":
-		if err := store.Clear(input.SessionID); err != nil {
+		if sessionID == "" {
+			return nil
+		}
+		if err := store.Clear(sessionID); err != nil {
 			return err
 		}
-		return store.ClearMCPProbe(input.SessionID)
+		return store.ClearMCPProbe(sessionID)
 	default:
 		return nil
 	}
@@ -218,13 +208,6 @@ func writeOutputWithSystemMessage(w io.Writer, eventName, additionalContext, sys
 	})
 }
 
-func mcpProbeFailureMessage(err error) string {
-	if err == nil {
-		return "Waypost MCP probe failed for an unknown reason."
-	}
-	return fmt.Sprintf("Waypost MCP probe failed: %v", err)
-}
-
 func writeSystemMessage(w io.Writer, systemMessage string) error {
 	return json.NewEncoder(w).Encode(struct {
 		SystemMessage string `json:"systemMessage"`
@@ -241,67 +224,45 @@ func writeDenyOutput(w io.Writer, reason string) error {
 	})
 }
 
-func readHookInput(r io.Reader) (hookInput, bool, error) {
-	var input hookInput
-	err := json.NewDecoder(r).Decode(&input)
-	if errors.Is(err, io.EOF) {
-		return hookInput{}, false, nil
-	}
-	if err != nil {
-		return hookInput{}, false, fmt.Errorf("parse Codex hook input: %w", err)
-	}
-	return input, true, nil
-}
-
 func LooksLikeWaypostNudge(prompt string) bool {
-	return strings.EqualFold(strings.TrimSpace(prompt), defaultNudgeMessage)
+	return hookcore.LooksLikeWaypostNudge(prompt)
 }
 
-type nudgeState string
+type nudgeState = hookcore.NudgeState
 
 const (
-	nudgeNone     nudgeState = ""
-	nudgePending  nudgeState = "pending"
-	nudgeConsumed nudgeState = "consumed"
+	nudgeNone     = hookcore.NudgeNone
+	nudgePending  = hookcore.NudgePending
+	nudgeConsumed = hookcore.NudgeConsumed
 )
 
-type nudgeStateStore interface {
-	Load(sessionID string) (nudgeState, error)
-	Save(sessionID string, state nudgeState) error
-	LoadMCPProbe(sessionID string) (waypostMCPAvailability, bool, error)
-	SaveMCPProbe(sessionID string, availability waypostMCPAvailability) error
-	ClearMCPProbe(sessionID string) error
-	Clear(sessionID string) error
-}
+type nudgeStateStore = hookcore.NudgeStore
 
-type fileNudgeStateStore struct {
-	dir string
-}
+type fileNudgeStateStore = hookcore.FileNudgeStore
 
-type nudgeStateRecord struct {
-	SessionID string     `json:"session_id"`
-	State     nudgeState `json:"state"`
+type memoryNudgeStateStore = hookcore.MemoryNudgeStore
+
+func newMemoryNudgeStateStore() *memoryNudgeStateStore {
+	store := hookcore.NewMemoryNudgeStore()
+	store.Label = harnessLabel
+	return store
 }
 
 func probeWaypostMCP(ctx context.Context, sessionID string, probe waypostMCPProbe, store nudgeStateStore) (waypostMCPAvailability, error) {
-	// Some hook producers omit session_id for tool events. Do not make the
-	// optimization change those events' existing behavior; simply probe.
-	if strings.TrimSpace(sessionID) == "" {
-		return detectWaypostMCP(ctx, probe)
-	}
-	if availability, ok, err := store.LoadMCPProbe(sessionID); err != nil {
-		return waypostMCPUnknown, err
-	} else if ok {
-		return availability, nil
-	}
-	availability, err := detectWaypostMCP(ctx, probe)
+	record, err := hookcore.ProbeAndCache(ctx, sessionID, func(ctx context.Context) (hookcore.MCPProbeRecord, error) {
+		availability, err := detectWaypostMCP(ctx, probe)
+		if err != nil {
+			return hookcore.MCPProbeRecord{}, err
+		}
+		return hookcore.MCPProbeRecord{Available: availability == waypostMCPAvailable}, nil
+	}, store)
 	if err != nil {
-		return availability, err
-	}
-	if err := store.SaveMCPProbe(sessionID, availability); err != nil {
 		return waypostMCPUnknown, err
 	}
-	return availability, nil
+	if record.Available {
+		return waypostMCPAvailable, nil
+	}
+	return waypostMCPUnavailable, nil
 }
 
 func defaultNudgeStateStore() (nudgeStateStore, error) {
@@ -309,541 +270,48 @@ func defaultNudgeStateStore() (nudgeStateStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return fileNudgeStateStore{dir: filepath.Join(home, hookStateDirectoryName)}, nil
-}
-
-func (store fileNudgeStateStore) Load(sessionID string) (nudgeState, error) {
-	sessionID, err := normalizedSessionID(sessionID)
-	if err != nil {
-		return nudgeNone, err
-	}
-	path, err := store.path(sessionID)
-	if err != nil {
-		return nudgeNone, err
-	}
-	contents, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nudgeNone, nil
-	}
-	if err != nil {
-		return nudgeNone, fmt.Errorf("read Codex Waypost nudge state %q: %w", path, err)
-	}
-	var record nudgeStateRecord
-	if err := json.Unmarshal(contents, &record); err != nil {
-		return nudgeNone, fmt.Errorf("parse Codex Waypost nudge state %q: %w", path, err)
-	}
-	if record.SessionID != sessionID {
-		return nudgeNone, fmt.Errorf("parse Codex Waypost nudge state %q: session id mismatch", path)
-	}
-	if record.State != nudgePending && record.State != nudgeConsumed {
-		return nudgeNone, fmt.Errorf("parse Codex Waypost nudge state %q: invalid state %q", path, record.State)
-	}
-	return record.State, nil
-}
-
-func (store fileNudgeStateStore) Save(sessionID string, state nudgeState) error {
-	if state != nudgePending && state != nudgeConsumed {
-		return fmt.Errorf("save Codex Waypost nudge state: invalid state %q", state)
-	}
-	sessionID, err := normalizedSessionID(sessionID)
-	if err != nil {
-		return err
-	}
-	path, err := store.path(sessionID)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(store.dir, 0o700); err != nil {
-		return fmt.Errorf("create Codex Waypost nudge state directory %q: %w", store.dir, err)
-	}
-	contents, err := json.Marshal(nudgeStateRecord{SessionID: sessionID, State: state})
-	if err != nil {
-		return fmt.Errorf("encode Codex Waypost nudge state: %w", err)
-	}
-	contents = append(contents, '\n')
-	temporary, err := os.CreateTemp(store.dir, ".state.tmp-*")
-	if err != nil {
-		return fmt.Errorf("create temporary Codex Waypost nudge state: %w", err)
-	}
-	temporaryPath := temporary.Name()
-	defer func() {
-		_ = temporary.Close()
-		_ = os.Remove(temporaryPath)
-	}()
-	if err := temporary.Chmod(0o600); err != nil {
-		return fmt.Errorf("set Codex Waypost nudge state permissions: %w", err)
-	}
-	if _, err := temporary.Write(contents); err != nil {
-		return fmt.Errorf("write Codex Waypost nudge state: %w", err)
-	}
-	if err := temporary.Sync(); err != nil {
-		return fmt.Errorf("sync Codex Waypost nudge state: %w", err)
-	}
-	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("close Codex Waypost nudge state: %w", err)
-	}
-	if err := replaceHooksFile(temporaryPath, path); err != nil {
-		return fmt.Errorf("replace Codex Waypost nudge state %q: %w", path, err)
-	}
-	return nil
-}
-
-func (store fileNudgeStateStore) LoadMCPProbe(sessionID string) (waypostMCPAvailability, bool, error) {
-	sessionID, err := normalizedSessionID(sessionID)
-	if err != nil {
-		return waypostMCPUnknown, false, err
-	}
-	path, err := store.probePath(sessionID)
-	if err != nil {
-		return waypostMCPUnknown, false, err
-	}
-	contents, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return waypostMCPUnknown, false, nil
-	}
-	if err != nil {
-		return waypostMCPUnknown, false, fmt.Errorf("read Codex Waypost MCP probe %q: %w", path, err)
-	}
-	var record struct {
-		SessionID string `json:"session_id"`
-		Available *bool  `json:"available"`
-	}
-	if err := json.Unmarshal(contents, &record); err != nil {
-		return waypostMCPUnknown, false, fmt.Errorf("parse Codex Waypost MCP probe %q: %w", path, err)
-	}
-	if record.SessionID != sessionID {
-		return waypostMCPUnknown, false, fmt.Errorf("parse Codex Waypost MCP probe %q: session id mismatch", path)
-	}
-	if record.Available == nil {
-		return waypostMCPUnknown, false, fmt.Errorf("parse Codex Waypost MCP probe %q: missing available field", path)
-	}
-	if *record.Available {
-		return waypostMCPAvailable, true, nil
-	}
-	return waypostMCPUnavailable, true, nil
-}
-
-func (store fileNudgeStateStore) SaveMCPProbe(sessionID string, availability waypostMCPAvailability) error {
-	if availability != waypostMCPAvailable && availability != waypostMCPUnavailable {
-		return errors.New("save Codex Waypost MCP probe: invalid availability")
-	}
-	sessionID, err := normalizedSessionID(sessionID)
-	if err != nil {
-		return err
-	}
-	path, err := store.probePath(sessionID)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(store.dir, 0o700); err != nil {
-		return fmt.Errorf("create Codex Waypost nudge state directory %q: %w", store.dir, err)
-	}
-	contents, _ := json.Marshal(struct {
-		SessionID string `json:"session_id"`
-		Available bool   `json:"available"`
-	}{sessionID, availability == waypostMCPAvailable})
-	contents = append(contents, '\n')
-	temporary, err := os.CreateTemp(store.dir, ".mcp-state.tmp-*")
-	if err != nil {
-		return fmt.Errorf("create temporary Codex Waypost MCP probe: %w", err)
-	}
-	temporaryPath := temporary.Name()
-	defer func() {
-		_ = temporary.Close()
-		_ = os.Remove(temporaryPath)
-	}()
-	if err := temporary.Chmod(0o600); err != nil {
-		return fmt.Errorf("set Codex Waypost MCP probe permissions: %w", err)
-	}
-	if _, err := temporary.Write(contents); err != nil {
-		return fmt.Errorf("write Codex Waypost MCP probe: %w", err)
-	}
-	if err := temporary.Sync(); err != nil {
-		return fmt.Errorf("sync Codex Waypost MCP probe: %w", err)
-	}
-	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("close Codex Waypost MCP probe: %w", err)
-	}
-	if err := replaceHooksFile(temporaryPath, path); err != nil {
-		return fmt.Errorf("replace Codex Waypost MCP probe %q: %w", path, err)
-	}
-	return nil
-}
-
-func (store fileNudgeStateStore) ClearMCPProbe(sessionID string) error {
-	sessionID, err := normalizedSessionID(sessionID)
-	if err != nil {
-		return err
-	}
-	path, err := store.probePath(sessionID)
-	if err != nil {
-		return err
-	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove Codex Waypost MCP probe %q: %w", path, err)
-	}
-	return nil
-}
-
-func (store fileNudgeStateStore) Clear(sessionID string) error {
-	sessionID, err := normalizedSessionID(sessionID)
-	if err != nil {
-		return err
-	}
-	path, err := store.path(sessionID)
-	if err != nil {
-		return err
-	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove Codex Waypost nudge state %q: %w", path, err)
-	}
-	return nil
-}
-
-func (store fileNudgeStateStore) path(sessionID string) (string, error) {
-	sessionID, err := normalizedSessionID(sessionID)
-	if err != nil {
-		return "", err
-	}
-	digest := sha256.Sum256([]byte(sessionID))
-	return filepath.Join(store.dir, fmt.Sprintf("%x.json", digest)), nil
-}
-
-func (store fileNudgeStateStore) probePath(sessionID string) (string, error) {
-	path, err := store.path(sessionID)
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSuffix(path, ".json") + ".mcp.json", nil
-}
-
-type memoryNudgeStateStore struct {
-	states map[string]nudgeState
-	probes map[string]waypostMCPAvailability
-}
-
-func newMemoryNudgeStateStore() *memoryNudgeStateStore {
-	return &memoryNudgeStateStore{states: make(map[string]nudgeState), probes: make(map[string]waypostMCPAvailability)}
-}
-
-func (store *memoryNudgeStateStore) Load(sessionID string) (nudgeState, error) {
-	sessionID, err := normalizedSessionID(sessionID)
-	if err != nil {
-		return nudgeNone, err
-	}
-	return store.states[sessionID], nil
-}
-
-func (store *memoryNudgeStateStore) Save(sessionID string, state nudgeState) error {
-	sessionID, err := normalizedSessionID(sessionID)
-	if err != nil {
-		return err
-	}
-	store.states[sessionID] = state
-	return nil
-}
-
-func (store *memoryNudgeStateStore) LoadMCPProbe(sessionID string) (waypostMCPAvailability, bool, error) {
-	sessionID, err := normalizedSessionID(sessionID)
-	if err != nil {
-		return waypostMCPUnknown, false, err
-	}
-	availability, ok := store.probes[sessionID]
-	return availability, ok, nil
-}
-
-func (store *memoryNudgeStateStore) SaveMCPProbe(sessionID string, availability waypostMCPAvailability) error {
-	sessionID, err := normalizedSessionID(sessionID)
-	if err != nil {
-		return err
-	}
-	if availability != waypostMCPAvailable && availability != waypostMCPUnavailable {
-		return errors.New("save Codex Waypost MCP probe: invalid availability")
-	}
-	store.probes[sessionID] = availability
-	return nil
-}
-
-func (store *memoryNudgeStateStore) ClearMCPProbe(sessionID string) error {
-	sessionID, err := normalizedSessionID(sessionID)
-	if err != nil {
-		return err
-	}
-	delete(store.probes, sessionID)
-	return nil
-}
-
-func (store *memoryNudgeStateStore) Clear(sessionID string) error {
-	sessionID, err := normalizedSessionID(sessionID)
-	if err != nil {
-		return err
-	}
-	delete(store.states, sessionID)
-	return nil
-}
-
-func normalizedSessionID(sessionID string) (string, error) {
-	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
-		return "", errors.New("Codex hook input is missing session_id")
-	}
-	return sessionID, nil
+	return fileNudgeStateStore{Dir: filepath.Join(home, hookStateDirectoryName), Label: harnessLabel}, nil
 }
 
 func successfulWaypostReceive(input hookInput) bool {
 	switch input.ToolName {
 	case receiveMCPToolName:
-		return successfulWaypostMCPResponse(input.ToolResponse)
+		return hookcore.MCPReceiveResultSucceeded(string(input.ToolResponse))
 	case "Bash":
 		command, err := bashCommand(input.ToolInput)
 		if err != nil {
 			return false
 		}
 		subcommand, ok := directWaypostCommand(command)
-		return ok && (subcommand == "recv" || subcommand == "receive") && successfulBashResponse(input.ToolResponse)
+		return ok && (subcommand == "recv" || subcommand == "receive") && hookcore.ShellReceiveOutputSucceeded(input.ToolResponse)
 	default:
 		return false
 	}
 }
 
-func successfulWaypostMCPResponse(raw json.RawMessage) bool {
-	if len(raw) == 0 {
-		return false
-	}
-	var response struct {
-		IsError           bool `json:"isError"`
-		StructuredContent struct {
-			Status string `json:"status"`
-		} `json:"structuredContent"`
-	}
-	if err := json.Unmarshal(raw, &response); err != nil || response.IsError {
-		return false
-	}
-	return response.StructuredContent.Status == "received" || response.StructuredContent.Status == "no_message"
-}
-
-func successfulBashResponse(raw json.RawMessage) bool {
-	if len(raw) == 0 {
-		return false
-	}
-	var output string
-	if json.Unmarshal(raw, &output) != nil {
-		return false
-	}
-	output = strings.TrimSpace(output)
-	if output == "" {
-		return false
-	}
-
-	if success, parsed := successfulJSONReceive(output); parsed {
-		return success
-	}
-	if output == "status=no_message" {
-		return true
-	}
-
-	firstLine, _, _ := strings.Cut(output, "\n")
-	if strings.HasPrefix(firstLine, "status: ") {
-		var status string
-		if json.Unmarshal([]byte(strings.TrimPrefix(firstLine, "status: ")), &status) == nil {
-			return status == "received" || status == "no_message"
-		}
-		return false
-	}
-	if successfulFullYAMLReceive(output) {
-		return true
-	}
-	personalReceive := strings.HasPrefix(firstLine, "delivery_id=") &&
-		strings.Contains(firstLine, " recipient_address=") &&
-		strings.Contains(firstLine, " lease_token=")
-	groupReceive := strings.HasPrefix(firstLine, "message_id=") &&
-		strings.Contains(firstLine, " group=") &&
-		strings.Contains(firstLine, " person=") &&
-		strings.Contains(firstLine, " first_read_at=")
-	return personalReceive || groupReceive
-}
-
-type cliJSONReceive struct {
-	Status           string           `json:"status"`
-	DeliveryID       string           `json:"delivery_id"`
-	RecipientAddress string           `json:"recipient_address"`
-	LeaseToken       string           `json:"lease_token"`
-	MessageID        string           `json:"message_id"`
-	GroupAddress     string           `json:"group_address"`
-	Person           string           `json:"person"`
-	FirstReadAt      string           `json:"first_read_at"`
-	Messages         []cliJSONReceive `json:"messages"`
-}
-
-func successfulJSONReceive(output string) (success, parsed bool) {
-	var response cliJSONReceive
-	if json.Unmarshal([]byte(output), &response) != nil {
-		return false, false
-	}
-	if response.Status != "" {
-		return response.Status == "received" || response.Status == "no_message", true
-	}
-	if completePersonalJSONReceive(response) || completeGroupJSONReceive(response) {
-		return true, true
-	}
-	if len(response.Messages) == 0 {
-		return false, true
-	}
-	for _, message := range response.Messages {
-		if !completePersonalJSONReceive(message) {
-			return false, true
-		}
-	}
-	return true, true
-}
-
-func completePersonalJSONReceive(response cliJSONReceive) bool {
-	return response.DeliveryID != "" && response.RecipientAddress != "" && response.LeaseToken != ""
-}
-
-func completeGroupJSONReceive(response cliJSONReceive) bool {
-	return response.MessageID != "" && response.GroupAddress != "" && response.Person != "" && response.FirstReadAt != ""
-}
-
-func successfulFullYAMLReceive(output string) bool {
-	fields := make(map[string]bool)
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		name, value, found := strings.Cut(line, ":")
-		if found && strings.TrimSpace(value) != "" {
-			fields[name] = true
-		}
-	}
-	personalReceive := fields["delivery_id"] && fields["recipient_address"] && fields["lease_token"]
-	groupReceive := fields["message_id"] && fields["group_address"] && fields["person"] && fields["first_read_at"]
-	return personalReceive || groupReceive
-}
-
 func LooksLikeWaypostWaitCommand(command string) bool {
-	subcommand, ok := directWaypostCommand(command)
-	return ok && subcommand == "wait"
+	return hookcore.LooksLikeWaypostWaitCommand(command)
 }
 
 func waypostMCPDenialReason(command string) (string, bool) {
-	subcommand, ok := directWaypostCommand(command)
-	if !ok {
+	tool, guarded := hookcore.WaypostMCPTool(command)
+	if !guarded {
 		return "", false
 	}
-	if subcommand == "status" {
-		return MCPStatusDenialReason, true
-	}
-	tool, blocked := waypostMCPCommandBlacklist[subcommand]
-	if !blocked {
-		return "", false
-	}
-	if tool == "" {
-		return MCPServerCommandDenialReason, true
-	}
-	return fmt.Sprintf("The Waypost MCP tool %s is available. Use it instead of the Waypost CLI.", tool), true
+	return hookcore.WaypostCommandDenialReason(tool, MCPServerCommandDenialReason), true
 }
 
 func waypostMCPCommandAlwaysDenied(command string) bool {
-	subcommand, ok := directWaypostCommand(command)
-	if !ok {
-		return false
-	}
-	tool, blocked := waypostMCPCommandBlacklist[subcommand]
-	return blocked && tool == ""
+	tool, guarded := hookcore.WaypostMCPTool(command)
+	return guarded && tool == ""
 }
 
 func directWaypostCommand(command string) (string, bool) {
-	rest := strings.TrimSpace(command)
-	executable, rest, ok := consumeCommandWord(rest)
-	if !ok {
-		return "", false
-	}
-	if executable == "&" {
-		executable, rest, ok = consumeCommandWord(rest)
-		if !ok {
-			return "", false
-		}
-	}
-	if !isWaypostExecutable(executable) {
-		return "", false
-	}
-
-	for {
-		argument, remaining, ok := consumeCommandWord(rest)
-		if !ok {
-			return "", false
-		}
-		switch {
-		case argument == "--state-dir":
-			_, rest, ok = consumeCommandWord(remaining)
-			if !ok {
-				return "", false
-			}
-		case strings.HasPrefix(argument, "--state-dir=") && len(argument) > len("--state-dir="):
-			rest = remaining
-		default:
-			return argument, true
-		}
-	}
+	return hookcore.DirectWaypostCommand(command)
 }
 
 func bashCommand(raw json.RawMessage) (string, error) {
-	if len(raw) == 0 {
-		return "", nil
-	}
-	var input struct {
-		Command string `json:"command"`
-	}
-	if err := json.Unmarshal(raw, &input); err != nil {
-		return "", fmt.Errorf("parse Codex Bash tool input: %w", err)
-	}
-	return input.Command, nil
-}
-
-func consumeCommandWord(input string) (string, string, bool) {
-	input = strings.TrimLeft(input, " \t\r")
-	if input == "" || input[0] == '\n' {
-		return "", input, false
-	}
-	if strings.ContainsRune(";&|<>()", rune(input[0])) {
-		return input[:1], input[1:], true
-	}
-
-	var word strings.Builder
-	var quote byte
-	for index := 0; index < len(input); index++ {
-		character := input[index]
-		if quote != 0 {
-			if character == quote {
-				quote = 0
-				continue
-			}
-			word.WriteByte(character)
-			continue
-		}
-		switch character {
-		case '\'', '"':
-			quote = character
-		case ' ', '\t', '\r':
-			return word.String(), input[index:], word.Len() != 0
-		case '\n', ';', '&', '|', '<', '>', '(', ')':
-			return word.String(), input[index:], word.Len() != 0
-		default:
-			word.WriteByte(character)
-		}
-	}
-	if quote != 0 || word.Len() == 0 {
-		return "", input, false
-	}
-	return word.String(), "", true
-}
-
-func isWaypostExecutable(executable string) bool {
-	normalized := strings.ReplaceAll(executable, `\`, "/")
-	base := normalized
-	if separator := strings.LastIndexByte(normalized, '/'); separator >= 0 {
-		base = normalized[separator+1:]
-	}
-	return strings.EqualFold(base, "waypost") || strings.EqualFold(base, "waypost.exe")
+	return hookcore.CommandToolInput(raw, "Codex Bash")
 }
 
 func DefaultHome() (string, error) {
@@ -862,100 +330,121 @@ func CurrentCommand() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve waypost executable: %w", err)
 	}
-	command := quoteCommandPath(executable) + " codex-hook"
+	command := hookcore.QuoteCommandPath(executable) + " codex-hook"
 	if runtime.GOOS == "windows" {
 		command = "& " + command
 	}
 	return command, nil
 }
 
+// managedHookSpec describes one managed hook definition: which event it
+// belongs to, the desired group contents, and how groups written by this
+// installer are recognized.
+type managedHookSpec struct {
+	event          string
+	doctorName     string
+	timeoutSeconds int64
+	description    string
+	statusMessages []string
+	desired        func(command string) map[string]any
+	eligibleGroup  func(group map[string]any) bool
+}
+
+func managedHookSpecs() []managedHookSpec {
+	return []managedHookSpec{
+		{
+			event:          "SessionStart",
+			doctorName:     "compact",
+			timeoutSeconds: hookTimeoutSeconds,
+			description:    compactManagedDescription,
+			statusMessages: []string{compactStatusMessage},
+			desired:        compactManagedGroup,
+			eligibleGroup: func(group map[string]any) bool {
+				return hookcore.MatcherTargetsCompactOnly(group["matcher"])
+			},
+		},
+		{
+			event:          "UserPromptSubmit",
+			doctorName:     "Waypost nudge",
+			timeoutSeconds: hookTimeoutSeconds,
+			description:    promptManagedDescription,
+			statusMessages: []string{promptStatusMessage, legacyPromptStatusMessage},
+			desired:        promptManagedGroup,
+			eligibleGroup:  func(map[string]any) bool { return true },
+		},
+		{
+			event:          "PreToolUse",
+			doctorName:     "Waypost wait polling guard",
+			timeoutSeconds: hookTimeoutSeconds,
+			description:    waitManagedDescription,
+			statusMessages: []string{waitStatusMessage},
+			desired:        waitManagedGroup,
+			eligibleGroup: func(group map[string]any) bool {
+				return hookcore.MatcherTargetsOnly(group["matcher"], "Bash")
+			},
+		},
+		{
+			event:          "PostToolUse",
+			doctorName:     "Waypost receive completion",
+			timeoutSeconds: hookTimeoutSeconds,
+			description:    receiveManagedDescription,
+			desired:        receiveManagedGroup,
+			eligibleGroup: func(group map[string]any) bool {
+				return matcherTargetsReceiveCompletionOnly(group["matcher"])
+			},
+		},
+		{
+			event:          "SessionEnd",
+			doctorName:     "Waypost nudge state cleanup",
+			timeoutSeconds: cleanupHookTimeoutSeconds,
+			description:    cleanupManagedDescription,
+			desired:        cleanupManagedGroup,
+			eligibleGroup:  matcherTargetsEverySessionEnd,
+		},
+	}
+}
+
+func (spec managedHookSpec) recognition(command string) hookcore.ManagedHandlerSpec {
+	return hookcore.ManagedHandlerSpec{
+		Description:    spec.description,
+		StatusMessages: spec.statusMessages,
+		Command:        command,
+		HookSubcommand: "codex-hook",
+		EligibleGroup:  spec.eligibleGroup,
+	}
+}
+
 func Install(codexHome, command string) (InstallResult, error) {
 	path := filepath.Join(codexHome, "hooks.json")
-	document, mode, err := readHooksDocument(path)
+	document, mode, _, err := hookcore.ReadConfigDocument(path, harnessLabel, false)
 	if err != nil {
 		return InstallResult{}, err
 	}
 
-	hooks, err := objectField(document, "hooks")
+	hooks, err := hookcore.ObjectField(document, "hooks")
 	if err != nil {
 		return InstallResult{}, fmt.Errorf("read %q: %w", path, err)
 	}
-	if err := validateHooksStructure(hooks); err != nil {
+	if err := hookcore.ValidateHooksStructure(hooks, knownHookEvent); err != nil {
 		return InstallResult{}, fmt.Errorf("validate %q: %w", path, err)
 	}
-	groups, err := arrayField(hooks, "SessionStart")
-	if err != nil {
-		return InstallResult{}, fmt.Errorf("read %q: %w", path, err)
-	}
 
-	updated, compactChanged := mergeManagedHandler(groups, compactManagedGroup(command), managedHandlerSpec{
-		description:    compactManagedDescription,
-		statusMessages: []string{compactStatusMessage},
-		command:        command,
-		eligibleGroup: func(group map[string]any) bool {
-			return matcherTargetsCompactOnly(group["matcher"])
-		},
-	})
-	hooks["SessionStart"] = updated
-
-	promptGroups, err := arrayField(hooks, "UserPromptSubmit")
-	if err != nil {
-		return InstallResult{}, fmt.Errorf("read %q: %w", path, err)
+	changed := false
+	for _, spec := range managedHookSpecs() {
+		groups, err := hookcore.ArrayField(hooks, spec.event)
+		if err != nil {
+			return InstallResult{}, fmt.Errorf("read %q: %w", path, err)
+		}
+		updated, eventChanged := hookcore.MergeManagedHandler(groups, spec.desired(command), spec.recognition(command))
+		hooks[spec.event] = updated
+		changed = changed || eventChanged
 	}
-	updated, promptChanged := mergeManagedHandler(promptGroups, promptManagedGroup(command), managedHandlerSpec{
-		description:    promptManagedDescription,
-		statusMessages: []string{promptStatusMessage, legacyPromptStatusMessage},
-		command:        command,
-		eligibleGroup:  func(map[string]any) bool { return true },
-	})
-	hooks["UserPromptSubmit"] = updated
-
-	waitGroups, err := arrayField(hooks, "PreToolUse")
-	if err != nil {
-		return InstallResult{}, fmt.Errorf("read %q: %w", path, err)
-	}
-	updated, waitChanged := mergeManagedHandler(waitGroups, waitManagedGroup(command), managedHandlerSpec{
-		description:    waitManagedDescription,
-		statusMessages: []string{waitStatusMessage},
-		command:        command,
-		eligibleGroup: func(group map[string]any) bool {
-			return matcherTargetsBashOnly(group["matcher"])
-		},
-	})
-	hooks["PreToolUse"] = updated
-
-	receiveGroups, err := arrayField(hooks, "PostToolUse")
-	if err != nil {
-		return InstallResult{}, fmt.Errorf("read %q: %w", path, err)
-	}
-	updated, receiveChanged := mergeManagedHandler(receiveGroups, receiveManagedGroup(command), managedHandlerSpec{
-		description:    receiveManagedDescription,
-		statusMessages: nil,
-		command:        command,
-		eligibleGroup: func(group map[string]any) bool {
-			return matcherTargetsReceiveCompletionOnly(group["matcher"])
-		},
-	})
-	hooks["PostToolUse"] = updated
-
-	cleanupGroups, err := arrayField(hooks, "SessionEnd")
-	if err != nil {
-		return InstallResult{}, fmt.Errorf("read %q: %w", path, err)
-	}
-	updated, cleanupChanged := mergeManagedHandler(cleanupGroups, cleanupManagedGroup(command), managedHandlerSpec{
-		description:    cleanupManagedDescription,
-		statusMessages: nil,
-		command:        command,
-		eligibleGroup:  matcherTargetsEverySessionEnd,
-	})
-	hooks["SessionEnd"] = updated
 	document["hooks"] = hooks
-	changed := compactChanged || promptChanged || waitChanged || receiveChanged || cleanupChanged
 
 	if !changed {
 		return InstallResult{Path: path, Changed: false}, nil
 	}
-	if err := writeHooksDocument(path, document, mode); err != nil {
+	if err := hookcore.WriteConfigDocument(path, document, mode, harnessLabel); err != nil {
 		return InstallResult{}, err
 	}
 	return InstallResult{Path: path, Changed: true}, nil
@@ -963,105 +452,38 @@ func Install(codexHome, command string) (InstallResult, error) {
 
 func Doctor(codexHome, command string) (DoctorResult, error) {
 	path := filepath.Join(codexHome, "hooks.json")
-	document, _, err := readExistingHooksDocument(path)
+	document, _, _, err := hookcore.ReadExistingConfigDocument(path, harnessLabel, false)
 	if err != nil {
 		return DoctorResult{}, err
 	}
-	hooks, err := existingObjectField(document, "hooks")
+	hooks, err := hookcore.ExistingObjectField(document, "hooks")
 	if err != nil {
 		return DoctorResult{}, fmt.Errorf("read %q: %w", path, err)
 	}
-	if err := validateHooksStructure(hooks); err != nil {
+	if err := hookcore.ValidateHooksStructure(hooks, knownHookEvent); err != nil {
 		return DoctorResult{}, fmt.Errorf("validate %q: %w", path, err)
 	}
-	groups, err := existingArrayField(hooks, "SessionStart")
-	if err != nil {
-		return DoctorResult{}, fmt.Errorf("read %q: %w", path, err)
-	}
-
-	compactInstalled := false
-	for _, item := range groups {
-		group, ok := item.(map[string]any)
-		if !ok || !matcherTargetsCompactOnly(group["matcher"]) {
-			continue
+	for _, spec := range managedHookSpecs() {
+		groups, err := hookcore.ArrayField(hooks, spec.event)
+		if err != nil {
+			return DoctorResult{}, fmt.Errorf("read %q: %w", path, err)
 		}
-		if groupHasCommandWithTimeout(group, command, hookTimeoutSeconds) {
-			compactInstalled = true
-			break
+		installed := false
+		for _, item := range groups {
+			group, ok := item.(map[string]any)
+			if !ok || !spec.eligibleGroup(group) {
+				continue
+			}
+			if hookcore.GroupHasCommandWithTimeout(group, command, spec.timeoutSeconds) {
+				installed = true
+				break
+			}
 		}
-	}
-	if !compactInstalled {
-		return DoctorResult{}, fmt.Errorf("Codex compact hook is not installed in %q; run `waypost install codex-hook`", path)
-	}
-
-	promptGroups, err := existingArrayField(hooks, "UserPromptSubmit")
-	if err != nil {
-		return DoctorResult{}, fmt.Errorf("read %q: %w", path, err)
-	}
-	promptInstalled := false
-	for _, item := range promptGroups {
-		group, ok := item.(map[string]any)
-		if ok && groupHasCommandWithTimeout(group, command, hookTimeoutSeconds) {
-			promptInstalled = true
-			break
+		if !installed {
+			return DoctorResult{}, fmt.Errorf("Codex %s is not installed in %q; run `waypost install codex-hook`", spec.doctorName, path)
 		}
 	}
-	if !promptInstalled {
-		return DoctorResult{}, fmt.Errorf("Codex Waypost nudge hook is not installed in %q; run `waypost install codex-hook`", path)
-	}
-
-	waitGroups, err := arrayField(hooks, "PreToolUse")
-	if err != nil {
-		return DoctorResult{}, fmt.Errorf("read %q: %w", path, err)
-	}
-	waitInstalled := false
-	for _, item := range waitGroups {
-		group, ok := item.(map[string]any)
-		if !ok || !matcherTargetsBashOnly(group["matcher"]) {
-			continue
-		}
-		if groupHasCommandWithTimeout(group, command, hookTimeoutSeconds) {
-			waitInstalled = true
-			break
-		}
-	}
-	if !waitInstalled {
-		return DoctorResult{}, fmt.Errorf("Codex Waypost wait polling guard is not installed in %q; run `waypost install codex-hook`", path)
-	}
-
-	receiveGroups, err := arrayField(hooks, "PostToolUse")
-	if err != nil {
-		return DoctorResult{}, fmt.Errorf("read %q: %w", path, err)
-	}
-	receiveInstalled := false
-	for _, item := range receiveGroups {
-		group, ok := item.(map[string]any)
-		if !ok || !matcherTargetsReceiveCompletionOnly(group["matcher"]) {
-			continue
-		}
-		if groupHasCommandWithTimeout(group, command, hookTimeoutSeconds) {
-			receiveInstalled = true
-			break
-		}
-	}
-	if !receiveInstalled {
-		return DoctorResult{}, fmt.Errorf("Codex Waypost receive completion hook is not installed in %q; run `waypost install codex-hook`", path)
-	}
-
-	cleanupGroups, err := arrayField(hooks, "SessionEnd")
-	if err != nil {
-		return DoctorResult{}, fmt.Errorf("read %q: %w", path, err)
-	}
-	for _, item := range cleanupGroups {
-		group, ok := item.(map[string]any)
-		if !ok || !matcherTargetsEverySessionEnd(group) {
-			continue
-		}
-		if groupHasCommandWithTimeout(group, command, cleanupHookTimeoutSeconds) {
-			return DoctorResult{Path: path, Command: command}, nil
-		}
-	}
-	return DoctorResult{}, fmt.Errorf("Codex Waypost nudge state cleanup hook is not installed in %q; run `waypost install codex-hook`", path)
+	return DoctorResult{Path: path, Command: command}, nil
 }
 
 func compactManagedGroup(command string) map[string]any {
@@ -1135,233 +557,13 @@ func cleanupManagedGroup(command string) map[string]any {
 	}
 }
 
-type managedHandlerSpec struct {
-	description    string
-	statusMessages []string
-	command        string
-	eligibleGroup  func(map[string]any) bool
-}
-
-func mergeManagedHandler(groups []any, desired map[string]any, spec managedHandlerSpec) ([]any, bool) {
-	desiredHandlers := desired["hooks"].([]any)
-	desiredHandler := desiredHandlers[0]
-	updated := make([]any, 0, len(groups)+1)
-	installed := false
-	for _, item := range groups {
-		group, ok := item.(map[string]any)
-		if !ok {
-			updated = append(updated, item)
-			continue
-		}
-
-		description, _ := group["description"].(string)
-		managedGroup := description == spec.description
-		if !managedGroup && !spec.eligibleGroup(group) {
-			updated = append(updated, item)
-			continue
-		}
-
-		handlers, ok := group["hooks"].([]any)
-		if !ok {
-			updated = append(updated, item)
-			continue
-		}
-		if !installed && managedGroup && len(handlers) == 1 && managedCommandHandler(handlers[0], spec, true, 1) {
-			updated = append(updated, desired)
-			installed = true
-			continue
-		}
-
-		kept := make([]any, 0, len(handlers))
-		changed := false
-		keptManagedHandler := false
-		for _, handler := range handlers {
-			if !managedCommandHandler(handler, spec, managedGroup, len(handlers)) {
-				kept = append(kept, handler)
-				continue
-			}
-			changed = true
-			if !installed {
-				kept = append(kept, desiredHandler)
-				installed = true
-				keptManagedHandler = true
-			}
-		}
-		if !changed {
-			updated = append(updated, item)
-			continue
-		}
-		if len(kept) != 0 {
-			preserved := cloneObject(group)
-			preserved["hooks"] = kept
-			if managedGroup && !keptManagedHandler {
-				delete(preserved, "description")
-			}
-			updated = append(updated, preserved)
-		}
-	}
-	if !installed {
-		updated = append(updated, desired)
-	}
-	return updated, !reflect.DeepEqual(groups, updated)
-}
-
-func managedCommandHandler(value any, spec managedHandlerSpec, managedGroup bool, groupSize int) bool {
-	handler, ok := value.(map[string]any)
-	if !ok {
-		return false
-	}
-	handlerType, _ := handler["type"].(string)
-	if handlerType != "command" {
-		return false
-	}
-	handlerCommand, _ := handler["command"].(string)
-	if handlerCommand == spec.command {
-		return true
-	}
-	statusMessage, _ := handler["statusMessage"].(string)
-	for _, managedStatus := range spec.statusMessages {
-		if statusMessage == managedStatus {
-			return true
-		}
-	}
-	return managedGroup && groupSize == 1
-}
-
-func cloneObject(value map[string]any) map[string]any {
-	cloned := make(map[string]any, len(value))
-	for key, item := range value {
-		cloned[key] = item
-	}
-	return cloned
-}
-
-func groupHasCommand(group map[string]any, command string) bool {
-	handlers, ok := group["hooks"].([]any)
-	if !ok {
-		return false
-	}
-	for _, item := range handlers {
-		handler, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		handlerType, _ := handler["type"].(string)
-		handlerCommand, _ := handler["command"].(string)
-		if handlerType == "command" && handlerCommand == command {
-			return true
-		}
-	}
-	return false
-}
-
-func groupHasCommandWithTimeout(group map[string]any, command string, timeoutSeconds int64) bool {
-	handlers, ok := group["hooks"].([]any)
-	if !ok {
-		return false
-	}
-	for _, item := range handlers {
-		handler, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		handlerType, _ := handler["type"].(string)
-		handlerCommand, _ := handler["command"].(string)
-		timeout, ok := handler["timeout"].(json.Number)
-		if handlerType != "command" || handlerCommand != command || !ok {
-			continue
-		}
-		seconds, err := timeout.Int64()
-		if err == nil && seconds == timeoutSeconds {
-			return true
-		}
-	}
-	return false
-}
-
-func matcherTargetsCompactOnly(value any) bool {
-	matcher, ok := value.(string)
-	if !ok {
-		return false
-	}
-	compiled, err := regexp.Compile(matcher)
-	if err != nil || !compiled.MatchString("compact") {
-		return false
-	}
-	for _, other := range []string{"startup", "resume", "clear"} {
-		if compiled.MatchString(other) {
-			return false
-		}
-	}
-	return true
-}
-
-func matcherTargetsBashOnly(value any) bool {
-	matcher, ok := value.(string)
-	return ok && matcher == "^Bash$"
-}
-
 func matcherTargetsReceiveCompletionOnly(value any) bool {
-	matcher, ok := value.(string)
-	if !ok {
-		return false
-	}
-	compiled, err := regexp.Compile(matcher)
-	if err != nil || !compiled.MatchString("Bash") || !compiled.MatchString(receiveMCPToolName) {
-		return false
-	}
-	for _, other := range []string{"apply_patch", "mcp__waypost__waypost_send", "mcp__waypost__waypost_status"} {
-		if compiled.MatchString(other) {
-			return false
-		}
-	}
-	return true
+	return hookcore.MatcherTargetsReceiveCompletionOnly(value, "Bash", receiveMCPToolName,
+		[]string{"apply_patch", "mcp__waypost__waypost_send", "mcp__waypost__waypost_status"})
 }
 
 func matcherTargetsEverySessionEnd(group map[string]any) bool {
-	value, exists := group["matcher"]
-	if !exists || value == nil {
-		return true
-	}
-	matcher, ok := value.(string)
-	if !ok {
-		return false
-	}
-	compiled, err := regexp.Compile(matcher)
-	return err == nil && compiled.MatchString("other")
-}
-
-func validateHooksStructure(hooks map[string]any) error {
-	for event, value := range hooks {
-		groups, ok := value.([]any)
-		if !ok {
-			if knownHookEvent(event) {
-				return fmt.Errorf("hooks.%s must be a JSON array", event)
-			}
-			continue
-		}
-		for groupIndex, value := range groups {
-			group, ok := value.(map[string]any)
-			if !ok {
-				return fmt.Errorf("hooks.%s[%d] must be a JSON object", event, groupIndex)
-			}
-			if matcher, exists := group["matcher"]; exists {
-				if _, ok := matcher.(string); matcher != nil && !ok {
-					return fmt.Errorf("hooks.%s[%d].matcher must be a string", event, groupIndex)
-				}
-			}
-			handlers, ok := group["hooks"].([]any)
-			if !ok {
-				return fmt.Errorf("hooks.%s[%d].hooks must be a JSON array", event, groupIndex)
-			}
-			for handlerIndex, handler := range handlers {
-				if _, ok := handler.(map[string]any); !ok {
-					return fmt.Errorf("hooks.%s[%d].hooks[%d] must be a JSON object", event, groupIndex, handlerIndex)
-				}
-			}
-		}
-	}
-	return nil
+	return hookcore.MatcherFiresForNonToolEvent(group, "other")
 }
 
 func knownHookEvent(name string) bool {
@@ -1373,155 +575,4 @@ func knownHookEvent(name string) bool {
 	default:
 		return false
 	}
-}
-
-func readHooksDocument(path string) (map[string]any, os.FileMode, error) {
-	document, mode, err := readExistingHooksDocument(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return map[string]any{}, 0o600, nil
-	}
-	return document, mode, err
-}
-
-func readExistingHooksDocument(path string) (map[string]any, os.FileMode, error) {
-	contents, err := os.ReadFile(path)
-	if err != nil {
-		return nil, 0, fmt.Errorf("read Codex hooks %q: %w", path, err)
-	}
-	decoder := json.NewDecoder(bytes.NewReader(contents))
-	decoder.UseNumber()
-	var document map[string]any
-	if err := decoder.Decode(&document); err != nil {
-		return nil, 0, fmt.Errorf("parse Codex hooks %q: %w", path, err)
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		if err == nil {
-			err = errors.New("multiple JSON values")
-		}
-		return nil, 0, fmt.Errorf("parse Codex hooks %q: %w", path, err)
-	}
-	if document == nil {
-		return nil, 0, fmt.Errorf("parse Codex hooks %q: expected a JSON object", path)
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, 0, fmt.Errorf("stat Codex hooks %q: %w", path, err)
-	}
-	return document, info.Mode().Perm(), nil
-}
-
-func objectField(document map[string]any, name string) (map[string]any, error) {
-	value, ok := document[name]
-	if !ok {
-		return map[string]any{}, nil
-	}
-	object, ok := value.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("field %q must be a JSON object", name)
-	}
-	return object, nil
-}
-
-func existingObjectField(document map[string]any, name string) (map[string]any, error) {
-	value, ok := document[name]
-	if !ok {
-		return nil, fmt.Errorf("field %q is missing", name)
-	}
-	object, ok := value.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("field %q must be a JSON object", name)
-	}
-	return object, nil
-}
-
-func arrayField(document map[string]any, name string) ([]any, error) {
-	value, ok := document[name]
-	if !ok {
-		return nil, nil
-	}
-	array, ok := value.([]any)
-	if !ok {
-		return nil, fmt.Errorf("field %q must be a JSON array", name)
-	}
-	return array, nil
-}
-
-func existingArrayField(document map[string]any, name string) ([]any, error) {
-	value, ok := document[name]
-	if !ok {
-		return nil, fmt.Errorf("field %q is missing", name)
-	}
-	array, ok := value.([]any)
-	if !ok {
-		return nil, fmt.Errorf("field %q must be a JSON array", name)
-	}
-	return array, nil
-}
-
-func writeHooksDocument(path string, document map[string]any, mode os.FileMode) error {
-	contents, err := json.MarshalIndent(document, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode Codex hooks %q: %w", path, err)
-	}
-	contents = append(contents, '\n')
-	writePath, err := resolveHooksWritePath(path)
-	if err != nil {
-		return err
-	}
-	writeDir := filepath.Dir(writePath)
-	if err := os.MkdirAll(writeDir, 0o700); err != nil {
-		return fmt.Errorf("create Codex hooks directory %q: %w", writeDir, err)
-	}
-
-	temporary, err := os.CreateTemp(writeDir, ".hooks.json.tmp-*")
-	if err != nil {
-		return fmt.Errorf("create temporary Codex hooks file: %w", err)
-	}
-	temporaryPath := temporary.Name()
-	defer func() {
-		_ = temporary.Close()
-		_ = os.Remove(temporaryPath)
-	}()
-	if err := temporary.Chmod(mode); err != nil {
-		return fmt.Errorf("set Codex hooks permissions: %w", err)
-	}
-	if _, err := temporary.Write(contents); err != nil {
-		return fmt.Errorf("write temporary Codex hooks: %w", err)
-	}
-	if err := temporary.Sync(); err != nil {
-		return fmt.Errorf("sync temporary Codex hooks: %w", err)
-	}
-	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("close temporary Codex hooks: %w", err)
-	}
-	if err := replaceHooksFile(temporaryPath, writePath); err != nil {
-		return fmt.Errorf("replace Codex hooks %q: %w", path, err)
-	}
-	return nil
-}
-
-func resolveHooksWritePath(path string) (string, error) {
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return path, nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("inspect Codex hooks %q: %w", path, err)
-	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		return path, nil
-	}
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return "", fmt.Errorf("resolve Codex hooks symlink %q: %w", path, err)
-	}
-	return resolved, nil
-}
-
-func quoteCommandPath(path string) string {
-	if runtime.GOOS == "windows" {
-		return `"` + strings.ReplaceAll(path, `"`, `\"`) + `"`
-	}
-	return "'" + strings.ReplaceAll(path, "'", "'\"'\"'") + "'"
 }

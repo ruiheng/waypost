@@ -157,6 +157,30 @@ func TestRunInstallMCPServer(t *testing.T) {
 	}
 }
 
+func TestRunInstallMCPServerPrintsPartialSuccessOnError(t *testing.T) {
+	t.Parallel()
+
+	var stdout, stderr bytes.Buffer
+	app := New(strings.NewReader(""), &stdout, &stderr)
+	app.installMCPServer = func(context.Context) (mcpinstall.Result, error) {
+		return mcpinstall.Result{
+			Configured: []mcpinstall.ConfiguredAgent{
+				{Name: "Codex", Path: "/tmp/codex/config.toml"},
+				{Name: "Claude Code", Path: "/tmp/home/.claude.json"},
+			},
+		}, errors.New("configure Devin MCP server: permission denied")
+	}
+
+	err := app.Run(context.Background(), []string{"install", "mcp-server"})
+	if err == nil || !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("Run(install mcp-server) error = %v, want configure failure", err)
+	}
+	got := stderr.String()
+	if !strings.Contains(got, "partially installed") || !strings.Contains(got, "Codex: /tmp/codex/config.toml") || !strings.Contains(got, "Claude Code: /tmp/home/.claude.json") || !strings.Contains(got, "Re-run") {
+		t.Fatalf("stderr = %q, want partial-success summary with recovery hint", got)
+	}
+}
+
 func TestRunInstallMCPServerHelp(t *testing.T) {
 	t.Parallel()
 

@@ -13,6 +13,7 @@ var strictSessionAddressSchemes = map[string]struct{}{
 	"agent-deck": {},
 	"claude":     {},
 	"codex":      {},
+	"devin":      {},
 	"gemini":     {},
 	"opencode":   {},
 	"thurbox":    {},

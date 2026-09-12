@@ -136,7 +136,7 @@ func toolSessionEnvDiagnostic(name, value string, present bool) map[string]any {
 		return diagnostic
 	}
 	diagnostic["value"] = value
-	if failure := toolSessionIDValidationFailure(value); failure != "" {
+	if failure := toolSessionValidationFailureForEnv(name, value); failure != "" {
 		diagnostic["failure_reason"] = failure
 		return diagnostic
 	}

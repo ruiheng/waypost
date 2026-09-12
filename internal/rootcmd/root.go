@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/ruiheng/waypost/internal/codexhook"
+	"github.com/ruiheng/waypost/internal/devinhook"
 	"github.com/ruiheng/waypost/internal/mcpinstall"
 	"github.com/ruiheng/waypost/internal/mcpserver"
 	"github.com/ruiheng/waypost/internal/version"
@@ -24,6 +26,7 @@ type App struct {
 	runMCP                              func(context.Context, mcpserver.Options) error
 	runWeb                              func(context.Context, webui.Options) error
 	currentDirectoryWaypostMCPAvailable func(context.Context) (bool, error)
+	currentDirectoryDevinMCPStatus      func(context.Context) (devinhook.WaypostMCPStatus, error)
 	installMCPServer                    func(context.Context) (mcpinstall.Result, error)
 	notifyWaypostSend                   waypost.SendNotifier
 }
@@ -40,6 +43,7 @@ func New(stdin io.Reader, stdout, stderr io.Writer) *App {
 		},
 		runWeb:                              webui.Run,
 		currentDirectoryWaypostMCPAvailable: codexhook.CurrentDirectoryWaypostMCPAvailable,
+		currentDirectoryDevinMCPStatus:      devinhook.CurrentDirectoryWaypostMCPStatus,
 		installMCPServer:                    mcpinstall.Install,
 		notifyWaypostSend:                   mcpserver.NotifyWaypostSend,
 	}
@@ -59,10 +63,13 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return err
 	}
 	if len(rest) == 0 {
-		return errors.New("expected a command: mcp, codex-hook, install, doctor, migrate, doc, send, forward, recv, wait, watch, read, show, ack, renew, release, defer, undefer, fail, dead-letter, list, stale, group, or address")
+		return errors.New("expected a command: mcp, codex-hook, devin-hook, install, doctor, migrate, doc, send, forward, recv, wait, watch, read, show, ack, renew, release, defer, undefer, fail, dead-letter, list, stale, group, or address")
 	}
 	if rest[0] == "codex-hook" {
 		return a.runCodexHookCommand(ctx, rest[1:])
+	}
+	if rest[0] == "devin-hook" {
+		return a.runDevinHookCommand(ctx, rest[1:])
 	}
 	if rest[0] == "install" {
 		return a.runInstallCommand(ctx, rest[1:])
@@ -95,6 +102,17 @@ func (a *App) runCodexHookCommand(ctx context.Context, args []string) error {
 		return fmt.Errorf("codex-hook does not accept arguments")
 	}
 	return codexhook.Run(ctx, a.stdin, a.stdout)
+}
+
+func (a *App) runDevinHookCommand(ctx context.Context, args []string) error {
+	if len(args) == 1 && isHelpArg(args[0]) {
+		a.writeDevinHookHelp()
+		return waypost.ErrHelpRequested
+	}
+	if len(args) != 0 {
+		return fmt.Errorf("devin-hook does not accept arguments")
+	}
+	return devinhook.Run(ctx, a.stdin, a.stdout)
 }
 
 func (a *App) runInstallCommand(ctx context.Context, args []string) error {
@@ -130,6 +148,38 @@ func (a *App) runInstallCommand(ctx context.Context, args []string) error {
 		}
 		_, err = fmt.Fprintf(a.stdout, "Codex hooks %s: %s\nCodex hook trust: review the Waypost hooks with `/hooks` in Codex before use\n", status, result.Path)
 		return err
+	case "devin-hook":
+		if len(args) == 2 && isHelpArg(args[1]) {
+			a.writeInstallDevinHookHelp()
+			return waypost.ErrHelpRequested
+		}
+		if len(args) != 1 {
+			return fmt.Errorf("install devin-hook does not accept arguments")
+		}
+
+		configDir, err := devinhook.DefaultConfigDir()
+		if err != nil {
+			return err
+		}
+		command, err := devinhook.CurrentCommand()
+		if err != nil {
+			return err
+		}
+		result, err := devinhook.Install(configDir, command)
+		if err != nil {
+			return err
+		}
+		status := "installed"
+		if !result.Changed {
+			status = "already installed"
+		}
+		var summary strings.Builder
+		fmt.Fprintf(&summary, "Devin hooks %s: %s\n", status, result.Path)
+		for _, warning := range result.Warnings {
+			fmt.Fprintf(&summary, "Warning: %s\n", warning)
+		}
+		_, err = fmt.Fprint(a.stdout, summary.String())
+		return err
 	case "mcp-server", "mcp-sever":
 		if len(args) == 2 && isHelpArg(args[1]) {
 			a.writeInstallMCPServerHelp()
@@ -143,18 +193,43 @@ func (a *App) runInstallCommand(ctx context.Context, args []string) error {
 		}
 		result, err := a.installMCPServer(ctx)
 		if err != nil {
+			if len(result.Configured) > 0 || len(result.Warnings) > 0 {
+				var partial strings.Builder
+				if len(result.Configured) > 0 {
+					partial.WriteString("Waypost MCP server partially installed:\n")
+					for _, agent := range result.Configured {
+						fmt.Fprintf(&partial, "  %s: %s\n", agent.Name, agent.Path)
+					}
+					partial.WriteString("Re-run `waypost install mcp-server` after fixing the error; completed entries are left in place.\n")
+				}
+				for _, warning := range result.Warnings {
+					fmt.Fprintf(&partial, "Warning: %s\n", warning)
+				}
+				fmt.Fprint(a.stderr, partial.String())
+			}
 			return err
 		}
 		status := "installed"
 		if !result.Changed {
 			status = "already installed"
 		}
-		if _, err = fmt.Fprintf(a.stdout, "Waypost MCP server %s: %s\nCommand: %s\n", status, result.Path, result.Command); err != nil {
-			return err
+		configured := result.Configured
+		if len(configured) == 0 && result.Path != "" {
+			configured = []mcpinstall.ConfiguredAgent{{Name: "Codex", Path: result.Path}}
 		}
-		return nil
+		var summary strings.Builder
+		fmt.Fprintf(&summary, "Waypost MCP server %s:\n", status)
+		for _, agent := range configured {
+			fmt.Fprintf(&summary, "  %s: %s\n", agent.Name, agent.Path)
+		}
+		fmt.Fprintf(&summary, "Command: %s\n", result.Command)
+		for _, warning := range result.Warnings {
+			fmt.Fprintf(&summary, "Warning: %s\n", warning)
+		}
+		_, err = fmt.Fprint(a.stdout, summary.String())
+		return err
 	default:
-		return fmt.Errorf("unknown install target %q; expected codex-hook or mcp-server", args[0])
+		return fmt.Errorf("unknown install target %q; expected codex-hook, devin-hook, or mcp-server", args[0])
 	}
 }
 
@@ -163,38 +238,75 @@ func (a *App) runDoctorCommand(ctx context.Context, args []string) error {
 		a.writeDoctorHelp()
 		return waypost.ErrHelpRequested
 	}
-	if args[0] != "codex-hook" {
-		return fmt.Errorf("unknown doctor target %q; expected codex-hook", args[0])
-	}
-	if len(args) == 2 && isHelpArg(args[1]) {
-		a.writeDoctorCodexHookHelp()
-		return waypost.ErrHelpRequested
-	}
-	if len(args) != 1 {
-		return fmt.Errorf("doctor codex-hook does not accept arguments")
-	}
+	switch args[0] {
+	case "codex-hook":
+		if len(args) == 2 && isHelpArg(args[1]) {
+			a.writeDoctorCodexHookHelp()
+			return waypost.ErrHelpRequested
+		}
+		if len(args) != 1 {
+			return fmt.Errorf("doctor codex-hook does not accept arguments")
+		}
 
-	home, err := codexhook.DefaultHome()
-	if err != nil {
+		home, err := codexhook.DefaultHome()
+		if err != nil {
+			return err
+		}
+		command, err := codexhook.CurrentCommand()
+		if err != nil {
+			return err
+		}
+		result, err := codexhook.Doctor(home, command)
+		if err != nil {
+			return err
+		}
+		mcpStatus := "not available to a new Codex process in the current directory (an already-running session, profile, or `-c` override may differ)"
+		available, probeErr := a.currentDirectoryWaypostMCPAvailable(ctx)
+		if probeErr != nil {
+			mcpStatus = fmt.Sprintf("availability to a new Codex process in the current directory is unknown: %v (an already-running session, profile, or `-c` override may differ)", probeErr)
+		} else if available {
+			mcpStatus = "available to a new Codex process in the current directory (an already-running session, profile, or `-c` override may differ)"
+		}
+		_, err = fmt.Fprintf(a.stdout, "Codex compact hook: configured\nCodex nudge hook: configured\nCodex wait polling guard: configured\nCodex receive completion tracker: configured\nCodex nudge state cleanup: configured\nCodex hook trust: not checked; verify with `/hooks` in Codex\nWaypost MCP: %s\nHooks file: %s\nCommand: %s\n", mcpStatus, result.Path, result.Command)
 		return err
-	}
-	command, err := codexhook.CurrentCommand()
-	if err != nil {
+	case "devin-hook":
+		if len(args) == 2 && isHelpArg(args[1]) {
+			a.writeDoctorDevinHookHelp()
+			return waypost.ErrHelpRequested
+		}
+		if len(args) != 1 {
+			return fmt.Errorf("doctor devin-hook does not accept arguments")
+		}
+
+		configDir, err := devinhook.DefaultConfigDir()
+		if err != nil {
+			return err
+		}
+		command, err := devinhook.CurrentCommand()
+		if err != nil {
+			return err
+		}
+		result, err := devinhook.Doctor(configDir, command)
+		if err != nil {
+			return err
+		}
+		mcpStatus := "not available to a new Devin process in the current directory (an already-running session or imported configuration may differ)"
+		if a.currentDirectoryDevinMCPStatus != nil {
+			status, probeErr := a.currentDirectoryDevinMCPStatus(ctx)
+			switch {
+			case probeErr != nil:
+				mcpStatus = fmt.Sprintf("availability to a new Devin process in the current directory is unknown: %v (an already-running session or imported configuration may differ)", probeErr)
+			case status.Available && len(status.DisabledTools) > 0:
+				mcpStatus = fmt.Sprintf("available to a new Devin process in the current directory, but disabled tools: %s (an already-running session or imported configuration may differ)", strings.Join(status.DisabledTools, ", "))
+			case status.Available:
+				mcpStatus = "available to a new Devin process in the current directory (an already-running session or imported configuration may differ)"
+			}
+		}
+		_, err = fmt.Fprintf(a.stdout, "Devin PostCompaction hook: configured\nDevin SessionStart hook: configured\nDevin nudge hook: configured\nDevin wait polling guard: configured\nDevin receive completion tracker: configured\nDevin nudge state cleanup: configured\nWaypost MCP: %s\nConfig file: %s\nCommand: %s\n", mcpStatus, result.Path, result.Command)
 		return err
+	default:
+		return fmt.Errorf("unknown doctor target %q; expected codex-hook or devin-hook", args[0])
 	}
-	result, err := codexhook.Doctor(home, command)
-	if err != nil {
-		return err
-	}
-	mcpStatus := "not available to a new Codex process in the current directory (an already-running session, profile, or `-c` override may differ)"
-	available, probeErr := a.currentDirectoryWaypostMCPAvailable(ctx)
-	if probeErr != nil {
-		mcpStatus = fmt.Sprintf("availability to a new Codex process in the current directory is unknown: %v (an already-running session, profile, or `-c` override may differ)", probeErr)
-	} else if available {
-		mcpStatus = "available to a new Codex process in the current directory (an already-running session, profile, or `-c` override may differ)"
-	}
-	_, err = fmt.Fprintf(a.stdout, "Codex compact hook: configured\nCodex nudge hook: configured\nCodex wait polling guard: configured\nCodex receive completion tracker: configured\nCodex nudge state cleanup: configured\nCodex hook trust: not checked; verify with `/hooks` in Codex\nWaypost MCP: %s\nHooks file: %s\nCommand: %s\n", mcpStatus, result.Path, result.Command)
-	return err
 }
 
 func parseGlobalArgs(args []string) (string, []string, bool, bool, error) {
@@ -330,6 +442,7 @@ func (a *App) writeRootHelp() {
 		"Commands:",
 		"  mcp                 Run the built-in stdio MCP server",
 		"  codex-hook          Emit Codex Waypost hook context",
+		"  devin-hook          Emit Devin Waypost hook context",
 		"  install             Install an optional integration",
 		"  doctor              Diagnose an optional integration",
 		"  migrate             Move state from the previous default directory",
@@ -377,6 +490,21 @@ func (a *App) writeCodexHookHelp() {
 	})
 }
 
+func (a *App) writeDevinHookHelp() {
+	writeHelp(a.stdout, []string{
+		"Usage:",
+		"  waypost devin-hook",
+		"",
+		"Track pending and consumed Waypost nudges for the current Devin session.",
+		"For a Waypost nudge on UserPromptSubmit, probe `devin mcp get waypost` and",
+		"emit one receive instruction: waypost_recv when available, CLI otherwise.",
+		"After a successful receive, PostCompaction emits an anti-repeat guard.",
+		"For PreToolUse exec calls, warn before waypost wait; when MCP is available,",
+		"block waypost status, recv, receive, and send in favor of Waypost MCP tools.",
+		"The waypost mcp CLI command is always blocked; install it with waypost install mcp-server.",
+	})
+}
+
 func (a *App) writeInstallHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
@@ -384,6 +512,7 @@ func (a *App) writeInstallHelp() {
 		"",
 		"Install optional Waypost integrations:",
 		"  codex-hook              Install Codex lifecycle hooks",
+		"  devin-hook              Install Devin lifecycle hooks",
 		"  mcp-server              Install Waypost MCP in Codex and detected agent configs",
 	})
 }
@@ -400,26 +529,43 @@ func (a *App) writeInstallCodexHookHelp() {
 	})
 }
 
+func (a *App) writeInstallDevinHookHelp() {
+	writeHelp(a.stdout, []string{
+		"Usage:",
+		"  waypost install devin-hook",
+		"",
+		"Merge Devin nudge lifecycle, compaction guard, receive tracking, and wait",
+		"hooks into the user-level Devin config (~/.config/devin/config.json).",
+		"The command is idempotent and preserves unrelated hooks and settings.",
+	})
+}
+
 func (a *App) writeInstallMCPServerHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
 		"  waypost install mcp-server",
 		"",
 		"Install the built-in Waypost MCP server in Codex's global config and",
-		"configure Claude Code and agy when those agents are installed.",
-		"The command is idempotent, preserves unrelated Codex settings, and ensures",
+		"configure Claude Code, agy, and Devin when those agents are installed",
+		"(detected by CLI or an existing configuration). Codex is no longer",
+		"required: on a Devin-only machine the command writes",
+		"~/.config/devin/mcp_config.json instead.",
+		"The command is idempotent, preserves unrelated settings, and ensures",
 		"Waypost session environment passthrough, required startup, and the",
-		"660-second tool timeout. Claude Code has no equivalent required switch;",
-		"agy is enabled when configured (its disabled flag is removed).",
+		"660-second tool timeout in Codex. Claude Code has no equivalent required",
+		"switch; agy is enabled when configured (its disabled flag is removed);",
+		"Devin gets a stdio transport entry.",
 	})
 }
 
 func (a *App) writeDoctorHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
-		"  waypost doctor codex-hook",
+		"  waypost doctor <target>",
 		"",
-		"Diagnose optional Waypost integrations.",
+		"Diagnose optional Waypost integrations:",
+		"  codex-hook              Diagnose Codex lifecycle hooks",
+		"  devin-hook              Diagnose Devin lifecycle hooks",
 	})
 }
 
@@ -430,6 +576,15 @@ func (a *App) writeDoctorCodexHookHelp() {
 		"",
 		"Verify all Codex hook definitions and report MCP availability for a new Codex process in the current directory.",
 		"Codex hook trust must be verified interactively with `/hooks`.",
+	})
+}
+
+func (a *App) writeDoctorDevinHookHelp() {
+	writeHelp(a.stdout, []string{
+		"Usage:",
+		"  waypost doctor devin-hook",
+		"",
+		"Verify all Devin hook definitions and report MCP availability for a new Devin process in the current directory.",
 	})
 }
 

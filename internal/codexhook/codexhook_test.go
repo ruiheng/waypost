@@ -10,7 +10,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/ruiheng/waypost/internal/hookcore"
 	"github.com/ruiheng/waypost/internal/launchpath"
 )
 
@@ -203,7 +205,7 @@ func TestFileNudgeStateStorePersistsAndClearsSessionState(t *testing.T) {
 	t.Parallel()
 
 	stateDir := filepath.Join(t.TempDir(), "hook-state")
-	store := fileNudgeStateStore{dir: stateDir}
+	store := fileNudgeStateStore{Dir: stateDir, Label: harnessLabel}
 	const sessionID = "session/with unsafe path characters"
 	if err := store.Save(sessionID, nudgePending); err != nil {
 		t.Fatalf("Save(pending) error = %v", err)
@@ -333,16 +335,19 @@ printf '%s\n' '{"name":"waypost","enabled":true}'
 	if err := os.WriteFile(codexPath, []byte(probe), 0o700); err != nil {
 		t.Fatalf("WriteFile(codex probe) error = %v", err)
 	}
-	t.Setenv("PATH", binDir)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CODEX_HOME", t.TempDir())
 
+	realProbe := func(ctx context.Context) (bool, error) {
+		return probeWaypostMCPWithTimeout(ctx, 30*time.Second)
+	}
 	input := strings.NewReader(`{
   "hook_event_name": "UserPromptSubmit",
   "session_id": "session-real-probe",
   "prompt": "NOTICE: There might be new delivery in waypost."
 }`)
 	var output bytes.Buffer
-	if err := run(context.Background(), input, &output); err != nil {
+	if err := runWithMCPProbe(context.Background(), input, &output, realProbe); err != nil {
 		t.Fatalf("run(UserPromptSubmit) error = %v", err)
 	}
 	var payload hookOutput
@@ -382,9 +387,9 @@ func TestRunReusesMCPProbeForSession(t *testing.T) {
 }
 
 func TestFileMCPProbeRejectsMissingAvailability(t *testing.T) {
-	store := fileNudgeStateStore{dir: t.TempDir()}
+	store := fileNudgeStateStore{Dir: t.TempDir(), Label: harnessLabel}
 	sessionID := "incomplete-probe"
-	path, err := store.probePath(sessionID)
+	path, err := store.ProbePath(sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -775,42 +780,42 @@ func TestInstallRefreshesManagedGroupsInPlace(t *testing.T) {
 	hooks := document["hooks"].(map[string]any)
 
 	compactGroups := hooks["SessionStart"].([]any)
-	if !groupHasCommand(compactGroups[0].(map[string]any), command) {
+	if !hookcore.GroupHasCommand(compactGroups[0].(map[string]any), command) {
 		t.Fatalf("SessionStart[0] = %#v, want refreshed Waypost group", compactGroups[0])
 	}
-	if !groupHasCommand(compactGroups[1].(map[string]any), "keep-compact-position") {
+	if !hookcore.GroupHasCommand(compactGroups[1].(map[string]any), "keep-compact-position") {
 		t.Fatalf("SessionStart[1] = %#v, want unrelated group at original position", compactGroups[1])
 	}
 
 	promptGroups := hooks["UserPromptSubmit"].([]any)
-	if !groupHasCommand(promptGroups[0].(map[string]any), command) {
+	if !hookcore.GroupHasCommand(promptGroups[0].(map[string]any), command) {
 		t.Fatalf("UserPromptSubmit[0] = %#v, want refreshed Waypost group", promptGroups[0])
 	}
-	if !groupHasCommand(promptGroups[1].(map[string]any), "keep-prompt-position") {
+	if !hookcore.GroupHasCommand(promptGroups[1].(map[string]any), "keep-prompt-position") {
 		t.Fatalf("UserPromptSubmit[1] = %#v, want unrelated group at original position", promptGroups[1])
 	}
 
 	waitGroups := hooks["PreToolUse"].([]any)
-	if !groupHasCommand(waitGroups[0].(map[string]any), command) {
+	if !hookcore.GroupHasCommand(waitGroups[0].(map[string]any), command) {
 		t.Fatalf("PreToolUse[0] = %#v, want refreshed Waypost group", waitGroups[0])
 	}
-	if !groupHasCommand(waitGroups[1].(map[string]any), "keep-tool-position") {
+	if !hookcore.GroupHasCommand(waitGroups[1].(map[string]any), "keep-tool-position") {
 		t.Fatalf("PreToolUse[1] = %#v, want unrelated group at original position", waitGroups[1])
 	}
 
 	receiveGroups := hooks["PostToolUse"].([]any)
-	if !groupHasCommand(receiveGroups[0].(map[string]any), command) {
+	if !hookcore.GroupHasCommand(receiveGroups[0].(map[string]any), command) {
 		t.Fatalf("PostToolUse[0] = %#v, want refreshed Waypost group", receiveGroups[0])
 	}
-	if !groupHasCommand(receiveGroups[1].(map[string]any), "keep-post-tool-position") {
+	if !hookcore.GroupHasCommand(receiveGroups[1].(map[string]any), "keep-post-tool-position") {
 		t.Fatalf("PostToolUse[1] = %#v, want unrelated group at original position", receiveGroups[1])
 	}
 
 	cleanupGroups := hooks["SessionEnd"].([]any)
-	if !groupHasCommand(cleanupGroups[0].(map[string]any), command) {
+	if !hookcore.GroupHasCommand(cleanupGroups[0].(map[string]any), command) {
 		t.Fatalf("SessionEnd[0] = %#v, want refreshed Waypost group", cleanupGroups[0])
 	}
-	if !groupHasCommand(cleanupGroups[1].(map[string]any), "keep-session-end-position") {
+	if !hookcore.GroupHasCommand(cleanupGroups[1].(map[string]any), "keep-session-end-position") {
 		t.Fatalf("SessionEnd[1] = %#v, want unrelated group at original position", cleanupGroups[1])
 	}
 }
@@ -862,11 +867,11 @@ exit 1
 	if err := os.WriteFile(codexPath, []byte(probe), 0o700); err != nil {
 		t.Fatalf("WriteFile(codex probe) error = %v", err)
 	}
-	t.Setenv("PATH", binDir)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	available, err := CurrentDirectoryWaypostMCPAvailable(context.Background())
+	available, err := probeWaypostMCPWithTimeout(context.Background(), 30*time.Second)
 	if err != nil || available {
-		t.Fatalf("CurrentDirectoryWaypostMCPAvailable() = %v, %v; want unavailable", available, err)
+		t.Fatalf("probeWaypostMCPWithTimeout() = %v, %v; want unavailable", available, err)
 	}
 }
 
@@ -896,11 +901,11 @@ exit 9
 	if err := os.WriteFile(codexPath, []byte(probe), 0o700); err != nil {
 		t.Fatalf("WriteFile(codex probe) error = %v", err)
 	}
-	t.Setenv("PATH", binDir)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	available, err := CurrentDirectoryWaypostMCPAvailable(context.Background())
+	available, err := probeWaypostMCPWithTimeout(context.Background(), 30*time.Second)
 	if err == nil || !strings.Contains(err.Error(), "invalid Codex MCP configuration") {
-		t.Fatalf("CurrentDirectoryWaypostMCPAvailable() = %v, %v; want stderr detail", available, err)
+		t.Fatalf("probeWaypostMCPWithTimeout() = %v, %v; want stderr detail", available, err)
 	}
 }
 
@@ -973,7 +978,7 @@ func TestInstallPreservesUnrelatedHooksAndIsIdempotent(t *testing.T) {
 	if got := len(preToolGroups); got != 2 {
 		t.Fatalf("PreToolUse hooks = %d, want existing plus Waypost", got)
 	}
-	if !groupHasCommand(preToolGroups[0].(map[string]any), "check-bash") || !groupHasCommand(preToolGroups[1].(map[string]any), command) {
+	if !hookcore.GroupHasCommand(preToolGroups[0].(map[string]any), "check-bash") || !hookcore.GroupHasCommand(preToolGroups[1].(map[string]any), command) {
 		t.Fatalf("PreToolUse hooks = %#v, want preserved existing group followed by Waypost", preToolGroups)
 	}
 	if got := len(hooks["SessionStart"].([]any)); got != 2 {
@@ -986,14 +991,14 @@ func TestInstallPreservesUnrelatedHooksAndIsIdempotent(t *testing.T) {
 	if got := len(postToolGroups); got != 2 {
 		t.Fatalf("PostToolUse hooks = %d, want existing plus Waypost", got)
 	}
-	if !groupHasCommand(postToolGroups[0].(map[string]any), "review-patch") || !groupHasCommand(postToolGroups[1].(map[string]any), command) {
+	if !hookcore.GroupHasCommand(postToolGroups[0].(map[string]any), "review-patch") || !hookcore.GroupHasCommand(postToolGroups[1].(map[string]any), command) {
 		t.Fatalf("PostToolUse hooks = %#v, want preserved existing group followed by Waypost", postToolGroups)
 	}
 	sessionEndGroups := hooks["SessionEnd"].([]any)
 	if got := len(sessionEndGroups); got != 2 {
 		t.Fatalf("SessionEnd hooks = %d, want existing plus Waypost", got)
 	}
-	if !groupHasCommand(sessionEndGroups[0].(map[string]any), "archive-session") || !groupHasCommand(sessionEndGroups[1].(map[string]any), command) {
+	if !hookcore.GroupHasCommand(sessionEndGroups[0].(map[string]any), "archive-session") || !hookcore.GroupHasCommand(sessionEndGroups[1].(map[string]any), command) {
 		t.Fatalf("SessionEnd hooks = %#v, want preserved existing group followed by Waypost", sessionEndGroups)
 	}
 	info, err := os.Stat(path)
@@ -1099,7 +1104,7 @@ func TestInstallPreservesSiblingHandlersWhenAdoptingGroups(t *testing.T) {
 		t.Fatalf("SessionStart groups = %d, want mixed group updated in place", got)
 	}
 	preservedCompact := compactGroups[0].(map[string]any)
-	if preservedCompact["custom"] != "keep-compact" || !groupHasCommand(preservedCompact, "keep-compact-sibling") {
+	if preservedCompact["custom"] != "keep-compact" || !hookcore.GroupHasCommand(preservedCompact, "keep-compact-sibling") {
 		t.Fatalf("preserved compact group = %#v, want custom field and sibling handler", preservedCompact)
 	}
 	compactHandlers := preservedCompact["hooks"].([]any)
@@ -1112,7 +1117,7 @@ func TestInstallPreservesSiblingHandlersWhenAdoptingGroups(t *testing.T) {
 		t.Fatalf("UserPromptSubmit groups = %d, want mixed group updated in place", got)
 	}
 	preservedPrompt := promptGroups[0].(map[string]any)
-	if preservedPrompt["custom"] != "keep-prompt" || !groupHasCommand(preservedPrompt, "keep-prompt-sibling") {
+	if preservedPrompt["custom"] != "keep-prompt" || !hookcore.GroupHasCommand(preservedPrompt, "keep-prompt-sibling") {
 		t.Fatalf("preserved prompt group = %#v, want custom field and sibling handler", preservedPrompt)
 	}
 	promptHandlers := preservedPrompt["hooks"].([]any)
@@ -1125,7 +1130,7 @@ func TestInstallPreservesSiblingHandlersWhenAdoptingGroups(t *testing.T) {
 		t.Fatalf("PreToolUse groups = %d, want mixed group updated in place", got)
 	}
 	preservedWait := waitGroups[0].(map[string]any)
-	if preservedWait["custom"] != "keep-wait" || !groupHasCommand(preservedWait, "keep-wait-sibling") {
+	if preservedWait["custom"] != "keep-wait" || !hookcore.GroupHasCommand(preservedWait, "keep-wait-sibling") {
 		t.Fatalf("preserved wait group = %#v, want custom field and sibling handler", preservedWait)
 	}
 	waitHandlers := preservedWait["hooks"].([]any)
@@ -1157,7 +1162,7 @@ func TestCurrentCommandUsesStableLauncherPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CurrentCommand() error = %v", err)
 	}
-	want := quoteCommandPath(stable) + " codex-hook"
+	want := hookcore.QuoteCommandPath(stable) + " codex-hook"
 	if runtime.GOOS == "windows" {
 		want = "& " + want
 	}

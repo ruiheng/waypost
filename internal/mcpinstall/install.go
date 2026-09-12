@@ -13,6 +13,9 @@ import (
 	"strings"
 
 	"github.com/ruiheng/waypost/internal/codexhook"
+	"github.com/ruiheng/waypost/internal/devinconfig"
+	"github.com/ruiheng/waypost/internal/hookcore"
+	"github.com/ruiheng/waypost/internal/jsonc"
 	"github.com/ruiheng/waypost/internal/launchpath"
 )
 
@@ -37,9 +40,20 @@ var requiredEnvVars = []string{
 
 // Result describes the agent configurations changed by an MCP installation.
 type Result struct {
-	Path    string
-	Command string
-	Changed bool
+	// Path is the Codex config path; it is empty when Codex was not detected.
+	Path       string
+	Command    string
+	Changed    bool
+	Configured []ConfiguredAgent
+	// Warnings describes non-fatal side effects of the installation, such as
+	// JSONC syntax being normalized to strict JSON on rewrite.
+	Warnings []string
+}
+
+// ConfiguredAgent names one agent configuration ensured by an installation.
+type ConfiguredAgent struct {
+	Name string
+	Path string
 }
 
 type commandOutput struct {
@@ -55,10 +69,12 @@ type dependencies struct {
 	resolveHome       func() (string, error)
 	resolveUserHome   func() (string, error)
 	lookPath          func(string) (string, error)
+	getwd             func() (string, error)
 }
 
-// Install registers the built-in Waypost MCP server in Codex's global
-// configuration and updates detected Claude Code and agy configurations. It
+// Install registers the built-in Waypost MCP server in the configuration of
+// every detected agent: Codex, Claude Code, agy, and Devin. An agent is
+// detected when its CLI is installed or its configuration already exists. It
 // uses the stable Waypost executable path so upgrades do not leave an agent
 // pointing at a versioned binary.
 func Install(ctx context.Context) (Result, error) {
@@ -68,6 +84,7 @@ func Install(ctx context.Context) (Result, error) {
 		resolveHome:       codexhook.DefaultHome,
 		resolveUserHome:   os.UserHomeDir,
 		lookPath:          exec.LookPath,
+		getwd:             os.Getwd,
 	})
 }
 
@@ -79,9 +96,9 @@ func installWithDependencies(ctx context.Context, deps dependencies) (Result, er
 		return Result{}, errors.New("MCP installer dependencies are incomplete")
 	}
 
-	codexPath, err := deps.lookPath("codex")
+	executable, err := deps.resolveExecutable()
 	if err != nil {
-		return Result{}, fmt.Errorf("find Codex CLI: %w; install Codex before running `waypost install mcp-server`", err)
+		return Result{}, fmt.Errorf("resolve Waypost executable: %w", err)
 	}
 	var userHome string
 	if deps.resolveUserHome != nil {
@@ -93,65 +110,99 @@ func installWithDependencies(ctx context.Context, deps dependencies) (Result, er
 			return Result{}, err
 		}
 	}
-	home, err := deps.resolveHome()
-	if err != nil {
-		return Result{}, err
+
+	// Codex is configured when its CLI is installed or its global config
+	// already exists. It is no longer a mandatory target: a Devin-only
+	// machine must still be able to install the Waypost MCP server.
+	codexPath, codexLookErr := deps.lookPath("codex")
+	home, homeErr := deps.resolveHome()
+	configureCodex := codexLookErr == nil
+	configPath := ""
+	if homeErr == nil {
+		configPath = filepath.Join(home, configFileName)
+		if _, statErr := os.Stat(configPath); statErr == nil {
+			configureCodex = true
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return Result{}, fmt.Errorf("inspect Codex config %q: %w", configPath, statErr)
+		}
 	}
-	executable, err := deps.resolveExecutable()
-	if err != nil {
-		return Result{}, fmt.Errorf("resolve Waypost executable: %w", err)
-	}
-	configPath := filepath.Join(home, configFileName)
-	if err := os.MkdirAll(home, 0o700); err != nil {
-		return Result{}, fmt.Errorf("create Codex config directory %q: %w", home, err)
+	if configureCodex && homeErr != nil {
+		return Result{}, homeErr
 	}
 
+	result := Result{Command: executable + " " + serverSubcommand}
 	changed := false
-	getOutput, getErr := deps.run(ctx, codexPath, "mcp", "get", serverName, "--json")
-	args := []string{serverSubcommand}
-	if getErr == nil {
-		server, err := parseCodexServer(getOutput.stdout)
+	if configureCodex {
+		if err := os.MkdirAll(home, 0o700); err != nil {
+			return Result{}, fmt.Errorf("create Codex config directory %q: %w", home, err)
+		}
+		// Without the Codex CLI the registered args cannot be discovered, so
+		// ensureCodexConfig preserves any args already present in config.toml.
+		var args []string
+		// codexRegistered records whether the Codex CLI has already written
+		// the waypost server entry, so a later failure still reports Codex as
+		// configured.
+		codexRegistered := false
+		if codexLookErr == nil {
+			args = []string{serverSubcommand}
+			getOutput, getErr := deps.run(ctx, codexPath, "mcp", "get", serverName, "--json")
+			if getErr == nil {
+				server, err := parseCodexServer(getOutput.stdout)
+				if err != nil {
+					return Result{}, fmt.Errorf("inspect Codex MCP server %q: %w", serverName, err)
+				}
+				codexRegistered = true
+				if len(server.Transport.Args) > 0 && server.Transport.Args[0] == serverSubcommand {
+					args = append([]string(nil), server.Transport.Args...)
+				}
+			} else {
+				if err := ctx.Err(); err != nil {
+					return Result{}, err
+				}
+				if !isMissingCodexMCPError(string(getOutput.stderr)) {
+					return Result{}, commandError("inspect Codex MCP server", getOutput, getErr)
+				}
+				if output, err := deps.run(ctx, codexPath, "mcp", "add", serverName, "--", executable, serverSubcommand); err != nil {
+					return Result{}, commandError("add Waypost MCP server to Codex", output, err)
+				}
+				codexRegistered = true
+				changed = true
+			}
+		}
+
+		configChanged, err := ensureCodexConfig(configPath, executable, args...)
 		if err != nil {
-			return Result{}, fmt.Errorf("inspect Codex MCP server %q: %w", serverName, err)
-		}
-		if len(server.Transport.Args) > 0 && server.Transport.Args[0] == serverSubcommand {
-			args = append([]string(nil), server.Transport.Args...)
-		}
-	} else {
-		if err := ctx.Err(); err != nil {
+			if codexRegistered {
+				result.Path = configPath
+				result.Changed = changed
+				result.Configured = append(result.Configured, ConfiguredAgent{Name: "Codex", Path: configPath})
+				return result, fmt.Errorf("MCP server configured for Codex; remaining integrations failed: %w", err)
+			}
 			return Result{}, err
 		}
-		if !isMissingCodexMCPError(string(getOutput.stderr)) {
-			return Result{}, commandError("inspect Codex MCP server", getOutput, getErr)
-		}
-		if output, err := deps.run(ctx, codexPath, "mcp", "add", serverName, "--", executable, serverSubcommand); err != nil {
-			return Result{}, commandError("add Waypost MCP server to Codex", output, err)
-		}
-		changed = true
+		changed = changed || configChanged
+		result.Path = configPath
+		result.Configured = append(result.Configured, ConfiguredAgent{Name: "Codex", Path: configPath})
 	}
 
-	configChanged, err := ensureCodexConfig(configPath, executable, args...)
-	if err != nil {
-		return Result{}, err
+	if deps.resolveUserHome != nil {
+		configured, warnings, optional, err := installOptionalAgents(userHome, executable, deps.getwd, deps.lookPath)
+		changed = changed || optional
+		result.Configured = append(result.Configured, configured...)
+		result.Warnings = append(result.Warnings, warnings...)
+		if err != nil {
+			if len(result.Configured) > 0 {
+				result.Changed = changed
+				return result, fmt.Errorf("MCP server configured for %s; remaining integrations failed: %w", configuredAgentNames(result.Configured), err)
+			}
+			result.Changed = changed
+			return result, fmt.Errorf("optional MCP integrations failed: %w", err)
+		}
 	}
-	changed = changed || configChanged
-	result := Result{
-		Path:    configPath,
-		Command: executable + " " + serverSubcommand,
-		Changed: changed,
+	if len(result.Configured) == 0 {
+		return Result{}, fmt.Errorf("find Codex CLI: %w; no supported agent detected, install Codex, Claude Code, agy, or Devin before running `waypost install mcp-server`", codexLookErr)
 	}
-
-	// The Codex configuration is the required installation target. Other
-	// agents are configured when their CLI or existing configuration indicates
-	// that they are installed, while leaving unrelated homes untouched.
-	if deps.resolveUserHome == nil {
-		return result, nil
-	}
-	optional, err := installOptionalAgents(userHome, executable, deps.lookPath)
-	if err != nil {
-		return result, fmt.Errorf("Codex MCP server configured at %q; optional integrations failed: %w", configPath, err)
-	}
-	result.Changed = result.Changed || optional
+	result.Changed = changed
 	return result, nil
 }
 
@@ -200,34 +251,121 @@ func ensureCodexConfig(path, executable string, args ...string) (bool, error) {
 	return true, nil
 }
 
-func installOptionalAgents(home, executable string, lookPath func(string) (string, error)) (bool, error) {
+func installOptionalAgents(home, executable string, getwd func() (string, error), lookPath func(string) (string, error)) ([]ConfiguredAgent, []string, bool, error) {
+	var configured []ConfiguredAgent
+	var warnings []string
 	changed := false
 	claudePath := claudeConfigPath(home)
 	configureClaude, err := shouldConfigureOptionalAgent(claudePath, "claude", lookPath)
 	if err != nil {
-		return false, fmt.Errorf("inspect Claude Code MCP config %q: %w", claudePath, err)
+		return configured, warnings, changed, fmt.Errorf("inspect Claude Code MCP config %q: %w", claudePath, err)
 	}
 	if configureClaude {
-		claudeChanged, err := ensureClaudeConfig(claudePath, executable)
+		claudeChanged, _, err := ensureClaudeConfig(claudePath, executable)
 		if err != nil {
-			return false, fmt.Errorf("configure Claude Code MCP server: %w", err)
+			return configured, warnings, changed, fmt.Errorf("configure Claude Code MCP server: %w", err)
 		}
 		changed = changed || claudeChanged
+		configured = append(configured, ConfiguredAgent{Name: "Claude Code", Path: claudePath})
 	}
 
 	agyPath := filepath.Join(home, agyMCPConfigName)
 	configureAgy, err := shouldConfigureOptionalAgent(agyPath, "agy", lookPath)
 	if err != nil {
-		return false, fmt.Errorf("inspect agy MCP config %q: %w", agyPath, err)
+		return configured, warnings, changed, fmt.Errorf("inspect agy MCP config %q: %w", agyPath, err)
 	}
 	if configureAgy {
-		agyChanged, err := ensureAgyConfig(agyPath, executable)
+		agyChanged, _, err := ensureAgyConfig(agyPath, executable)
 		if err != nil {
-			return false, fmt.Errorf("configure agy MCP server: %w", err)
+			return configured, warnings, changed, fmt.Errorf("configure agy MCP server: %w", err)
 		}
 		changed = changed || agyChanged
+		configured = append(configured, ConfiguredAgent{Name: "agy", Path: agyPath})
 	}
-	return changed, nil
+
+	devinPath := devinMCPConfigPath(home)
+	configureDevin, err := shouldConfigureDevin(home, devinPath, lookPath)
+	if err != nil {
+		return configured, warnings, changed, fmt.Errorf("inspect Devin MCP config %q: %w", devinPath, err)
+	}
+	if configureDevin {
+		devinChanged, wasJSONC, err := ensureDevinConfig(devinPath, executable)
+		if err != nil {
+			return configured, warnings, changed, fmt.Errorf("configure Devin MCP server: %w", err)
+		}
+		changed = changed || devinChanged
+		configured = append(configured, ConfiguredAgent{Name: "Devin", Path: devinPath})
+		if devinChanged && wasJSONC {
+			warnings = append(warnings, fmt.Sprintf("%s contained JSONC comments or trailing commas; the rewrite emitted strict JSON and removed them", devinPath))
+		}
+		workDir := ""
+		if getwd != nil {
+			if dir, err := getwd(); err != nil {
+				warnings = append(warnings, fmt.Sprintf("project-level Devin MCP override check skipped: resolve working directory: %v", err))
+			} else {
+				workDir = dir
+			}
+		}
+		warnings = append(warnings, devinProjectOverrideWarnings(workDir)...)
+	}
+	return configured, warnings, changed, nil
+}
+
+// devinProjectOverrideWarnings reports project-level Devin MCP configs under
+// dir (.devin/mcp_config.json, .devin/mcp_config.local.json) that define
+// their own waypost server. Project entries take precedence over the
+// user-level config the installer maintains, so a Devin session launched in
+// dir may resolve a different definition.
+func devinProjectOverrideWarnings(dir string) []string {
+	if dir == "" {
+		return nil
+	}
+	var warnings []string
+	for _, name := range []string{"mcp_config.json", "mcp_config.local.json"} {
+		path := filepath.Join(dir, ".devin", name)
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if normalized, _, err := jsonc.Normalize(contents); err == nil {
+			contents = normalized
+		}
+		var root map[string]json.RawMessage
+		if err := json.Unmarshal(contents, &root); err != nil {
+			continue
+		}
+		var servers map[string]json.RawMessage
+		if raw := root["mcpServers"]; len(raw) > 0 {
+			if err := json.Unmarshal(raw, &servers); err != nil {
+				continue
+			}
+		}
+		if _, ok := servers[serverName]; ok {
+			warnings = append(warnings, fmt.Sprintf("%s defines a %q server that takes precedence over the user-level entry; update or remove it to use the installed configuration", path, serverName))
+		}
+	}
+	return warnings
+}
+
+func configuredAgentNames(agents []ConfiguredAgent) string {
+	names := make([]string, 0, len(agents))
+	for _, agent := range agents {
+		names = append(names, agent.Name)
+	}
+	return strings.Join(names, ", ")
+}
+
+// shouldConfigureDevin detects Devin by its CLI, an existing MCP config, or
+// an existing user-level config.json (for example left by
+// `waypost install devin-hook`). Unlike the other agents, Devin keeps its
+// main settings and MCP servers in separate files, so both count.
+func shouldConfigureDevin(home, mcpConfigPath string, lookPath func(string) (string, error)) (bool, error) {
+	if _, err := os.Stat(filepath.Join(devinconfig.UserConfigDir(home), "config.json")); err == nil {
+		return true, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	return shouldConfigureOptionalAgent(mcpConfigPath, "devin", lookPath)
 }
 
 func claudeConfigPath(home string) string {
@@ -237,6 +375,10 @@ func claudeConfigPath(home string) string {
 	return filepath.Join(home, claudeConfigName)
 }
 
+func devinMCPConfigPath(home string) string {
+	return filepath.Join(devinconfig.UserConfigDir(home), "mcp_config.json")
+}
+
 func validateOptionalAgents(home string, lookPath func(string) (string, error)) error {
 	claudePath := claudeConfigPath(home)
 	configureClaude, err := shouldConfigureOptionalAgent(claudePath, "claude", lookPath)
@@ -244,7 +386,7 @@ func validateOptionalAgents(home string, lookPath func(string) (string, error)) 
 		return fmt.Errorf("inspect Claude Code MCP config %q: %w", claudePath, err)
 	}
 	if configureClaude {
-		if err := validateJSONMCPConfig(claudePath); err != nil {
+		if err := validateJSONMCPConfig(claudePath, false); err != nil {
 			return fmt.Errorf("validate Claude Code MCP config %q: %w", claudePath, err)
 		}
 	}
@@ -255,20 +397,37 @@ func validateOptionalAgents(home string, lookPath func(string) (string, error)) 
 		return fmt.Errorf("inspect agy MCP config %q: %w", agyPath, err)
 	}
 	if configureAgy {
-		if err := validateJSONMCPConfig(agyPath); err != nil {
+		if err := validateJSONMCPConfig(agyPath, false); err != nil {
 			return fmt.Errorf("validate agy MCP config %q: %w", agyPath, err)
+		}
+	}
+
+	devinPath := devinMCPConfigPath(home)
+	configureDevin, err := shouldConfigureDevin(home, devinPath, lookPath)
+	if err != nil {
+		return fmt.Errorf("inspect Devin MCP config %q: %w", devinPath, err)
+	}
+	if configureDevin {
+		if err := validateJSONMCPConfig(devinPath, true); err != nil {
+			return fmt.Errorf("validate Devin MCP config %q: %w", devinPath, err)
 		}
 	}
 	return nil
 }
 
-func validateJSONMCPConfig(path string) error {
+func validateJSONMCPConfig(path string, allowJSONC bool) error {
 	contents, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+	if allowJSONC {
+		contents, _, err = jsonc.Normalize(contents)
+		if err != nil {
+			return fmt.Errorf("parse MCP config: %w", err)
+		}
 	}
 	if len(bytes.TrimSpace(contents)) == 0 {
 		return nil
@@ -302,8 +461,8 @@ func shouldConfigureOptionalAgent(path, cli string, lookPath func(string) (strin
 	return err == nil, nil
 }
 
-func ensureClaudeConfig(path, executable string) (bool, error) {
-	return ensureJSONMCPServer(path, executable, func(server map[string]json.RawMessage) error {
+func ensureClaudeConfig(path, executable string) (bool, bool, error) {
+	return ensureJSONMCPServer(path, executable, false, func(server map[string]json.RawMessage) error {
 		if err := setJSONField(server, "type", "stdio"); err != nil {
 			return err
 		}
@@ -323,8 +482,8 @@ func ensureClaudeConfig(path, executable string) (bool, error) {
 	})
 }
 
-func ensureAgyConfig(path, executable string) (bool, error) {
-	return ensureJSONMCPServer(path, executable, func(server map[string]json.RawMessage) error {
+func ensureAgyConfig(path, executable string) (bool, bool, error) {
+	return ensureJSONMCPServer(path, executable, false, func(server map[string]json.RawMessage) error {
 		if err := setJSONField(server, "command", executable); err != nil {
 			return err
 		}
@@ -342,23 +501,58 @@ func ensureAgyConfig(path, executable string) (bool, error) {
 	})
 }
 
+func ensureDevinConfig(path, executable string) (bool, bool, error) {
+	return ensureJSONMCPServer(path, executable, true, func(server map[string]json.RawMessage) error {
+		if err := setJSONField(server, "command", executable); err != nil {
+			return err
+		}
+		if err := setJSONField(server, "args", []string{serverSubcommand}); err != nil {
+			return err
+		}
+		if err := setJSONField(server, "transport", "stdio"); err != nil {
+			return err
+		}
+		// Remove fields that make Devin treat the entry as a remote server or
+		// keep it disabled. Installing the server implies enabling it, matching
+		// `devin mcp enable waypost`. Per-tool disabledTools entries are a user
+		// policy the hook can degrade around (it probes `devin mcp get` and
+		// allows the CLI fallback for disabled tools), so they are preserved.
+		delete(server, "type")
+		delete(server, "url")
+		delete(server, "headers")
+		delete(server, "disabled")
+		return nil
+	})
+}
+
 type jsonMCPMutator func(map[string]json.RawMessage) error
 
-func ensureJSONMCPServer(path, executable string, mutate jsonMCPMutator) (bool, error) {
+// ensureJSONMCPServer updates the waypost entry in a JSON MCP config file.
+// When allowJSONC is set, existing files may use the JSONC subset Devin
+// accepts (//- and /* */-comments, trailing commas); the rewrite then emits
+// strict JSON and the second return value reports that the input was JSONC.
+func ensureJSONMCPServer(path, executable string, allowJSONC bool, mutate jsonMCPMutator) (bool, bool, error) {
 	original, err := os.ReadFile(path)
 	mode := os.FileMode(0o600)
+	wasJSONC := false
 	if err == nil {
+		if allowJSONC {
+			original, wasJSONC, err = jsonc.Normalize(original)
+			if err != nil {
+				return false, false, fmt.Errorf("parse MCP config %q: %w", path, err)
+			}
+		}
 		if info, statErr := os.Stat(path); statErr == nil {
 			mode = info.Mode().Perm()
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return false, fmt.Errorf("read MCP config %q: %w", path, err)
+		return false, false, fmt.Errorf("read MCP config %q: %w", path, err)
 	}
 
 	root := make(map[string]json.RawMessage)
 	if len(bytes.TrimSpace(original)) > 0 {
 		if err := json.Unmarshal(original, &root); err != nil {
-			return false, fmt.Errorf("parse MCP config %q: %w", path, err)
+			return false, false, fmt.Errorf("parse MCP config %q: %w", path, err)
 		}
 		if root == nil {
 			root = make(map[string]json.RawMessage)
@@ -367,7 +561,7 @@ func ensureJSONMCPServer(path, executable string, mutate jsonMCPMutator) (bool, 
 	mcpServers := make(map[string]json.RawMessage)
 	if raw := root["mcpServers"]; len(raw) > 0 {
 		if err := json.Unmarshal(raw, &mcpServers); err != nil {
-			return false, fmt.Errorf("parse MCP servers in %q: %w", path, err)
+			return false, false, fmt.Errorf("parse MCP servers in %q: %w", path, err)
 		}
 		if mcpServers == nil {
 			mcpServers = make(map[string]json.RawMessage)
@@ -376,40 +570,40 @@ func ensureJSONMCPServer(path, executable string, mutate jsonMCPMutator) (bool, 
 	server := make(map[string]json.RawMessage)
 	if raw := mcpServers[serverName]; len(raw) > 0 {
 		if err := json.Unmarshal(raw, &server); err != nil {
-			return false, fmt.Errorf("parse %s MCP server in %q: %w", serverName, path, err)
+			return false, false, fmt.Errorf("parse %s MCP server in %q: %w", serverName, path, err)
 		}
 		if server == nil {
 			server = make(map[string]json.RawMessage)
 		}
 	}
 	if err := mutate(server); err != nil {
-		return false, fmt.Errorf("build %s MCP server in %q: %w", serverName, path, err)
+		return false, false, fmt.Errorf("build %s MCP server in %q: %w", serverName, path, err)
 	}
 	serverJSON, err := json.Marshal(server)
 	if err != nil {
-		return false, fmt.Errorf("encode %s MCP server: %w", serverName, err)
+		return false, false, fmt.Errorf("encode %s MCP server: %w", serverName, err)
 	}
 	mcpServers[serverName] = serverJSON
 	mcpJSON, err := json.Marshal(mcpServers)
 	if err != nil {
-		return false, fmt.Errorf("encode MCP servers: %w", err)
+		return false, false, fmt.Errorf("encode MCP servers: %w", err)
 	}
 	root["mcpServers"] = mcpJSON
 	updated, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
-		return false, fmt.Errorf("encode MCP config: %w", err)
+		return false, false, fmt.Errorf("encode MCP config: %w", err)
 	}
 	updated = append(updated, '\n')
 	if bytes.Equal(original, updated) {
-		return false, nil
+		return false, wasJSONC, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return false, fmt.Errorf("create MCP config directory %q: %w", filepath.Dir(path), err)
+		return false, false, fmt.Errorf("create MCP config directory %q: %w", filepath.Dir(path), err)
 	}
 	if err := writeFileAtomically(path, updated, mode); err != nil {
-		return false, fmt.Errorf("write MCP config %q: %w", path, err)
+		return false, false, fmt.Errorf("write MCP config %q: %w", path, err)
 	}
-	return true, nil
+	return true, wasJSONC, nil
 }
 
 func writeFileAtomically(path string, contents []byte, mode os.FileMode) error {
@@ -445,7 +639,7 @@ func writeFileAtomically(path string, contents []byte, mode os.FileMode) error {
 	if err := temporary.Close(); err != nil {
 		return fmt.Errorf("close temporary config: %w", err)
 	}
-	if err := codexhook.ReplaceFile(temporaryPath, writePath); err != nil {
+	if err := hookcore.ReplaceFile(temporaryPath, writePath); err != nil {
 		return fmt.Errorf("replace config %q: %w", path, err)
 	}
 	return nil

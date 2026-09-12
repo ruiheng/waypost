@@ -9,6 +9,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/ruiheng/waypost/internal/devinconfig"
 )
 
 func TestEnsureWaypostSectionCreatesConfig(t *testing.T) {
@@ -407,7 +409,7 @@ func TestEnsureClaudeConfigPreservesUnrelatedSettings(t *testing.T) {
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatalf("WriteFile(config) error = %v", err)
 	}
-	changed, err := ensureClaudeConfig(path, "/opt/waypost")
+	changed, _, err := ensureClaudeConfig(path, "/opt/waypost")
 	if err != nil {
 		t.Fatalf("ensureClaudeConfig() error = %v", err)
 	}
@@ -433,7 +435,7 @@ func TestEnsureClaudeConfigPreservesUnrelatedSettings(t *testing.T) {
 	if waypost["custom"] != "preserved" || servers["other"] == nil || config["numStartups"] != float64(4) {
 		t.Fatalf("config = %#v, want unrelated settings preserved", config)
 	}
-	if changed, err := ensureClaudeConfig(path, "/opt/waypost"); err != nil {
+	if changed, _, err := ensureClaudeConfig(path, "/opt/waypost"); err != nil {
 		t.Fatalf("ensureClaudeConfig() second error = %v", err)
 	} else if changed {
 		t.Fatal("ensureClaudeConfig() second changed = true, want false")
@@ -466,7 +468,7 @@ func TestEnsureAgyConfigEnablesServer(t *testing.T) {
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatalf("WriteFile(config) error = %v", err)
 	}
-	changed, err := ensureAgyConfig(path, "/opt/waypost")
+	changed, _, err := ensureAgyConfig(path, "/opt/waypost")
 	if err != nil {
 		t.Fatalf("ensureAgyConfig() error = %v", err)
 	}
@@ -494,10 +496,235 @@ func TestEnsureAgyConfigEnablesServer(t *testing.T) {
 	if waypost["command"] != "/opt/waypost" || !reflect.DeepEqual(waypost["args"], []any{"mcp"}) || waypost["custom"] != "preserved" || config["otherSetting"] != true {
 		t.Fatalf("config = %#v, want enabled Waypost and unrelated settings preserved", config)
 	}
-	if changed, err := ensureAgyConfig(path, "/opt/waypost"); err != nil {
+	if changed, _, err := ensureAgyConfig(path, "/opt/waypost"); err != nil {
 		t.Fatalf("ensureAgyConfig() second error = %v", err)
 	} else if changed {
 		t.Fatal("ensureAgyConfig() second changed = true, want false")
+	}
+}
+
+func TestEnsureDevinConfigMergesStdioServerAndIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "mcp_config.json")
+	original := `{
+  "mcpServers": {
+    "other": {"command": "other", "args": ["serve"]},
+    "waypost": {
+      "command": "/old/waypost",
+      "args": ["mcp"],
+      "transport": "http",
+      "type": "http",
+      "url": "http://localhost:9999/mcp",
+      "headers": {"Authorization": "Bearer x"},
+      "disabled": true,
+      "custom": "preserved"
+    }
+  },
+  "otherSetting": true
+}`
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatalf("WriteFile(devin config) error = %v", err)
+	}
+	changed, _, err := ensureDevinConfig(path, "/opt/waypost")
+	if err != nil {
+		t.Fatalf("ensureDevinConfig() error = %v", err)
+	}
+	if !changed {
+		t.Fatal("ensureDevinConfig() changed = false, want true")
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(devin config) error = %v", err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(updated, &config); err != nil {
+		t.Fatalf("json.Unmarshal(config) error = %v", err)
+	}
+	servers := config["mcpServers"].(map[string]any)
+	if other := servers["other"].(map[string]any); other["command"] != "other" || !reflect.DeepEqual(other["args"], []any{"serve"}) {
+		t.Fatalf("other server = %#v, want preserved", other)
+	}
+	waypost := servers["waypost"].(map[string]any)
+	if waypost["command"] != "/opt/waypost" || !reflect.DeepEqual(waypost["args"], []any{"mcp"}) || waypost["transport"] != "stdio" || waypost["custom"] != "preserved" || config["otherSetting"] != true {
+		t.Fatalf("config = %#v, want stdio Waypost with unrelated settings preserved", config)
+	}
+	for _, field := range []string{"type", "url", "headers", "disabled"} {
+		if _, present := waypost[field]; present {
+			t.Fatalf("waypost config = %#v, want remote/disabled field %q removed", waypost, field)
+		}
+	}
+	if changed, _, err := ensureDevinConfig(path, "/opt/waypost"); err != nil {
+		t.Fatalf("ensureDevinConfig() second error = %v", err)
+	} else if changed {
+		t.Fatal("ensureDevinConfig() second changed = true, want false")
+	}
+}
+
+func TestEnsureDevinConfigPreservesDisabledToolsPolicy(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "mcp_config.json")
+	original := `{
+  "mcpServers": {
+    "waypost": {
+      "command": "/old/waypost",
+      "disabledTools": ["waypost_recv", "mcp__waypost__waypost_send", "other_tool"]
+    }
+  }
+}`
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatalf("WriteFile(devin config) error = %v", err)
+	}
+	changed, _, err := ensureDevinConfig(path, "/opt/waypost")
+	if err != nil {
+		t.Fatalf("ensureDevinConfig() error = %v", err)
+	}
+	if !changed {
+		t.Fatal("ensureDevinConfig() changed = false, want true")
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(devin config) error = %v", err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(updated, &config); err != nil {
+		t.Fatalf("json.Unmarshal(config) error = %v", err)
+	}
+	waypost := config["mcpServers"].(map[string]any)["waypost"].(map[string]any)
+	want := []any{"waypost_recv", "mcp__waypost__waypost_send", "other_tool"}
+	if tools := waypost["disabledTools"]; !reflect.DeepEqual(tools, want) {
+		t.Fatalf("disabledTools = %#v, want user policy preserved %v", tools, want)
+	}
+}
+
+func TestEnsureDevinConfigAcceptsJSONC(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "mcp_config.json")
+	original := `{
+  // kept out of the rewrite
+  "mcpServers": {
+    "waypost": {
+      "command": "/old/waypost",
+      "args": ["mcp"],
+      "transport": "stdio",
+    },
+  },
+}`
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatalf("WriteFile(devin config) error = %v", err)
+	}
+	changed, wasJSONC, err := ensureDevinConfig(path, "/opt/waypost")
+	if err != nil {
+		t.Fatalf("ensureDevinConfig() error = %v", err)
+	}
+	if !changed {
+		t.Fatal("ensureDevinConfig() changed = false, want true")
+	}
+	if !wasJSONC {
+		t.Fatal("ensureDevinConfig() wasJSONC = false, want true")
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(devin config) error = %v", err)
+	}
+	if !json.Valid(updated) {
+		t.Fatalf("rewritten config is not strict JSON: %s", updated)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(updated, &config); err != nil {
+		t.Fatalf("json.Unmarshal(config) error = %v", err)
+	}
+	waypost := config["mcpServers"].(map[string]any)["waypost"].(map[string]any)
+	if waypost["command"] != "/opt/waypost" {
+		t.Fatalf("waypost command = %#v, want /opt/waypost", waypost["command"])
+	}
+}
+
+func TestEnsureDevinConfigRejectsSingleQuotedJSON5(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "mcp_config.json")
+	if err := os.WriteFile(path, []byte(`{'mcpServers': {}}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(devin config) error = %v", err)
+	}
+	if _, _, err := ensureDevinConfig(path, "/opt/waypost"); err == nil {
+		t.Fatal("ensureDevinConfig() error = nil, want single-quote rejection")
+	}
+}
+
+func TestInstallOptionalAgentsDetectsDevinByConfigJSON(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, "claude"))
+	devinDir := devinconfig.UserConfigDir(home)
+	if err := os.MkdirAll(devinDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll(devin config dir) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(devinDir, "config.json"), []byte(`{"theme": "dark"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(devin config.json) error = %v", err)
+	}
+	configured, _, changed, err := installOptionalAgents(home, "/opt/waypost", func() (string, error) { return t.TempDir(), nil }, func(name string) (string, error) {
+		return "", errors.New("not installed")
+	})
+	if err != nil {
+		t.Fatalf("installOptionalAgents() error = %v", err)
+	}
+	if !changed {
+		t.Fatal("installOptionalAgents() changed = false, want Devin config written")
+	}
+	want := []ConfiguredAgent{{Name: "Devin", Path: devinMCPConfigPath(home)}}
+	if !reflect.DeepEqual(configured, want) {
+		t.Fatalf("configured = %#v, want %v", configured, want)
+	}
+	contents, err := os.ReadFile(devinMCPConfigPath(home))
+	if err != nil {
+		t.Fatalf("ReadFile(devin mcp_config.json) error = %v", err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(contents, &config); err != nil {
+		t.Fatalf("Unmarshal(devin mcp_config.json) error = %v", err)
+	}
+	if _, ok := config["mcpServers"].(map[string]any)["waypost"]; !ok {
+		t.Fatalf("mcp_config.json = %#v, want waypost server", config)
+	}
+}
+
+func TestDevinProjectOverrideWarnings(t *testing.T) {
+	t.Parallel()
+
+	workDir := t.TempDir()
+	if got := devinProjectOverrideWarnings(workDir); len(got) != 0 {
+		t.Fatalf("devinProjectOverrideWarnings() = %v, want none without project config", got)
+	}
+	devinDir := filepath.Join(workDir, ".devin")
+	if err := os.MkdirAll(devinDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll(.devin) error = %v", err)
+	}
+	// A project server with another name is not an override.
+	if err := os.WriteFile(filepath.Join(devinDir, "mcp_config.json"), []byte(`{"mcpServers": {"other": {}}}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(project mcp_config.json) error = %v", err)
+	}
+	if got := devinProjectOverrideWarnings(workDir); len(got) != 0 {
+		t.Fatalf("devinProjectOverrideWarnings() = %v, want none for unrelated server", got)
+	}
+	if err := os.WriteFile(filepath.Join(devinDir, "mcp_config.local.json"), []byte(`{"mcpServers": {"waypost": {"command": "/old/waypost"}}}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(project mcp_config.local.json) error = %v", err)
+	}
+	got := devinProjectOverrideWarnings(workDir)
+	if len(got) != 1 || !strings.Contains(got[0], "mcp_config.local.json") {
+		t.Fatalf("devinProjectOverrideWarnings() = %v, want one local-override warning", got)
+	}
+	// Malformed project config is ignored rather than failing the install.
+	if err := os.WriteFile(filepath.Join(devinDir, "mcp_config.json"), []byte(`{bad`), 0o600); err != nil {
+		t.Fatalf("WriteFile(malformed project config) error = %v", err)
+	}
+	if got := devinProjectOverrideWarnings(workDir); len(got) != 1 {
+		t.Fatalf("devinProjectOverrideWarnings() = %v, want malformed config ignored", got)
+	}
+	if got := devinProjectOverrideWarnings(""); got != nil {
+		t.Fatalf("devinProjectOverrideWarnings(\"\") = %v, want nil", got)
 	}
 }
 
@@ -510,21 +737,27 @@ func TestInstallOptionalAgentsOnlyTouchesInstalledAgents(t *testing.T) {
 		t.Fatalf("WriteFile(Claude config) error = %v", err)
 	}
 	lookedUp := make([]string, 0, 2)
-	changed, err := installOptionalAgents(home, "/opt/waypost", func(name string) (string, error) {
+	configured, _, changed, err := installOptionalAgents(home, "/opt/waypost", func() (string, error) { return t.TempDir(), nil }, func(name string) (string, error) {
 		lookedUp = append(lookedUp, name)
 		return "", errors.New("not installed")
 	})
 	if err != nil {
 		t.Fatalf("installOptionalAgents() error = %v", err)
 	}
-	if !reflect.DeepEqual(lookedUp, []string{"agy"}) {
-		t.Fatalf("optional agent lookups = %#v, want only agy after existing Claude config", lookedUp)
+	if !reflect.DeepEqual(lookedUp, []string{"agy", "devin"}) {
+		t.Fatalf("optional agent lookups = %#v, want agy and devin after existing Claude config", lookedUp)
 	}
 	if !changed {
 		t.Fatal("installOptionalAgents() changed = false, want changed Claude result")
 	}
+	if !reflect.DeepEqual(configured, []ConfiguredAgent{{Name: "Claude Code", Path: claudePath}}) {
+		t.Fatalf("configured = %#v, want Claude Code only", configured)
+	}
 	if _, err := os.Stat(filepath.Join(home, agyMCPConfigName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("agy config stat error = %v, want absent", err)
+	}
+	if _, err := os.Stat(devinMCPConfigPath(home)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("devin config stat error = %v, want absent", err)
 	}
 }
 
@@ -536,7 +769,7 @@ func TestClaudeConfigPathHonorsOverride(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"mcpServers": {}}`), 0o600); err != nil {
 		t.Fatalf("WriteFile(Claude config) error = %v", err)
 	}
-	changed, err := installOptionalAgents(home, "/opt/waypost", func(name string) (string, error) {
+	_, _, changed, err := installOptionalAgents(home, "/opt/waypost", func() (string, error) { return t.TempDir(), nil }, func(name string) (string, error) {
 		if name == "claude" {
 			t.Fatalf("lookPath(%q) called despite custom Claude config", name)
 		}
@@ -781,27 +1014,277 @@ approval_mode = "approve"
 	}
 }
 
-func TestInstallWithDependenciesRequiresCodex(t *testing.T) {
+func TestInstallWithDependenciesRequiresADetectedAgent(t *testing.T) {
 	t.Parallel()
 
+	for _, tc := range []struct {
+		name            string
+		resolveUserHome func() (string, error)
+	}{
+		{name: "without user home"},
+		{name: "with user home", resolveUserHome: func() (string, error) { return t.TempDir(), nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			deps := dependencies{
+				lookPath: func(string) (string, error) { return "", errors.New("not found") },
+				resolveHome: func() (string, error) {
+					return t.TempDir(), nil
+				},
+				resolveUserHome:   tc.resolveUserHome,
+				resolveExecutable: func() (string, error) { return "/opt/waypost", nil },
+				run: func(context.Context, string, ...string) (commandOutput, error) {
+					t.Fatal("run called when no agent is detected")
+					return commandOutput{}, nil
+				},
+			}
+
+			_, err := installWithDependencies(context.Background(), deps)
+			if err == nil || !strings.Contains(err.Error(), "no supported agent detected") {
+				t.Fatalf("installWithDependencies() error = %v, want no-agent guidance", err)
+			}
+		})
+	}
+}
+
+func TestInstallWithDependenciesInstallsDevinWithoutCodex(t *testing.T) {
+	t.Parallel()
+
+	codexHome := filepath.Join(t.TempDir(), "codex")
+	userHome := t.TempDir()
 	deps := dependencies{
-		lookPath: func(string) (string, error) { return "", errors.New("not found") },
-		resolveHome: func() (string, error) {
-			t.Fatal("resolveHome called before Codex lookup")
-			return "", nil
+		lookPath: func(name string) (string, error) {
+			if name == "devin" {
+				return "/usr/local/bin/devin", nil
+			}
+			return "", errors.New("not installed")
 		},
-		resolveExecutable: func() (string, error) {
-			t.Fatal("resolveExecutable called before Codex lookup")
-			return "", nil
-		},
+		resolveHome:       func() (string, error) { return codexHome, nil },
+		resolveUserHome:   func() (string, error) { return userHome, nil },
+		resolveExecutable: func() (string, error) { return "/opt/waypost", nil },
 		run: func(context.Context, string, ...string) (commandOutput, error) {
 			t.Fatal("run called when Codex is unavailable")
 			return commandOutput{}, nil
 		},
 	}
 
-	_, err := installWithDependencies(context.Background(), deps)
-	if err == nil || !strings.Contains(err.Error(), "install Codex") {
-		t.Fatalf("installWithDependencies() error = %v, want Codex guidance", err)
+	result, err := installWithDependencies(context.Background(), deps)
+	if err != nil {
+		t.Fatalf("installWithDependencies() error = %v", err)
+	}
+	if !result.Changed {
+		t.Fatal("result.Changed = false, want true")
+	}
+	if result.Path != "" {
+		t.Fatalf("result.Path = %q, want empty without Codex", result.Path)
+	}
+	devinPath := devinMCPConfigPath(userHome)
+	if !reflect.DeepEqual(result.Configured, []ConfiguredAgent{{Name: "Devin", Path: devinPath}}) {
+		t.Fatalf("result.Configured = %#v, want Devin only", result.Configured)
+	}
+	contents, err := os.ReadFile(devinPath)
+	if err != nil {
+		t.Fatalf("ReadFile(devin config) error = %v", err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(contents, &document); err != nil {
+		t.Fatalf("Unmarshal(devin config) error = %v", err)
+	}
+	server := document["mcpServers"].(map[string]any)[serverName].(map[string]any)
+	if server["command"] != "/opt/waypost" || !reflect.DeepEqual(server["args"], []any{"mcp"}) || server["transport"] != "stdio" {
+		t.Fatalf("devin server = %#v, want stdio waypost entry", server)
+	}
+	if _, statErr := os.Stat(codexHome); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("Codex home stat error = %v, want untouched", statErr)
+	}
+}
+
+func TestInstallWithDependenciesConfiguresExistingCodexConfigWithoutCLI(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	configPath := filepath.Join(home, configFileName)
+	original := `[mcp_servers.waypost]
+command = "/old/waypost"
+args = ["mcp", "--include-debug-tool"]
+`
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+	deps := dependencies{
+		lookPath:          func(string) (string, error) { return "", errors.New("not installed") },
+		resolveHome:       func() (string, error) { return home, nil },
+		resolveExecutable: func() (string, error) { return "/opt/new/waypost", nil },
+		run: func(context.Context, string, ...string) (commandOutput, error) {
+			t.Fatal("run called when Codex CLI is unavailable")
+			return commandOutput{}, nil
+		},
+	}
+
+	result, err := installWithDependencies(context.Background(), deps)
+	if err != nil {
+		t.Fatalf("installWithDependencies() error = %v", err)
+	}
+	if !result.Changed || result.Path != configPath {
+		t.Fatalf("result = %+v, want changed Codex config %q", result, configPath)
+	}
+	contents, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(config) error = %v", err)
+	}
+	for _, expected := range []string{`command = "/opt/new/waypost"`, `args = ["mcp", "--include-debug-tool"]`, `required = true`} {
+		if !strings.Contains(string(contents), expected) {
+			t.Fatalf("config = %q, want %q preserved", contents, expected)
+		}
+	}
+}
+
+func TestInstallOptionalAgentsKeepsConfiguredAgentsOnLaterFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, "claude"))
+
+	// Claude is configured first, then Devin detection fails because its
+	// config directory is a regular file (ENOTDIR on stat).
+	claudePath := claudeConfigPath(home)
+	if err := os.MkdirAll(filepath.Dir(claudePath), 0o700); err != nil {
+		t.Fatalf("MkdirAll(claude dir) error = %v", err)
+	}
+	if err := os.WriteFile(claudePath, []byte(`{"mcpServers": {}}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(Claude config) error = %v", err)
+	}
+	devinBlocker := devinconfig.UserConfigDir(home)
+	if err := os.MkdirAll(filepath.Dir(devinBlocker), 0o700); err != nil {
+		t.Fatalf("MkdirAll(devin parent) error = %v", err)
+	}
+	if err := os.WriteFile(devinBlocker, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("WriteFile(devin blocker) error = %v", err)
+	}
+
+	configured, _, changed, err := installOptionalAgents(home, "/opt/waypost", func() (string, error) { return t.TempDir(), nil }, func(string) (string, error) {
+		return "", errors.New("not installed")
+	})
+	if err == nil {
+		t.Fatal("installOptionalAgents() error = nil, want Devin inspect failure")
+	}
+	if !changed {
+		t.Fatal("installOptionalAgents() changed = false, want Claude change preserved")
+	}
+	want := []ConfiguredAgent{{Name: "Claude Code", Path: claudePath}}
+	if !reflect.DeepEqual(configured, want) {
+		t.Fatalf("configured = %#v, want %v", configured, want)
+	}
+}
+
+func TestInstallWithDependenciesReportsCodexConfiguredOnConfigWriteFailure(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	// config.toml exists as a directory: detection succeeds, the CLI registers
+	// the server, then the direct config write fails.
+	if err := os.MkdirAll(filepath.Join(home, configFileName), 0o700); err != nil {
+		t.Fatalf("MkdirAll(config.toml) error = %v", err)
+	}
+	var calls [][]string
+	deps := dependencies{
+		lookPath:          func(string) (string, error) { return "/usr/local/bin/codex", nil },
+		resolveHome:       func() (string, error) { return home, nil },
+		resolveExecutable: func() (string, error) { return "/opt/waypost", nil },
+		run: func(_ context.Context, name string, args ...string) (commandOutput, error) {
+			calls = append(calls, append([]string{name}, args...))
+			if len(calls) == 1 {
+				return commandOutput{stderr: []byte("Error: No MCP server named 'waypost' found.")}, errors.New("exit status 1")
+			}
+			return commandOutput{}, nil
+		},
+	}
+
+	result, err := installWithDependencies(context.Background(), deps)
+	if err == nil || !strings.Contains(err.Error(), "configured for Codex") {
+		t.Fatalf("installWithDependencies() error = %v, want Codex partial-result error", err)
+	}
+	if !result.Changed {
+		t.Fatal("result.Changed = false, want true (codex mcp add succeeded)")
+	}
+	want := []ConfiguredAgent{{Name: "Codex", Path: filepath.Join(home, configFileName)}}
+	if !reflect.DeepEqual(result.Configured, want) {
+		t.Fatalf("result.Configured = %#v, want %v", result.Configured, want)
+	}
+}
+
+func TestInstallWithDependenciesWarnsWhenGetwdFails(t *testing.T) {
+	home := t.TempDir()
+	userHome := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(userHome, "xdg"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(userHome, "claude"))
+
+	// Devin is detected through an existing user-level config.json.
+	devinDir := devinconfig.UserConfigDir(userHome)
+	if err := os.MkdirAll(devinDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll(devin dir) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(devinDir, "config.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(devin config.json) error = %v", err)
+	}
+
+	deps := dependencies{
+		lookPath:          func(string) (string, error) { return "", errors.New("not installed") },
+		resolveHome:       func() (string, error) { return home, nil },
+		resolveUserHome:   func() (string, error) { return userHome, nil },
+		resolveExecutable: func() (string, error) { return "/opt/waypost", nil },
+		getwd:             func() (string, error) { return "", errors.New("getwd: no such directory") },
+		run: func(context.Context, string, ...string) (commandOutput, error) {
+			return commandOutput{}, errors.New("no codex CLI")
+		},
+	}
+
+	result, err := installWithDependencies(context.Background(), deps)
+	if err != nil {
+		t.Fatalf("installWithDependencies() error = %v", err)
+	}
+	found := false
+	for _, warning := range result.Warnings {
+		if strings.Contains(warning, "override check skipped") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("result.Warnings = %v, want project-override check warning", result.Warnings)
+	}
+}
+
+func TestInstallWithDependenciesSkipsGetwdWarningWithoutDevin(t *testing.T) {
+	home := t.TempDir()
+	userHome := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(userHome, "xdg"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(userHome, "claude"))
+
+	// Only Codex is detected (via an existing config.toml); no Devin
+	// artifacts exist, so a getwd failure must not surface a Devin warning.
+	configPath := filepath.Join(home, configFileName)
+	if err := os.WriteFile(configPath, []byte("[mcp_servers.waypost]\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+
+	deps := dependencies{
+		lookPath:          func(string) (string, error) { return "", errors.New("not installed") },
+		resolveHome:       func() (string, error) { return home, nil },
+		resolveUserHome:   func() (string, error) { return userHome, nil },
+		resolveExecutable: func() (string, error) { return "/opt/waypost", nil },
+		getwd:             func() (string, error) { return "", errors.New("getwd: no such directory") },
+		run: func(context.Context, string, ...string) (commandOutput, error) {
+			return commandOutput{}, errors.New("no codex CLI")
+		},
+	}
+
+	result, err := installWithDependencies(context.Background(), deps)
+	if err != nil {
+		t.Fatalf("installWithDependencies() error = %v", err)
+	}
+	for _, warning := range result.Warnings {
+		if strings.Contains(warning, "override check skipped") {
+			t.Fatalf("result.Warnings = %v, want no Devin override warning without Devin", result.Warnings)
+		}
 	}
 }

@@ -46,7 +46,7 @@ initialization. For the optional diagnostic `server_version` status field, call
 ## MCP Server Integrations
 
 Install or refresh the built-in Waypost MCP server in Codex's global
-configuration and, when present, Claude Code and agy configuration:
+configuration and, when present, Claude Code, agy, and Devin configuration:
 
 ```bash
 waypost install mcp-server
@@ -66,11 +66,26 @@ also ensures its user-scoped stdio server and 660-second timeout, honoring
 does not expose a required/enabled MCP-server switch, so no unsupported field
 is written. If agy is installed (or its global MCP config exists), the command
 ensures the server is enabled; agy's `disabled` flag is removed, matching
-`agy mcp enable waypost`.
+`agy mcp enable waypost`. If Devin is installed (or its
+`$XDG_CONFIG_HOME/devin/mcp_config.json`, or `~/.config/devin/mcp_config.json`
+when `XDG_CONFIG_HOME` is unset, exists), the command ensures the user-level
+`mcpServers.waypost` entry with `command`, `args`, and `transport: "stdio"`.
 
-The target is `$CODEX_HOME/config.toml` (or `~/.codex/config.toml` when
-`CODEX_HOME` is unset). Codex must be installed and available as `codex`;
-Claude Code and agy are optional.
+The Codex target is `$CODEX_HOME/config.toml` (or `~/.codex/config.toml` when
+`CODEX_HOME` is unset). Every agent is configured only when detected: the
+agent CLI on `PATH` or an existing config file counts as detection, and the
+command fails when no supported agent (Codex, Claude Code, agy, or Devin) is
+found. For Devin, an existing user-level `config.json` also counts as
+detection.
+
+Devin resolves MCP servers project-first: `.devin/mcp_config.local.json` and
+`.devin/mcp_config.json` in the session's working directory override the
+user-level entry. The installer only manages the user-level file and warns
+when a same-named `waypost` server exists in the current directory's
+project-level config; update or remove that entry if it should use the
+installed configuration. Per-tool `disabledTools` entries are preserved —
+the Devin hook probes `devin mcp get waypost` and falls back to the CLI for
+tools the user disabled.
 
 ## Codex Hooks
 
@@ -143,6 +158,68 @@ waypost codex-hook
 It reads the Codex hook event from stdin and emits the matching
 `hookSpecificOutput` JSON contract. It does not read or modify Waypost message
 state.
+
+## Devin Hooks
+
+Install the Devin lifecycle hooks:
+
+```bash
+waypost install devin-hook
+```
+
+The installer merges six idempotent handlers into the `hooks` object of the
+user-level Devin config (`$XDG_CONFIG_HOME/devin/config.json`, or
+`~/.config/devin/config.json` when `XDG_CONFIG_HOME` is unset) and preserves
+unrelated hooks and settings:
+
+- a `UserPromptSubmit` handler records the exact Waypost nudge as pending,
+  clears prior nudge state for ordinary user prompts, and runs
+  `devin mcp get waypost` from the session working directory; it injects one
+  explicit receive instruction: `waypost_recv` when the MCP server is
+  configured, `waypost recv --json` otherwise. If the probe fails, the
+  instruction and the probe error are emitted as additional context
+- a `PreToolUse` `exec` handler recognizes direct Waypost CLI invocations. A
+  `waypost wait` call receives a model-visible warning not to poll; it is not
+  blocked. When the MCP probe reports Waypost configured, `waypost status`,
+  `recv`, `receive`, and `send` are blocked with a `decision`/`reason` deny in
+  favor of the `waypost_status`, `waypost_recv`, and `waypost_send` MCP tools.
+  An unavailable probe leaves those CLI commands untouched; a failed probe
+  surfaces the error as additional context. The `waypost mcp` command is always
+  blocked because the MCP server is managed by Devin
+- a `PostToolUse` handler matched on `exec` and
+  `mcp__waypost__waypost_recv` observes successful MCP or direct CLI receives
+  and changes a pending nudge to consumed; `received` and `no_message` are
+  terminal receive results, while active-lease and recovery-required results
+  stay pending
+- a `PostCompaction` handler emits the anti-repeat receive guard only while
+  the current session's latest nudge is consumed
+- a `SessionStart` handler emits the same guard after a compact-source session
+  start; other sources produce no context
+- a `SessionEnd` handler removes the session's nudge state
+
+The small session-scoped state lives under `waypost-hook-state/` inside the
+Devin config directory.
+
+Verify the installation:
+
+```bash
+waypost doctor devin-hook
+```
+
+The doctor verifies all six handler definitions and reports whether
+`devin mcp get waypost` sees Waypost for a new Devin process started in the
+current directory. The MCP result is diagnostic only: an already-running
+session or an imported configuration may differ.
+
+Devin invokes the machine-facing entry point automatically:
+
+```bash
+waypost devin-hook
+```
+
+It reads the Devin hook event from stdin and emits the matching hook JSON
+contract (`decision`/`reason` for denials, `hookSpecificOutput` for additional
+context). It does not read or modify Waypost message state.
 
 ### Migrate previous local state
 

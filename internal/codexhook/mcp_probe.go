@@ -42,7 +42,11 @@ func detectWaypostMCP(ctx context.Context, probe waypostMCPProbe) (waypostMCPAva
 // may differ because Codex does not expose its live MCP inventory to command
 // hooks.
 func CurrentDirectoryWaypostMCPAvailable(ctx context.Context) (bool, error) {
-	probeCtx, cancel := context.WithTimeout(ctx, mcpProbeTimeout)
+	return probeWaypostMCPWithTimeout(ctx, mcpProbeTimeout)
+}
+
+func probeWaypostMCPWithTimeout(ctx context.Context, timeout time.Duration) (bool, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	commandName, commandArgs := mcpProbeInvocation("mcp", "get", waypostMCPServerName, "--json")
 	output, err := exec.CommandContext(probeCtx, commandName, commandArgs...).Output()

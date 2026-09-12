@@ -35,7 +35,7 @@ Use waypost COMMAND --help for command syntax. Use waypost doc --list for focuse
 var cliDocTopics = map[string]string{
 	"addresses": `A Waypost address is a public mailbox name within one state directory. It has the form scheme/id. Waypost does not assign a current address.
 
-For an agent session, use its actual session identity: agent-deck/<session-id> or thurbox/<session-id> for a hosted session; otherwise codex/<thread-id>, claude/<session-id>, gemini/<session-id>, or opencode/<session-id>. Obtain the ID from the launcher or tool. Never invent it from a role, task, or display name.
+For an agent session, use its actual session identity: agent-deck/<session-id> or thurbox/<session-id> for a hosted session; otherwise codex/<thread-id>, claude/<session-id>, gemini/<session-id>, opencode/<session-id>, or devin/<session-id>. Obtain the ID from the launcher or tool. Never invent it from a role, task, or display name.
 
 Use the address as --from when sending and --for when receiving, and give it to peers as the return address. Personal addresses are created on first use. group/... is reserved for explicitly created groups.
 `,

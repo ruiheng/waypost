@@ -27,6 +27,10 @@ var (
 	codexResumePattern      = regexp.MustCompile(`\bresume\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b`)
 	codexSessionFilePattern = regexp.MustCompile(`/\.codex/sessions/.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$`)
 	codexCommandPattern     = regexp.MustCompile(`(^|/)codex(\s|$)`)
+	devinResumePattern      = regexp.MustCompile(`(?:^|\s)(?:--resume[= ]+|-r[= ]+)([A-Za-z0-9][A-Za-z0-9._-]*)`)
+	devinSessionLockPattern = regexp.MustCompile(`/devin/cli/session_locks/([A-Za-z0-9][A-Za-z0-9._-]*)\.lock`)
+	devinCommandPattern     = regexp.MustCompile(`(^|/)devin(\s|$)`)
+	devinSessionIDPattern   = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$`)
 	toolSessionIDPattern    = regexp.MustCompile(`^[0-9a-fA-F][0-9a-fA-F-]*[0-9a-fA-F]$|^[0-9a-fA-F]$`)
 )
 
@@ -76,6 +80,8 @@ type toolSessionDescriptor struct {
 	Scheme        string
 	Env           string
 	StatusJSONKey string
+	Validate      func(string) string
+	InvalidHint   string
 }
 
 type toolSessionIDs map[string]string
@@ -85,6 +91,21 @@ var toolSessionDescriptors = []toolSessionDescriptor{
 	{Scheme: "claude", Env: "CLAUDE_CODE_SESSION_ID", StatusJSONKey: "detected_claude_code_session_id"},
 	{Scheme: "gemini", Env: "GEMINI_SESSION_ID", StatusJSONKey: "detected_gemini_session_id"},
 	{Scheme: "opencode", Env: "OPENCODE_SESSION_ID", StatusJSONKey: "detected_opencode_session_id"},
+	{Scheme: "devin", Env: "DEVIN_SESSION_ID", StatusJSONKey: "detected_devin_session_id", Validate: devinSessionIDValidationFailure, InvalidHint: "a devin session id"},
+}
+
+func (d toolSessionDescriptor) validationFailure(sessionID string) string {
+	if d.Validate != nil {
+		return d.Validate(sessionID)
+	}
+	return toolSessionIDValidationFailure(sessionID)
+}
+
+func (d toolSessionDescriptor) invalidHint() string {
+	if d.InvalidHint != "" {
+		return d.InvalidHint
+	}
+	return "a hex session id"
 }
 
 type sessionData struct {
@@ -504,52 +525,119 @@ func (m *sessionManager) detectCurrentCodexSessionID(ctx context.Context) (strin
 	if runtime.GOOS == "windows" {
 		return "", warnings
 	}
+	found, probeWarnings := m.probeAncestorSessions(ctx, map[string]bool{"codex": true})
+	return found["codex"], append(warnings, probeWarnings...)
+}
 
+func (m *sessionManager) detectCurrentToolSessionIDs(ctx context.Context) (toolSessionIDs, []string) {
+	ids := toolSessionIDs{}
+	var warnings []string
+	for _, descriptor := range toolSessionDescriptors {
+		sessionID, envWarnings := detectToolSessionIDFromEnv(descriptor.Env)
+		if sessionID != "" {
+			ids[descriptor.Scheme] = sessionID
+		}
+		warnings = append(warnings, envWarnings...)
+	}
+	if runtime.GOOS == "windows" {
+		return ids, warnings
+	}
+
+	pending := map[string]bool{}
+	if ids["codex"] == "" {
+		pending["codex"] = true
+	}
+	if ids["devin"] == "" {
+		pending["devin"] = true
+	}
+	// The ancestor walk always runs when a codex session is unresolved, so
+	// Devin ancestors are resolved for free on the same chain. When Codex is
+	// already identified, only probe for Devin when the environment indicates
+	// a Devin-spawned process.
+	if !pending["codex"] && !(pending["devin"] && devinProcessProbeEnabled()) {
+		return ids, warnings
+	}
+	found, probeWarnings := m.probeAncestorSessions(ctx, pending)
+	warnings = append(warnings, probeWarnings...)
+	for scheme, sessionID := range found {
+		if ids[scheme] == "" {
+			ids[scheme] = sessionID
+		}
+	}
+	return ids, warnings
+}
+
+// devinProcessProbeEnabled reports whether the environment indicates that this
+// process was spawned by Devin. Devin propagates CHISEL_SESSION_DB to its
+// children; DEVIN_SESSION_ID is the manual override for the session address.
+func devinProcessProbeEnabled() bool {
+	return strings.TrimSpace(os.Getenv("DEVIN_SESSION_ID")) != "" ||
+		strings.TrimSpace(os.Getenv("CHISEL_SESSION_DB")) != ""
+}
+
+// probeAncestorSessions walks the parent process chain once and resolves the
+// session ids of the tool schemes in pending, removing each from pending when
+// its first matching ancestor is handled.
+func (m *sessionManager) probeAncestorSessions(ctx context.Context, pending map[string]bool) (toolSessionIDs, []string) {
+	ids := toolSessionIDs{}
+	var warnings []string
 	seen := map[int]bool{}
 	pid := m.parentPID()
 	for pid > 1 && !seen[pid] {
 		seen[pid] = true
 		row, err := m.getProcessRow(ctx, pid)
 		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("codex session auto-bind probe failed: %v", err))
-			return "", warnings
+			for _, scheme := range []string{"codex", "devin"} {
+				if pending[scheme] {
+					warnings = append(warnings, fmt.Sprintf("%s session auto-bind probe failed: %v", scheme, err))
+				}
+			}
+			return ids, warnings
 		}
 		if row == nil {
 			break
 		}
-		looksLikeCodex := row.Comm == "codex" || codexCommandPattern.MatchString(row.Args) || strings.Contains(row.Args, "@openai/codex")
-		if looksLikeCodex {
+		if pending["codex"] && (row.Comm == "codex" || codexCommandPattern.MatchString(row.Args) || strings.Contains(row.Args, "@openai/codex")) {
+			delete(pending, "codex")
 			if fromArgs := extractCodexSessionIDFromArgs(row.Args); fromArgs != "" {
-				return fromArgs, warnings
-			}
-			if fromLsof, err := m.extractCodexSessionIDFromLsof(ctx, row.PID); err != nil {
+				ids["codex"] = fromArgs
+			} else if fromLsof, err := m.extractCodexSessionIDFromLsof(ctx, row.PID); err != nil {
 				warnings = append(warnings, fmt.Sprintf("codex session auto-bind probe failed: %v", err))
-				return "", warnings
+				return ids, warnings
 			} else if fromLsof != "" {
-				return fromLsof, warnings
+				ids["codex"] = fromLsof
 			}
-			return "", warnings
+		}
+		if pending["devin"] && (row.Comm == "devin" || devinCommandPattern.MatchString(row.Args)) {
+			delete(pending, "devin")
+			devinID := ""
+			if fromArgs := extractDevinSessionIDFromArgs(row.Args); fromArgs != "" {
+				if failure := devinSessionIDValidationFailure(fromArgs); failure != "" {
+					warnings = append(warnings, fmt.Sprintf("devin --resume session id %q is invalid (%s); ignoring it for auto-bind", fromArgs, failure))
+				} else {
+					devinID = fromArgs
+				}
+			}
+			if devinID == "" {
+				if fromLsof, err := m.extractDevinSessionIDFromLsof(ctx, row.PID); err != nil {
+					warnings = append(warnings, fmt.Sprintf("devin session auto-bind probe failed: %v", err))
+					return ids, warnings
+				} else if fromLsof != "" {
+					if failure := devinSessionIDValidationFailure(fromLsof); failure != "" {
+						warnings = append(warnings, fmt.Sprintf("devin session lock id %q is invalid (%s); ignoring it for auto-bind", fromLsof, failure))
+					} else {
+						devinID = fromLsof
+					}
+				}
+			}
+			if devinID != "" {
+				ids["devin"] = devinID
+			}
+		}
+		if len(pending) == 0 {
+			break
 		}
 		pid = row.PPID
-	}
-	return "", warnings
-}
-
-func (m *sessionManager) detectCurrentToolSessionIDs(ctx context.Context) (toolSessionIDs, []string) {
-	ids := toolSessionIDs{}
-	codexSessionID, warnings := m.detectCurrentCodexSessionID(ctx)
-	if codexSessionID != "" {
-		ids["codex"] = codexSessionID
-	}
-	for _, descriptor := range toolSessionDescriptors {
-		if descriptor.Scheme == "codex" {
-			continue
-		}
-		sessionID, envWarnings := detectToolSessionIDFromEnv(descriptor.Env)
-		if sessionID != "" {
-			ids[descriptor.Scheme] = sessionID
-		}
-		warnings = append(warnings, envWarnings...)
 	}
 	return ids, warnings
 }
@@ -559,10 +647,24 @@ func detectToolSessionIDFromEnv(name string) (string, []string) {
 	if sessionID == "" {
 		return "", nil
 	}
-	if toolSessionIDValidationFailure(sessionID) == "" {
+	descriptor := toolSessionDescriptorForEnv(name)
+	if descriptor.validationFailure(sessionID) == "" {
 		return sessionID, nil
 	}
-	return "", []string{fmt.Sprintf("%s is set but does not look like a hex session id; ignoring it for auto-bind", name)}
+	return "", []string{fmt.Sprintf("%s is set but does not look like %s; ignoring it for auto-bind", name, descriptor.invalidHint())}
+}
+
+func toolSessionDescriptorForEnv(name string) toolSessionDescriptor {
+	for _, descriptor := range toolSessionDescriptors {
+		if descriptor.Env == name {
+			return descriptor
+		}
+	}
+	return toolSessionDescriptor{Env: name}
+}
+
+func toolSessionValidationFailureForEnv(name, sessionID string) string {
+	return toolSessionDescriptorForEnv(name).validationFailure(sessionID)
 }
 
 func toolSessionEnvWarnings() []string {
@@ -706,6 +808,14 @@ func (m *sessionManager) getProcessRow(ctx context.Context, pid int) (*psRow, er
 }
 
 func (m *sessionManager) extractCodexSessionIDFromLsof(ctx context.Context, pid int) (string, error) {
+	return m.extractSessionIDFromLsof(ctx, pid, codexSessionFilePattern)
+}
+
+func (m *sessionManager) extractDevinSessionIDFromLsof(ctx context.Context, pid int) (string, error) {
+	return m.extractSessionIDFromLsof(ctx, pid, devinSessionLockPattern)
+}
+
+func (m *sessionManager) extractSessionIDFromLsof(ctx context.Context, pid int, pattern *regexp.Regexp) (string, error) {
 	if pid <= 1 {
 		return "", nil
 	}
@@ -717,12 +827,37 @@ func (m *sessionManager) extractCodexSessionIDFromLsof(ctx context.Context, pid 
 		return "", nil
 	}
 	for _, line := range strings.Split(result.Stdout, "\n") {
-		match := codexSessionFilePattern.FindStringSubmatch(line)
+		match := pattern.FindStringSubmatch(line)
 		if len(match) == 2 {
 			return match[1], nil
 		}
 	}
 	return "", nil
+}
+
+func extractDevinSessionIDFromArgs(args string) string {
+	match := devinResumePattern.FindStringSubmatch(args)
+	if len(match) != 2 {
+		return ""
+	}
+	return match[1]
+}
+
+func devinSessionIDValidationFailure(sessionID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return "empty"
+	}
+	if strings.Contains(sessionID, "--") {
+		return "contains consecutive hyphen"
+	}
+	if !devinSessionIDPattern.MatchString(sessionID) {
+		return "must contain only letters, digits, dots, underscores, and single hyphens, and start and end with a letter or digit"
+	}
+	if len(sessionID) < 3 {
+		return "must contain at least 3 characters"
+	}
+	return ""
 }
 
 func (m *sessionManager) waypostAddresses(ctx context.Context, addresses []string) ([]string, error) {

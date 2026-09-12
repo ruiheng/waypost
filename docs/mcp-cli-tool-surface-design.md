@@ -311,9 +311,11 @@ The same `notice` cue is included on `no_message` when queued deliveries
 remain in the mailbox snapshot.
 
 After a `no_message` result, the same MCP connection must wait at least 15
-seconds before calling `waypost_recv` again. If the next result is also
-`no_message` within three minutes, the response includes a warning to avoid
-meaningless polling.
+seconds before calling `waypost_recv` again. A call inside that window is
+rejected with an instruction to wait for a delivery notification rather than
+a retry time, so callers do not treat it as a polling schedule. If the next
+result is also `no_message` within three minutes, the response includes a
+warning to avoid meaningless polling.
 
 Active leases:
 

@@ -97,8 +97,7 @@ func (g *waypostRecvGuard) begin(req *mcp.CallToolRequest, now func() time.Time,
 		if elapsed >= 0 && elapsed < waypostRecvNoMessageMinInterval {
 			state.mu.Unlock()
 			state.inFlight.Add(-1)
-			remaining := waypostRecvNoMessageMinInterval - elapsed
-			return nil, fmt.Errorf("waypost_recv must wait at least 15 seconds after the previous no_message result (retry in %s)", formatReceiveWait(remaining))
+			return nil, fmt.Errorf("the previous waypost_recv result was no_message; wait for a delivery notification instead of polling")
 		}
 	}
 	state.mu.Unlock()
@@ -156,12 +155,4 @@ func (l *waypostRecvGuardLease) finish(status string, now time.Time) bool {
 	l.state.inFlight.Add(-1)
 	l.active = false
 	return warn
-}
-
-func formatReceiveWait(remaining time.Duration) string {
-	if remaining < time.Second {
-		return "less than 1 second"
-	}
-	seconds := (remaining + time.Second - 1) / time.Second
-	return fmt.Sprintf("%d seconds", seconds)
 }

@@ -42,8 +42,11 @@ func TestWaypostRecvEnforcesNoMessageIntervalPerConnection(t *testing.T) {
 		t.Fatalf("first recv status = %v, want no_message", firstOutput["status"])
 	}
 	_, secondOutput, err := service.waypostRecv(context.Background(), req, waypostRecvInput{Addresses: []string{"agent-deck/self"}})
-	if err == nil || !strings.Contains(err.Error(), "15 seconds") {
-		t.Fatalf("second recv error = %v, want 15-second interval error", err)
+	if err == nil || !strings.Contains(err.Error(), "delivery notification") {
+		t.Fatalf("second recv error = %v, want wait-for-notification error", err)
+	}
+	if strings.Contains(err.Error(), "retry") {
+		t.Fatalf("second recv error = %v, must not suggest a retry time", err)
 	}
 	if secondOutput != nil {
 		t.Fatalf("second recv output = %v, want nil on interval error", secondOutput)
@@ -251,8 +254,11 @@ func TestWaypostRecvGroupEnforcesNoMessageIntervalPerConnection(t *testing.T) {
 	}
 
 	_, secondOutput, err := service.waypostRecv(context.Background(), req, input)
-	if err == nil || !strings.Contains(err.Error(), "15 seconds") {
-		t.Fatalf("second group recv error = %v, want 15-second interval error", err)
+	if err == nil || !strings.Contains(err.Error(), "delivery notification") {
+		t.Fatalf("second group recv error = %v, want wait-for-notification error", err)
+	}
+	if strings.Contains(err.Error(), "retry") {
+		t.Fatalf("second group recv error = %v, must not suggest a retry time", err)
 	}
 	if secondOutput != nil {
 		t.Fatalf("second group recv output = %v, want nil on interval error", secondOutput)

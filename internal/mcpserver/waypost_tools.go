@@ -137,6 +137,11 @@ func waypostRecvInputSchema() *jsonschema.Schema {
 	if err != nil {
 		panic(fmt.Errorf("build waypost_recv input schema: %w", err))
 	}
+	knownDeliveryIDs, ok := schema.Properties["known_delivery_ids"]
+	if !ok {
+		panic("build waypost_recv input schema: missing known_delivery_ids")
+	}
+	knownDeliveryIDs.Description = "Delivery IDs of active leases already known to the caller. Suppresses the active-lease safety hint for this call so another delivery can be claimed; it does not acknowledge, release, or mark them read. Use IDs returned by this MCP server."
 	diagnostics, ok := schema.Properties["diagnostics"]
 	if !ok {
 		panic("build waypost_recv input schema: missing diagnostics")
@@ -254,7 +259,7 @@ func (s *Service) registerWaypostTools(server *mcp.Server) {
 	}, s.waypostSend)
 	addToolRequiringWaypostStatus(server, s, &mcp.Tool{
 		Name:        "waypost_recv",
-		Description: "Claim one available delivery immediately; never blocks. Defaults to all bound addresses, and explicit personal addresses must be bound.",
+		Description: "Claim one available delivery immediately; never blocks. If this MCP server already holds an unacknowledged lease, pass those already-known delivery IDs in known_delivery_ids to suppress the safety hint for this call; this does not acknowledge or release them. A more_messages_available notice means another queued delivery remains. Defaults to all bound addresses, and explicit personal addresses must be bound.",
 		InputSchema: waypostRecvInputSchema(),
 	}, s.waypostRecv)
 	addToolRequiringWaypostStatus(server, s, &mcp.Tool{
@@ -901,18 +906,16 @@ func (s *Service) waypostRecv(ctx context.Context, req *mcp.CallToolRequest, inp
 		return nil, nil, err
 	}
 	if activeLeasePage.Total > 0 {
-		var remainingByState map[string]int
-		if input.Diagnostics {
-			remainingByState, err = s.remainingByState(ctx, addresses, nil)
-			if err != nil {
-				return nil, nil, err
-			}
+		remainingByState, err := s.remainingByState(ctx, addresses, nil)
+		if err != nil {
+			return nil, nil, err
 		}
 		out := map[string]any{
 			"status":               "active_leases",
 			"active_lease_count":   activeLeasePage.Total,
 			"claimed_delivery_ids": activeLeasePage.DeliveryIDs,
 		}
+		addMoreMessagesNotice(out, remainingByState)
 		if len(warnings) > 0 {
 			out["warnings"] = warnings
 		}
@@ -938,9 +941,7 @@ func (s *Service) waypostRecv(ctx context.Context, req *mcp.CallToolRequest, inp
 		// diagnostics-only remaining_by_state map is easy for agents to miss.
 		// This is an informational hint; the next receive still decides whether
 		// a queued delivery is currently visible/claimable.
-		if delivery.RemainingByState["queued"] > 0 {
-			out["notice"] = "more_messages_available"
-		}
+		addMoreMessagesNotice(out, delivery.RemainingByState)
 		if finishRecv("no_message") {
 			warnings = append(warnings, waypostRecvPollingWarning)
 		}
@@ -996,9 +997,7 @@ func (s *Service) waypostRecv(ctx context.Context, req *mcp.CallToolRequest, inp
 		"status":   "received",
 		"delivery": waypost.CompactReceivedMessage(delivery.Messages[0]),
 	}
-	if delivery.RemainingByState["queued"] > 0 {
-		out["notice"] = "more_messages_available"
-	}
+	addMoreMessagesNotice(out, delivery.RemainingByState)
 	if len(warnings) > 0 {
 		out["warnings"] = warnings
 	}
@@ -1009,6 +1008,12 @@ func (s *Service) waypostRecv(ctx context.Context, req *mcp.CallToolRequest, inp
 		out["remaining_by_state"] = delivery.RemainingByState
 	}
 	return s.waypostMutationToolResult(ctx, out)
+}
+
+func addMoreMessagesNotice(out map[string]any, remainingByState map[string]int) {
+	if remainingByState["queued"] > 0 {
+		out["notice"] = "more_messages_available"
+	}
 }
 
 type activeLeaseHintPage struct {

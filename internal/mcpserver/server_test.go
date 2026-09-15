@@ -972,6 +972,10 @@ func TestWaypostRecvSchemaOmitsTimeout(t *testing.T) {
 	if _, ok := schema.Properties["known_delivery_ids"]; !ok {
 		t.Fatalf("schema.Properties missing known_delivery_ids: %v", schema.Properties)
 	}
+	knownDeliveryIDs := schema.Properties["known_delivery_ids"]
+	if got, want := knownDeliveryIDs.Description, "Delivery IDs of active leases already known to the caller. Suppresses the active-lease safety hint for this call so another delivery can be claimed; it does not acknowledge, release, or mark them read. Use IDs returned by this MCP server."; got != want {
+		t.Fatalf("known_delivery_ids description = %q, want %q", got, want)
+	}
 	if _, ok := schema.Properties["active_lease_cursor"]; !ok {
 		t.Fatalf("schema.Properties missing active_lease_cursor: %v", schema.Properties)
 	}
@@ -6302,6 +6306,11 @@ func TestWaypostRecvReportsActiveLeaseImmediately(t *testing.T) {
 	})
 	firstMessage := firstRecv["delivery"].(map[string]any)
 	leaseToken := firstMessage["lease_token"].(string)
+	callServiceTool(t, service, "waypost_send", map[string]any{
+		"to":      "agent-deck/self",
+		"subject": "queued behind active lease",
+		"body":    "second body",
+	})
 
 	startedAt := time.Now()
 	secondRecv := callServiceTool(t, service, "waypost_recv", map[string]any{
@@ -6312,6 +6321,9 @@ func TestWaypostRecvReportsActiveLeaseImmediately(t *testing.T) {
 	}
 	if got := secondRecv["status"]; got != "active_leases" {
 		t.Fatalf("recv status = %v, want active_leases", got)
+	}
+	if got := secondRecv["notice"]; got != "more_messages_available" {
+		t.Fatalf("recv notice = %v, want more_messages_available", got)
 	}
 	if _, ok := secondRecv["active_leases"]; ok {
 		t.Fatalf("active_leases unexpectedly present: %v", secondRecv["active_leases"])

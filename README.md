@@ -364,6 +364,14 @@ polling. Actionable warnings remain sparse. Set
 Repeated instructional fields, echoed known IDs, and counts derivable from the
 returned ID list are intentionally omitted.
 
+When `waypost_recv` returns `status = active_leases`, pass the returned
+`claimed_delivery_ids` as `known_delivery_ids` on a subsequent call only when
+the caller already knows those leases and wants to claim another delivery.
+This suppresses the safety hint for that call; it does not acknowledge, release,
+or mark those deliveries read. If the response also contains
+`notice: "more_messages_available"`, another queued delivery is waiting after
+the active-lease check.
+
 For a blocking receive, forwarding, group work, or durable inspection that is
 not on the retained MCP surface, call `waypost_status` with
 `include_cli_context: true`, then use the reported CLI binary and state

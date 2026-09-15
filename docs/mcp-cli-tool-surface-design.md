@@ -327,6 +327,14 @@ Active leases:
 }
 ```
 
+When `waypost_recv` returns `status = active_leases`, callers may pass the
+returned `claimed_delivery_ids` as `known_delivery_ids` on a later call when
+those leases are already known and another delivery should be claimed.
+`known_delivery_ids` only suppresses the active-lease safety hint for that
+call; it does not acknowledge, release, or mark a delivery read. If the result
+also contains `notice: "more_messages_available"`, a queued delivery remains
+after the active-lease check.
+
 Set `diagnostics: true` to add resolved `addresses` and sparse
 `remaining_by_state`. Warnings remain present only when actionable. Returned
 input echoes, derivable counts, tool-name pointers, and repeated usage prose

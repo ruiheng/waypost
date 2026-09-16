@@ -68,6 +68,8 @@ func Run(ctx context.Context, r io.Reader, w io.Writer) error {
 }
 
 func run(ctx context.Context, r io.Reader, w io.Writer) error {
+	ctx, cancel := hookcore.BeginRun(ctx, r)
+	defer cancel()
 	store, err := defaultNudgeStateStore()
 	if err != nil {
 		return err

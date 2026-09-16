@@ -1876,3 +1876,30 @@ func TestRunPreToolUseHonorsDisabledWaypostTools(t *testing.T) {
 		})
 	}
 }
+
+// TestRunFailsStalledHookInputWithinBudget feeds run() a stdin pipe whose
+// payload never arrives: the internal budget must end the wait below the
+// harness deadline and surface the read failure instead of dying to an opaque
+// kill.
+func TestRunFailsStalledHookInputWithinBudget(t *testing.T) {
+	previous := hookcore.RunBudget
+	hookcore.RunBudget = 50 * time.Millisecond
+	defer func() { hookcore.RunBudget = previous }()
+
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	defer readEnd.Close()
+	defer writeEnd.Close() // payload never arrives
+
+	var output bytes.Buffer
+	start := time.Now()
+	err = run(context.Background(), readEnd, &output)
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("run() error = %v, want os.ErrDeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("run() took %v, want exit well below the harness deadline", elapsed)
+	}
+}

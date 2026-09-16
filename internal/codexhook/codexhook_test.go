@@ -1563,3 +1563,37 @@ func runPreToolHook(t *testing.T, command string, probe waypostMCPProbe) (hookOu
 	}
 	return output, true
 }
+
+// TestRunReportsStalledHookInputWithinBudget feeds run() a stdin pipe whose
+// payload never arrives: the internal budget must end the wait below the
+// harness deadline and emit a systemMessage instead of dying to an opaque
+// kill.
+func TestRunReportsStalledHookInputWithinBudget(t *testing.T) {
+	previous := hookcore.RunBudget
+	hookcore.RunBudget = 50 * time.Millisecond
+	defer func() { hookcore.RunBudget = previous }()
+
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	defer readEnd.Close()
+	defer writeEnd.Close() // payload never arrives
+
+	var output bytes.Buffer
+	start := time.Now()
+	if err := run(context.Background(), readEnd, &output); err != nil {
+		t.Fatalf("run() error = %v, want graceful systemMessage", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("run() took %v, want exit well below the harness deadline", elapsed)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(output.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal(hook output) error = %v", err)
+	}
+	message, _ := payload["systemMessage"].(string)
+	if !strings.Contains(message, "timed out") {
+		t.Fatalf("systemMessage = %q, want timeout notice", message)
+	}
+}

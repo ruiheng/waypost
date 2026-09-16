@@ -3,6 +3,7 @@ package codexhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -72,6 +73,8 @@ func Run(ctx context.Context, r io.Reader, w io.Writer) error {
 }
 
 func run(ctx context.Context, r io.Reader, w io.Writer) error {
+	ctx, cancel := hookcore.BeginRun(ctx, r)
+	defer cancel()
 	store, err := defaultNudgeStateStore()
 	if err != nil {
 		return err
@@ -92,6 +95,9 @@ func runWithDependencies(
 ) error {
 	input, hasInput, err := hookcore.ReadHookInput(r, harnessLabel)
 	if err != nil {
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return writeSystemMessage(w, "Waypost Codex hook input timed out waiting for the harness payload")
+		}
 		return err
 	}
 	if !hasInput {

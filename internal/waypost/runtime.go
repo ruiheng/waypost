@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -152,8 +153,15 @@ func ensureDir(path string) error {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return fmt.Errorf("create directory %q: %w", path, err)
 	}
-	if err := os.Chmod(path, 0o700); err != nil {
-		return fmt.Errorf("chmod directory %q: %w", path, err)
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("inspect directory %q: %w", path, err)
+	}
+	if permissions := info.Mode().Perm(); permissions&0o077 != 0 {
+		return fmt.Errorf("directory %q permissions %04o allow group or other access; require user-only permissions", path, permissions)
 	}
 	return nil
 }

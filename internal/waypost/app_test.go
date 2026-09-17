@@ -101,6 +101,32 @@ WHERE type = 'index' AND name = 'idx_groups_created_address'
 	}
 }
 
+func TestOpenRuntimeRejectsNonPrivateStateDirectoryPermissions(t *testing.T) {
+	t.Parallel()
+	if goruntime.GOOS == "windows" {
+		t.Skip("directory permission bits are not portable on Windows")
+	}
+
+	stateDir := filepath.Join(t.TempDir(), "waypost-state")
+	if err := os.Mkdir(stateDir, 0o755); err != nil {
+		t.Fatalf("os.Mkdir(stateDir) error = %v", err)
+	}
+	if err := os.Chmod(stateDir, 0o755); err != nil {
+		t.Fatalf("os.Chmod(stateDir) error = %v", err)
+	}
+
+	_, err := OpenRuntime(context.Background(), stateDir)
+	if err == nil {
+		t.Fatal("OpenRuntime() error = nil, want unsafe directory permissions error")
+	}
+	if !strings.Contains(err.Error(), "permissions 0755 allow group or other access") {
+		t.Fatalf("OpenRuntime() error = %v, want unsafe directory permissions error", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(stateDir, databaseFilename)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("database created in unsafe directory: os.Stat() error = %v", statErr)
+	}
+}
+
 func TestOpenRuntimeMigratesForwardedMessageColumn(t *testing.T) {
 	t.Parallel()
 

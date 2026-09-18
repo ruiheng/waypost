@@ -165,6 +165,62 @@ func TestWaypostSendSchemaExposesSingleOrBatchTarget(t *testing.T) {
 	}
 }
 
+func TestWaypostSendAcceptsToAddressAlias(t *testing.T) {
+	waypostService := &fakeWaypostService{t: t}
+	waypostService.sendFunc = func(_ context.Context, params waypost.SendParams) (waypost.SendResult, error) {
+		if got, want := params.ToAddress, "workflow/reviewer"; got != want {
+			t.Fatalf("send to_address = %q, want %q", got, want)
+		}
+		return waypost.SendResult{DeliveryID: "dlv_alias"}, nil
+	}
+	service := newService(Options{
+		WaypostServiceFactory: fakeWaypostServiceFactory{service: waypostService},
+		CommandRunner: &fakeRunner{t: t, handler: func(_ []string, _ string) (RunResult, error) {
+			return RunResult{ExitCode: 1}, nil
+		}},
+		DisableWakeScheduler:  true,
+		DisableLeaseRenewLoop: true,
+	})
+	defer service.Close()
+	setBoundTestSender(service, "agent/sender")
+
+	output := callServiceTool(t, service, "waypost_send", map[string]any{
+		"to_address":             "workflow/reviewer",
+		"from_address":           "agent/sender",
+		"subject":                "alias send",
+		"body":                   "hello",
+		"disable_notify_message": true,
+	})
+	if output["delivery_id"] != "dlv_alias" {
+		t.Fatalf("delivery_id = %v, want dlv_alias", output["delivery_id"])
+	}
+}
+
+func TestWaypostSendRejectsConflictingToAddressAlias(t *testing.T) {
+	service := newService(Options{
+		WaypostServiceFactory: fakeWaypostServiceFactory{service: &fakeWaypostService{t: t}},
+		CommandRunner: &fakeRunner{t: t, handler: func(_ []string, _ string) (RunResult, error) {
+			return RunResult{ExitCode: 1}, nil
+		}},
+		DisableWakeScheduler:  true,
+		DisableLeaseRenewLoop: true,
+	})
+	defer service.Close()
+	setBoundTestSender(service, "agent/sender")
+
+	err := callServiceToolExpectError(t, service, "waypost_send", map[string]any{
+		"to":                     "workflow/reviewer",
+		"to_address":             "workflow/other",
+		"from_address":           "agent/sender",
+		"subject":                "conflict",
+		"body":                   "hello",
+		"disable_notify_message": true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "to_address") {
+		t.Fatalf("waypost_send error = %v, want validation flagging to_address", err)
+	}
+}
+
 func TestWaypostSendReadsBodyFile(t *testing.T) {
 	workdir := t.TempDir()
 	bodyFile := filepath.Join(workdir, " message.md ")

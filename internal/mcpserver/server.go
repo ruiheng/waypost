@@ -412,6 +412,7 @@ func (s *Service) Server() *mcp.Server {
 		SubscribeHandler:   s.subscribeResource,
 		UnsubscribeHandler: s.unsubscribeResource,
 	})
+	server.AddReceivingMiddleware(normalizeToolArgAliases)
 
 	s.registerWaypostTools(server)
 	s.registerSessionTools(server)

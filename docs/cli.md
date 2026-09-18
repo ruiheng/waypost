@@ -177,7 +177,9 @@ unrelated hooks and settings:
   `devin mcp get waypost` from the session working directory; it injects one
   explicit receive instruction: `waypost_recv` when the MCP server is
   configured, `waypost recv --json` otherwise. If the probe fails, the
-  instruction and the probe error are emitted as additional context
+  instruction and the probe error are emitted as additional context. An
+  ordinary prompt also emits a compact guard left pending by PostCompaction,
+  because Devin drops that event's additional context
 - a `PreToolUse` `exec` handler recognizes direct Waypost CLI invocations. A
   `waypost wait` call receives a model-visible warning not to poll; it is not
   blocked. When the MCP probe reports Waypost configured, `waypost status`,
@@ -186,15 +188,17 @@ unrelated hooks and settings:
   An unavailable probe leaves those CLI commands untouched; a failed probe
   surfaces the error as additional context. The `waypost mcp` command is always
   blocked because the MCP server is managed by Devin
-- a `PostToolUse` handler matched on `exec` and
-  `mcp__waypost__waypost_recv` observes successful MCP or direct CLI receives
-  and changes a pending nudge to consumed; `received` and `no_message` are
-  terminal receive results, while active-lease and recovery-required results
-  stay pending
-- a `PostCompaction` handler emits the anti-repeat receive guard only while
-  the current session's latest nudge is consumed
+- a `PostToolUse` handler fires after every tool call so the first
+  post-compaction call re-injects a pending compact guard; it also observes
+  successful MCP or direct CLI receives and changes a pending nudge to
+  consumed — `received` and `no_message` are terminal receive results, while
+  active-lease and recovery-required results stay pending
+- a `PostCompaction` handler marks the anti-repeat receive guard pending only
+  while the current session's latest nudge is consumed; Devin drops
+  PostCompaction additional context, so the guard is emitted by the next
+  PostToolUse or UserPromptSubmit event instead
 - a `SessionStart` handler emits the same guard after a compact-source session
-  start; other sources produce no context
+  start and delivers a still-pending guard on any source
 - a `SessionEnd` handler removes the session's nudge state
 
 The small session-scoped state lives under `waypost-hook-state/` inside the

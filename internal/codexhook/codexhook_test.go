@@ -58,7 +58,7 @@ func TestNudgeLifecycleControlsCompactGuard(t *testing.T) {
 	if !emitted || output.HookSpecificOutput.AdditionalContext != MCPNudgeContext {
 		t.Fatalf("nudge output = %+v, %v; want MCP receive context", output, emitted)
 	}
-	if state, err := store.Load(sessionID); err != nil || state != nudgePending {
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgePending {
 		t.Fatalf("state after nudge = %q, %v; want pending", state, err)
 	}
 	if context := runCompactHook(t, store, sessionID); context != "" {
@@ -74,7 +74,7 @@ func TestNudgeLifecycleControlsCompactGuard(t *testing.T) {
 	}); emitted {
 		t.Fatalf("PostToolUse output = %+v, want empty", output)
 	}
-	if state, err := store.Load(sessionID); err != nil || state != nudgeConsumed {
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgeConsumed {
 		t.Fatalf("state after receive = %q, %v; want consumed", state, err)
 	}
 	for compact := 1; compact <= 2; compact++ {
@@ -90,7 +90,7 @@ func TestNudgeLifecycleControlsCompactGuard(t *testing.T) {
 	}); emitted {
 		t.Fatalf("ordinary prompt output = %+v, want empty", output)
 	}
-	if state, err := store.Load(sessionID); err != nil || state != nudgeNone {
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgeNone {
 		t.Fatalf("state after ordinary prompt = %q, %v; want none", state, err)
 	}
 	if context := runCompactHook(t, store, sessionID); context != "" {
@@ -137,7 +137,7 @@ func TestPostToolUseConsumesPendingNudgeOnlyAfterSuccessfulReceive(t *testing.T)
 			t.Parallel()
 			const sessionID = "session-receive-result"
 			store := newMemoryNudgeStateStore()
-			if err := store.Save(sessionID, nudgePending); err != nil {
+			if err := store.Save(sessionID, hookcore.NudgePending); err != nil {
 				t.Fatalf("Save(pending) error = %v", err)
 			}
 			if output, emitted := runHook(t, store, nil, hookInput{
@@ -153,9 +153,9 @@ func TestPostToolUseConsumesPendingNudgeOnlyAfterSuccessfulReceive(t *testing.T)
 			if err != nil {
 				t.Fatalf("Load() error = %v", err)
 			}
-			want := nudgePending
+			want := hookcore.NudgePending
 			if tc.wantConsumed {
-				want = nudgeConsumed
+				want = hookcore.NudgeConsumed
 			}
 			if state != want {
 				t.Fatalf("state = %q, want %q", state, want)
@@ -177,7 +177,7 @@ func TestReceiveWithoutPendingNudgeDoesNotEnableCompactGuard(t *testing.T) {
 	}); emitted {
 		t.Fatalf("PostToolUse output = %+v, want empty", output)
 	}
-	if state, err := store.Load(sessionID); err != nil || state != nudgeNone {
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgeNone {
 		t.Fatalf("state after explicit receive = %q, %v; want none", state, err)
 	}
 	if context := runCompactHook(t, store, sessionID); context != "" {
@@ -190,13 +190,13 @@ func TestSessionEndClearsNudgeState(t *testing.T) {
 
 	const sessionID = "session-end"
 	store := newMemoryNudgeStateStore()
-	if err := store.Save(sessionID, nudgeConsumed); err != nil {
+	if err := store.Save(sessionID, hookcore.NudgeConsumed); err != nil {
 		t.Fatalf("Save(consumed) error = %v", err)
 	}
 	if output, emitted := runHook(t, store, nil, hookInput{HookEventName: "SessionEnd", SessionID: sessionID}); emitted {
 		t.Fatalf("SessionEnd output = %+v, want empty", output)
 	}
-	if state, err := store.Load(sessionID); err != nil || state != nudgeNone {
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgeNone {
 		t.Fatalf("state after SessionEnd = %q, %v; want none", state, err)
 	}
 }
@@ -207,7 +207,7 @@ func TestFileNudgeStateStorePersistsAndClearsSessionState(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), "hook-state")
 	store := fileNudgeStateStore{Dir: stateDir, Label: harnessLabel}
 	const sessionID = "session/with unsafe path characters"
-	if err := store.Save(sessionID, nudgePending); err != nil {
+	if err := store.Save(sessionID, hookcore.NudgePending); err != nil {
 		t.Fatalf("Save(pending) error = %v", err)
 	}
 	entries, err := os.ReadDir(stateDir)
@@ -224,19 +224,19 @@ func TestFileNudgeStateStorePersistsAndClearsSessionState(t *testing.T) {
 	if got := info.Mode().Perm(); runtime.GOOS != "windows" && got != 0o600 {
 		t.Fatalf("state file mode = %o, want 600", got)
 	}
-	if state, err := store.Load(sessionID); err != nil || state != nudgePending {
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgePending {
 		t.Fatalf("Load(pending) = %q, %v; want pending", state, err)
 	}
-	if err := store.Save(sessionID, nudgeConsumed); err != nil {
+	if err := store.Save(sessionID, hookcore.NudgeConsumed); err != nil {
 		t.Fatalf("Save(consumed) error = %v", err)
 	}
-	if state, err := store.Load(sessionID); err != nil || state != nudgeConsumed {
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgeConsumed {
 		t.Fatalf("Load(consumed) = %q, %v; want consumed", state, err)
 	}
 	if err := store.Clear(sessionID); err != nil {
 		t.Fatalf("Clear() error = %v", err)
 	}
-	if state, err := store.Load(sessionID); err != nil || state != nudgeNone {
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgeNone {
 		t.Fatalf("Load(after clear) = %q, %v; want none", state, err)
 	}
 }
@@ -609,8 +609,8 @@ func TestLooksLikeWaypostNudge(t *testing.T) {
 		"notice: there might be new delivery in WAYPOST.",
 		"  NOTICE: There might be new delivery in waypost.\n",
 	} {
-		if !LooksLikeWaypostNudge(prompt) {
-			t.Errorf("LooksLikeWaypostNudge(%q) = false, want true", prompt)
+		if !hookcore.LooksLikeWaypostNudge(prompt) {
+			t.Errorf("hookcore.LooksLikeWaypostNudge(%q) = false, want true", prompt)
 		}
 	}
 	for _, prompt := range []string{
@@ -622,8 +622,8 @@ func TestLooksLikeWaypostNudge(t *testing.T) {
 		"NOTICE: investigate a pending Waypost message delivery bug",
 		"NUDGE: check Waypost mail",
 	} {
-		if LooksLikeWaypostNudge(prompt) {
-			t.Errorf("LooksLikeWaypostNudge(%q) = true, want false", prompt)
+		if hookcore.LooksLikeWaypostNudge(prompt) {
+			t.Errorf("hookcore.LooksLikeWaypostNudge(%q) = true, want false", prompt)
 		}
 	}
 }
@@ -639,8 +639,8 @@ func TestLooksLikeWaypostWaitCommand(t *testing.T) {
 		`waypost.exe --state-dir "C:\Users\alice\Waypost State" wait --timeout 30s`,
 		`waypost --state-dir=/tmp/waypost wait`,
 	} {
-		if !LooksLikeWaypostWaitCommand(command) {
-			t.Errorf("LooksLikeWaypostWaitCommand(%q) = false, want true", command)
+		if !hookcore.LooksLikeWaypostWaitCommand(command) {
+			t.Errorf("hookcore.LooksLikeWaypostWaitCommand(%q) = false, want true", command)
 		}
 	}
 	for _, command := range []string{
@@ -652,8 +652,8 @@ func TestLooksLikeWaypostWaitCommand(t *testing.T) {
 		"waypost\nwait --for workflow/reviewer",
 		"cd /tmp && waypost wait --for workflow/reviewer",
 	} {
-		if LooksLikeWaypostWaitCommand(command) {
-			t.Errorf("LooksLikeWaypostWaitCommand(%q) = true, want false", command)
+		if hookcore.LooksLikeWaypostWaitCommand(command) {
+			t.Errorf("hookcore.LooksLikeWaypostWaitCommand(%q) = true, want false", command)
 		}
 	}
 }
@@ -671,13 +671,14 @@ func TestWaypostMCPDenialReason(t *testing.T) {
 		{`& "C:\Users\alice\.local\bin\waypost.exe" receive`, "waypost_recv"},
 		{"waypost --state-dir=/tmp/state send", "waypost_send"},
 	} {
-		reason, guarded := waypostMCPDenialReason(tc.command)
-		if !guarded || !strings.Contains(reason, tc.wantTool) {
-			t.Errorf("waypostMCPDenialReason(%q) = %q, %v; want tool %q", tc.command, reason, guarded, tc.wantTool)
+		tool, guarded := hookcore.WaypostMCPTool(tc.command)
+		reason := hookcore.WaypostCommandDenialReason(tool, MCPServerCommandDenialReason)
+		if !guarded || tool != tc.wantTool || !strings.Contains(reason, tc.wantTool) {
+			t.Errorf("WaypostMCPTool(%q)+WaypostCommandDenialReason = %q, %q, %v; want tool %q", tc.command, reason, tool, guarded, tc.wantTool)
 		}
 	}
-	if reason, guarded := waypostMCPDenialReason("waypost mcp --include-debug-tool"); !guarded || reason != MCPServerCommandDenialReason {
-		t.Errorf("waypostMCPDenialReason(%q) = %q, %v; want unconditional MCP server denial", "waypost mcp --include-debug-tool", reason, guarded)
+	if tool, guarded := hookcore.WaypostMCPTool("waypost mcp --include-debug-tool"); !guarded || tool != "" || hookcore.WaypostCommandDenialReason(tool, MCPServerCommandDenialReason) != MCPServerCommandDenialReason {
+		t.Errorf("WaypostMCPTool(%q) = %q, %v; want unconditional MCP server denial", "waypost mcp --include-debug-tool", tool, guarded)
 	}
 
 	for _, command := range []string{
@@ -686,8 +687,8 @@ func TestWaypostMCPDenialReason(t *testing.T) {
 		"echo waypost send",
 		"cd /tmp && waypost recv",
 	} {
-		if reason, guarded := waypostMCPDenialReason(command); guarded {
-			t.Errorf("waypostMCPDenialReason(%q) = %q, true; want unguarded", command, reason)
+		if _, guarded := hookcore.WaypostMCPTool(command); guarded {
+			t.Errorf("WaypostMCPTool(%q) = guarded; want unguarded", command)
 		}
 	}
 }
@@ -1181,20 +1182,16 @@ func TestCurrentCommandRejectsRelativeLauncherPath(t *testing.T) {
 func TestManagedGroupsUseShortTimeout(t *testing.T) {
 	t.Parallel()
 
-	for name, tc := range map[string]struct {
-		group   map[string]any
-		timeout json.Number
-	}{
-		"compact": {group: compactManagedGroup("waypost codex-hook"), timeout: hookTimeoutJSON},
-		"prompt":  {group: promptManagedGroup("waypost codex-hook"), timeout: hookTimeoutJSON},
-		"wait":    {group: waitManagedGroup("waypost codex-hook"), timeout: hookTimeoutJSON},
-		"receive": {group: receiveManagedGroup("waypost codex-hook"), timeout: hookTimeoutJSON},
-		"cleanup": {group: cleanupManagedGroup("waypost codex-hook"), timeout: cleanupHookTimeoutJSON},
-	} {
-		handlers := tc.group["hooks"].([]any)
+	for _, spec := range managedHooks.Events {
+		want := hookTimeoutJSON
+		if spec.Event == "SessionEnd" {
+			want = cleanupHookTimeoutJSON
+		}
+		group := spec.DesiredGroup("waypost codex-hook")
+		handlers := group["hooks"].([]any)
 		handler := handlers[0].(map[string]any)
-		if got := handler["timeout"]; got != tc.timeout {
-			t.Errorf("%s timeout = %#v, want %s", name, got, tc.timeout)
+		if got := handler["timeout"]; got != want {
+			t.Errorf("%s timeout = %#v, want %s", spec.Event, got, want)
 		}
 	}
 }

@@ -148,6 +148,25 @@ func TestMergeManagedHandler(t *testing.T) {
 		}
 	})
 
+	t.Run("refreshes envelope of wholly managed group", func(t *testing.T) {
+		groups := []any{
+			map[string]any{"matcher": "^old$", "custom": "field", "hooks": []any{
+				map[string]any{"type": "command", "command": "/old/waypost test-hook"},
+			}},
+		}
+		updated, changed := MergeManagedHandler(groups, desired, spec)
+		if !changed || len(updated) != 1 {
+			t.Fatalf("MergeManagedHandler() = %v, %v; want group replaced", updated, changed)
+		}
+		group := updated[0].(map[string]any)
+		if _, exists := group["matcher"]; exists {
+			t.Fatalf("group = %#v, want stale matcher removed", group)
+		}
+		if _, exists := group["custom"]; exists {
+			t.Fatalf("group = %#v, want envelope refreshed from desired", group)
+		}
+	})
+
 	t.Run("keeps commands merely mentioning subcommand", func(t *testing.T) {
 		groups := []any{
 			map[string]any{"hooks": []any{
@@ -239,13 +258,13 @@ func TestMatcherHelpers(t *testing.T) {
 	if MatcherTargetsReceiveCompletionOnly("^(exec|mcp__waypost__waypost_recv|edit)$", "exec", "mcp__waypost__waypost_recv", []string{"edit"}) {
 		t.Error("MatcherTargetsReceiveCompletionOnly(with edit) = true, want false")
 	}
-	if !MatcherFiresForNonToolEvent(map[string]any{}, "probe") {
-		t.Error("MatcherFiresForNonToolEvent(no matcher) = false, want true")
+	if !MatcherFiresFor(map[string]any{}, "probe") {
+		t.Error("MatcherFiresFor(no matcher) = false, want true")
 	}
-	if !MatcherFiresForNonToolEvent(map[string]any{"matcher": ".*"}, "probe") {
-		t.Error("MatcherFiresForNonToolEvent(.*) = false, want true")
+	if !MatcherFiresFor(map[string]any{"matcher": ".*"}, "probe") {
+		t.Error("MatcherFiresFor(.*) = false, want true")
 	}
-	if MatcherFiresForNonToolEvent(map[string]any{"matcher": "^Bash$"}, "") {
-		t.Error("MatcherFiresForNonToolEvent(^Bash$ vs empty) = true, want false")
+	if MatcherFiresFor(map[string]any{"matcher": "^Bash$"}, "") {
+		t.Error("MatcherFiresFor(^Bash$ vs empty) = true, want false")
 	}
 }

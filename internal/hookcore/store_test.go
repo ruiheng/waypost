@@ -31,6 +31,12 @@ func TestFileNudgeStorePersistsAndClearsSessionState(t *testing.T) {
 	if err := store.Save(sessionID, NudgeConsumed); err != nil {
 		t.Fatalf("Save(consumed) error = %v", err)
 	}
+	if err := store.Save(sessionID, NudgeGuardPending); err != nil {
+		t.Fatalf("Save(guard pending) error = %v", err)
+	}
+	if state, err := store.Load(sessionID); err != nil || state != NudgeGuardPending {
+		t.Fatalf("Load(guard pending) = %q, %v; want guard_pending", state, err)
+	}
 	if err := store.Clear(sessionID); err != nil {
 		t.Fatalf("Clear() error = %v", err)
 	}

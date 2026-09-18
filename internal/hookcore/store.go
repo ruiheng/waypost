@@ -13,13 +13,18 @@ import (
 )
 
 // NudgeState tracks whether the harness was nudged about a pending Waypost
-// delivery and whether that receive completed.
+// delivery and whether that receive completed. NudgeGuardPending marks a
+// consumed nudge whose compact guard still has to be re-injected through an
+// event the harness honors: Devin runs PostCompaction hooks but drops their
+// additionalContext, so PostCompaction only records the pending guard and the
+// next PostToolUse, UserPromptSubmit, or SessionStart delivers it.
 type NudgeState string
 
 const (
-	NudgeNone     NudgeState = ""
-	NudgePending  NudgeState = "pending"
-	NudgeConsumed NudgeState = "consumed"
+	NudgeNone         NudgeState = ""
+	NudgePending      NudgeState = "pending"
+	NudgeConsumed     NudgeState = "consumed"
+	NudgeGuardPending NudgeState = "guard_pending"
 )
 
 // MCPProbeRecord is the cached result of probing the harness CLI for the
@@ -99,14 +104,14 @@ func (store FileNudgeStore) Load(sessionID string) (NudgeState, error) {
 	if record.SessionID != sessionID {
 		return NudgeNone, fmt.Errorf("parse %s Waypost nudge state %q: session id mismatch", store.Label, path)
 	}
-	if record.State != NudgePending && record.State != NudgeConsumed {
+	if record.State != NudgePending && record.State != NudgeConsumed && record.State != NudgeGuardPending {
 		return NudgeNone, fmt.Errorf("parse %s Waypost nudge state %q: invalid state %q", store.Label, path, record.State)
 	}
 	return record.State, nil
 }
 
 func (store FileNudgeStore) Save(sessionID string, state NudgeState) error {
-	if state != NudgePending && state != NudgeConsumed {
+	if state != NudgePending && state != NudgeConsumed && state != NudgeGuardPending {
 		return fmt.Errorf("save %s Waypost nudge state: invalid state %q", store.Label, state)
 	}
 	sessionID, err := NormalizeSessionID(sessionID, store.Label)

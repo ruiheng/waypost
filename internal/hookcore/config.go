@@ -312,7 +312,10 @@ func MergeManagedHandler(groups []any, desired map[string]any, spec ManagedHandl
 			updated = append(updated, item)
 			continue
 		}
-		if !installed && managedGroup && len(handlers) == 1 && managedCommandHandler(handlers[0], spec, true, 1) {
+		// A group whose only handler is managed is wholly owned by the
+		// installer, so the whole envelope (matcher and other fields) is
+		// refreshed from desired rather than only the handler inside it.
+		if !installed && len(handlers) == 1 && managedCommandHandler(handlers[0], spec, managedGroup, 1) {
 			updated = append(updated, desired)
 			installed = true
 			continue
@@ -422,12 +425,11 @@ func MatcherTargetsReceiveCompletionOnly(value any, shellTool, receiveTool strin
 	return true
 }
 
-// MatcherFiresForNonToolEvent reports whether a group's matcher (absent,
-// null, or a regex matching probe) can fire for a non-tool lifecycle event.
-// probe is a sample value the matcher must accept: harnesses that match the
-// event's source use a source name; harnesses whose matchers target tool
-// names use the empty string.
-func MatcherFiresForNonToolEvent(group map[string]any, probe string) bool {
+// MatcherFiresFor reports whether a group's matcher (absent, null, or a
+// regex matching probe) can fire for an input value of probe. Lifecycle
+// events probe with a source name or the empty string; tool events probe
+// with a tool name.
+func MatcherFiresFor(group map[string]any, probe string) bool {
 	value, exists := group["matcher"]
 	if !exists || value == nil {
 		return true

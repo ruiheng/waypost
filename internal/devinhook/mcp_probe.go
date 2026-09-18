@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/ruiheng/waypost/internal/hookcore"
 )
 
 const mcpProbeTimeout = 4 * time.Second
@@ -24,7 +26,7 @@ type waypostMCPStatus struct {
 }
 
 func (status waypostMCPStatus) toolUsable(tool string) bool {
-	return status.available && !status.disabledTools[tool]
+	return hookcore.MCPToolUsable(status.probeRecord(), tool)
 }
 
 // WaypostMCPStatus is the exported form of waypostMCPStatus for doctor and
@@ -129,7 +131,7 @@ func parseWaypostMCPStatus(output []byte) (waypostMCPStatus, error) {
 		}
 		if match := disabledToolsPattern.FindStringSubmatch(trimmed); match != nil {
 			for _, name := range strings.Split(match[1], ",") {
-				if name = canonicalWaypostToolName(strings.TrimSpace(name)); name != "" {
+				if name = hookcore.CanonicalWaypostToolName(strings.TrimSpace(name)); name != "" {
 					status.disabledTools[name] = true
 				}
 			}
@@ -140,14 +142,4 @@ func parseWaypostMCPStatus(output []byte) (waypostMCPStatus, error) {
 	}
 	status.available = true
 	return status, nil
-}
-
-// canonicalWaypostToolName maps Devin's namespaced MCP tool id
-// (mcp__waypost__<tool>) to the bare tool name used for availability checks.
-// Entries for other servers are left untouched.
-func canonicalWaypostToolName(name string) string {
-	if rest, ok := strings.CutPrefix(name, "mcp__waypost__"); ok && rest != "" {
-		return rest
-	}
-	return name
 }

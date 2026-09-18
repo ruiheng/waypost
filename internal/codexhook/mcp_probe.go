@@ -14,26 +14,7 @@ const mcpProbeTimeout = 4 * time.Second
 
 const waypostMCPServerName = "waypost"
 
-type waypostMCPAvailability uint8
-
-const (
-	waypostMCPUnknown waypostMCPAvailability = iota
-	waypostMCPUnavailable
-	waypostMCPAvailable
-)
-
 type waypostMCPProbe func(context.Context) (bool, error)
-
-func detectWaypostMCP(ctx context.Context, probe waypostMCPProbe) (waypostMCPAvailability, error) {
-	available, err := probe(ctx)
-	if err != nil {
-		return waypostMCPUnknown, err
-	}
-	if available {
-		return waypostMCPAvailable, nil
-	}
-	return waypostMCPUnavailable, nil
-}
 
 // CurrentDirectoryWaypostMCPAvailable reports whether Waypost is enabled in
 // the effective configuration visible to a new Codex process started in the

@@ -78,11 +78,14 @@ func TestNudgeLifecycleControlsCompactGuard(t *testing.T) {
 	if !emitted || output.HookSpecificOutput.AdditionalContext != MCPNudgeContext {
 		t.Fatalf("nudge output = %+v, %v; want MCP receive context", output, emitted)
 	}
-	if state, err := store.Load(sessionID); err != nil || state != nudgePending {
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgePending {
 		t.Fatalf("state after nudge = %q, %v; want pending", state, err)
 	}
 	if context := runCompactHook(t, store, sessionID); context != "" {
 		t.Fatalf("compact context while pending = %q, want empty", context)
+	}
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgePending {
+		t.Fatalf("state after pending compaction = %q, %v; want pending", state, err)
 	}
 
 	toolResponse := json.RawMessage(`{"success":true,"output":"{\"structuredContent\":{\"status\":\"received\"}}"}`)
@@ -94,23 +97,46 @@ func TestNudgeLifecycleControlsCompactGuard(t *testing.T) {
 	}); emitted {
 		t.Fatalf("PostToolUse output = %+v, want empty", output)
 	}
-	if state, err := store.Load(sessionID); err != nil || state != nudgeConsumed {
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgeConsumed {
 		t.Fatalf("state after receive = %q, %v; want consumed", state, err)
 	}
-	for compact := 1; compact <= 2; compact++ {
-		if context := runCompactHook(t, store, sessionID); context != AdditionalContext {
-			t.Fatalf("compact %d context = %q, want guard %q", compact, context, AdditionalContext)
-		}
+
+	// Devin drops PostCompaction additionalContext, so the guard is marked
+	// pending; a second compaction before delivery keeps it pending.
+	if context := runCompactHook(t, store, sessionID); context != AdditionalContext {
+		t.Fatalf("compact context = %q, want guard %q", context, AdditionalContext)
+	}
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgeGuardPending {
+		t.Fatalf("state after compaction = %q, %v; want guard pending", state, err)
+	}
+	if context := runCompactHook(t, store, sessionID); context != "" {
+		t.Fatalf("second compact context = %q, want empty while guard pending", context)
 	}
 
+	// The next PostToolUse injects the guard for any tool and re-arms it.
+	if output, emitted := runHook(t, store, probe, hookInput{
+		HookEventName: "PostToolUse",
+		SessionID:     sessionID,
+		ToolName:      "edit",
+	}); !emitted || output.HookSpecificOutput.AdditionalContext != AdditionalContext {
+		t.Fatalf("PostToolUse output = %+v, %v; want compact guard", output, emitted)
+	}
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgeConsumed {
+		t.Fatalf("state after guard delivery = %q, %v; want consumed", state, err)
+	}
+
+	// An ordinary prompt delivers a still-pending guard and clears the state.
+	if context := runCompactHook(t, store, sessionID); context != AdditionalContext {
+		t.Fatalf("compact context = %q, want guard %q", context, AdditionalContext)
+	}
 	if output, emitted := runHook(t, store, probe, hookInput{
 		HookEventName: "UserPromptSubmit",
 		SessionID:     sessionID,
 		Prompt:        "Continue the original task.",
-	}); emitted {
-		t.Fatalf("ordinary prompt output = %+v, want empty", output)
+	}); !emitted || output.HookSpecificOutput.AdditionalContext != AdditionalContext {
+		t.Fatalf("ordinary prompt output = %+v, %v; want compact guard", output, emitted)
 	}
-	if state, err := store.Load(sessionID); err != nil || state != nudgeNone {
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgeNone {
 		t.Fatalf("state after ordinary prompt = %q, %v; want none", state, err)
 	}
 	if context := runCompactHook(t, store, sessionID); context != "" {
@@ -123,7 +149,7 @@ func TestSessionStartCompactSourceTriggersGuard(t *testing.T) {
 
 	const sessionID = "session-start-sources"
 	store := newMemoryNudgeStateStore()
-	if err := store.Save(sessionID, nudgeConsumed); err != nil {
+	if err := store.Save(sessionID, hookcore.NudgeConsumed); err != nil {
 		t.Fatalf("Save(consumed) error = %v", err)
 	}
 	output, emitted := runHook(t, store, nil, hookInput{
@@ -142,6 +168,48 @@ func TestSessionStartCompactSourceTriggersGuard(t *testing.T) {
 		}); emitted {
 			t.Fatalf("SessionStart(%q) output = %+v, want empty", source, output)
 		}
+	}
+
+	// A guard left pending by a pre-exit compaction is delivered by any
+	// SessionStart source and re-arms for the next compaction.
+	for _, source := range []string{"compact", "resume", "startup", ""} {
+		if err := store.Save(sessionID, hookcore.NudgeGuardPending); err != nil {
+			t.Fatalf("Save(guard pending) error = %v", err)
+		}
+		output, emitted := runHook(t, store, nil, hookInput{
+			HookEventName: "SessionStart",
+			SessionID:     sessionID,
+			Source:        source,
+		})
+		if !emitted || output.HookSpecificOutput.AdditionalContext != AdditionalContext {
+			t.Fatalf("SessionStart(%q) with pending guard output = %+v, %v; want compact guard", source, output, emitted)
+		}
+		if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgeConsumed {
+			t.Fatalf("state after SessionStart(%q) = %q, %v; want consumed", source, state, err)
+		}
+	}
+}
+
+func TestNudgePromptSupersedesPendingGuard(t *testing.T) {
+	t.Parallel()
+
+	const sessionID = "session-guard-nudge"
+	store := newMemoryNudgeStateStore()
+	if err := store.Save(sessionID, hookcore.NudgeGuardPending); err != nil {
+		t.Fatalf("Save(guard pending) error = %v", err)
+	}
+	output, emitted := runHook(t, store, func(context.Context) (waypostMCPStatus, error) {
+		return waypostMCPStatus{available: true}, nil
+	}, hookInput{
+		HookEventName: "UserPromptSubmit",
+		SessionID:     sessionID,
+		Prompt:        defaultNudgeMessage,
+	})
+	if !emitted || output.HookSpecificOutput.AdditionalContext != MCPNudgeContext {
+		t.Fatalf("nudge output = %+v, %v; want MCP nudge context", output, emitted)
+	}
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgePending {
+		t.Fatalf("state after nudge = %q, %v; want pending", state, err)
 	}
 }
 
@@ -190,7 +258,7 @@ func TestPostToolUseConsumesPendingNudgeOnlyAfterSuccessfulReceive(t *testing.T)
 			t.Parallel()
 			const sessionID = "session-receive-result"
 			store := newMemoryNudgeStateStore()
-			if err := store.Save(sessionID, nudgePending); err != nil {
+			if err := store.Save(sessionID, hookcore.NudgePending); err != nil {
 				t.Fatalf("Save(pending) error = %v", err)
 			}
 			if output, emitted := runHook(t, store, nil, hookInput{
@@ -206,9 +274,9 @@ func TestPostToolUseConsumesPendingNudgeOnlyAfterSuccessfulReceive(t *testing.T)
 			if err != nil {
 				t.Fatalf("Load() error = %v", err)
 			}
-			want := nudgePending
+			want := hookcore.NudgePending
 			if tc.wantConsumed {
-				want = nudgeConsumed
+				want = hookcore.NudgeConsumed
 			}
 			if state != want {
 				t.Fatalf("state = %q, want %q", state, want)
@@ -230,7 +298,7 @@ func TestReceiveWithoutPendingNudgeDoesNotEnableCompactGuard(t *testing.T) {
 	}); emitted {
 		t.Fatalf("PostToolUse output = %+v, want empty", output)
 	}
-	if state, err := store.Load(sessionID); err != nil || state != nudgeNone {
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgeNone {
 		t.Fatalf("state after explicit receive = %q, %v; want none", state, err)
 	}
 	if context := runCompactHook(t, store, sessionID); context != "" {
@@ -243,7 +311,7 @@ func TestSessionEndClearsNudgeState(t *testing.T) {
 
 	const sessionID = "session-end"
 	store := newMemoryNudgeStateStore()
-	if err := store.Save(sessionID, nudgeConsumed); err != nil {
+	if err := store.Save(sessionID, hookcore.NudgeConsumed); err != nil {
 		t.Fatalf("Save(consumed) error = %v", err)
 	}
 	if err := store.SaveMCPProbe(sessionID, waypostMCPStatus{available: true}.probeRecord()); err != nil {
@@ -252,7 +320,7 @@ func TestSessionEndClearsNudgeState(t *testing.T) {
 	if output, emitted := runHook(t, store, nil, hookInput{HookEventName: "SessionEnd", SessionID: sessionID}); emitted {
 		t.Fatalf("SessionEnd output = %+v, want empty", output)
 	}
-	if state, err := store.Load(sessionID); err != nil || state != nudgeNone {
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgeNone {
 		t.Fatalf("state after SessionEnd = %q, %v; want none", state, err)
 	}
 	if _, ok, err := store.LoadMCPProbe(sessionID); err != nil || ok {
@@ -266,7 +334,7 @@ func TestFileNudgeStateStorePersistsAndClearsSessionState(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), "hook-state")
 	store := fileNudgeStateStore{Dir: stateDir, Label: harnessLabel}
 	const sessionID = "session/with unsafe path characters"
-	if err := store.Save(sessionID, nudgePending); err != nil {
+	if err := store.Save(sessionID, hookcore.NudgePending); err != nil {
 		t.Fatalf("Save(pending) error = %v", err)
 	}
 	entries, err := os.ReadDir(stateDir)
@@ -283,19 +351,19 @@ func TestFileNudgeStateStorePersistsAndClearsSessionState(t *testing.T) {
 	if got := info.Mode().Perm(); runtime.GOOS != "windows" && got != 0o600 {
 		t.Fatalf("state file mode = %o, want 600", got)
 	}
-	if state, err := store.Load(sessionID); err != nil || state != nudgePending {
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgePending {
 		t.Fatalf("Load(pending) = %q, %v; want pending", state, err)
 	}
-	if err := store.Save(sessionID, nudgeConsumed); err != nil {
+	if err := store.Save(sessionID, hookcore.NudgeConsumed); err != nil {
 		t.Fatalf("Save(consumed) error = %v", err)
 	}
-	if state, err := store.Load(sessionID); err != nil || state != nudgeConsumed {
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgeConsumed {
 		t.Fatalf("Load(consumed) = %q, %v; want consumed", state, err)
 	}
 	if err := store.Clear(sessionID); err != nil {
 		t.Fatalf("Clear() error = %v", err)
 	}
-	if state, err := store.Load(sessionID); err != nil || state != nudgeNone {
+	if state, err := store.Load(sessionID); err != nil || state != hookcore.NudgeNone {
 		t.Fatalf("Load(after clear) = %q, %v; want none", state, err)
 	}
 }
@@ -473,21 +541,21 @@ func TestFileMCPProbeCanonicalizesNamespacedDisabledTools(t *testing.T) {
 	if err := os.WriteFile(path, []byte(cache), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	status, err := probeWaypostMCP(context.Background(), sessionID, func(context.Context) (waypostMCPStatus, error) {
+	record, err := hookcore.ProbeAndCache(context.Background(), sessionID, func(context.Context) (hookcore.MCPProbeRecord, error) {
 		t.Fatal("probe called despite cache hit")
-		return waypostMCPStatus{}, nil
+		return hookcore.MCPProbeRecord{}, nil
 	}, store)
 	if err != nil {
-		t.Fatalf("probeWaypostMCP() error = %v", err)
+		t.Fatalf("ProbeAndCache() error = %v", err)
 	}
-	if !status.available {
-		t.Fatal("status.available = false, want true")
+	if !record.Available {
+		t.Fatal("record.Available = false, want true")
 	}
-	if status.toolUsable("waypost_recv") || status.toolUsable("waypost_send") {
-		t.Fatalf("toolUsable() = %v/%v, want cached namespaced disabled tools honored", status.toolUsable("waypost_recv"), status.toolUsable("waypost_send"))
+	if hookcore.MCPToolUsable(record, "waypost_recv") || hookcore.MCPToolUsable(record, "waypost_send") {
+		t.Fatalf("MCPToolUsable() = %v/%v, want cached namespaced disabled tools honored", hookcore.MCPToolUsable(record, "waypost_recv"), hookcore.MCPToolUsable(record, "waypost_send"))
 	}
-	if !status.toolUsable("waypost_status") {
-		t.Fatal("toolUsable(waypost_status) = false, want usable")
+	if !hookcore.MCPToolUsable(record, "waypost_status") {
+		t.Fatal("MCPToolUsable(waypost_status) = false, want usable")
 	}
 }
 
@@ -702,8 +770,8 @@ func TestLooksLikeWaypostNudge(t *testing.T) {
 		"notice: there might be new delivery in WAYPOST.",
 		"  NOTICE: There might be new delivery in waypost.\n",
 	} {
-		if !LooksLikeWaypostNudge(prompt) {
-			t.Errorf("LooksLikeWaypostNudge(%q) = false, want true", prompt)
+		if !hookcore.LooksLikeWaypostNudge(prompt) {
+			t.Errorf("hookcore.LooksLikeWaypostNudge(%q) = false, want true", prompt)
 		}
 	}
 	for _, prompt := range []string{
@@ -715,8 +783,8 @@ func TestLooksLikeWaypostNudge(t *testing.T) {
 		"NOTICE: investigate a pending Waypost message delivery bug",
 		"NUDGE: check Waypost mail",
 	} {
-		if LooksLikeWaypostNudge(prompt) {
-			t.Errorf("LooksLikeWaypostNudge(%q) = true, want false", prompt)
+		if hookcore.LooksLikeWaypostNudge(prompt) {
+			t.Errorf("hookcore.LooksLikeWaypostNudge(%q) = true, want false", prompt)
 		}
 	}
 }
@@ -731,8 +799,8 @@ func TestLooksLikeWaypostWaitCommand(t *testing.T) {
 		`waypost.exe --state-dir "C:\Users\alice\Waypost State" wait --timeout 30s`,
 		`waypost --state-dir=/tmp/waypost wait`,
 	} {
-		if !LooksLikeWaypostWaitCommand(command) {
-			t.Errorf("LooksLikeWaypostWaitCommand(%q) = false, want true", command)
+		if !hookcore.LooksLikeWaypostWaitCommand(command) {
+			t.Errorf("hookcore.LooksLikeWaypostWaitCommand(%q) = false, want true", command)
 		}
 	}
 	for _, command := range []string{
@@ -744,8 +812,8 @@ func TestLooksLikeWaypostWaitCommand(t *testing.T) {
 		"waypost\nwait --for workflow/reviewer",
 		"cd /tmp && waypost wait --for workflow/reviewer",
 	} {
-		if LooksLikeWaypostWaitCommand(command) {
-			t.Errorf("LooksLikeWaypostWaitCommand(%q) = true, want false", command)
+		if hookcore.LooksLikeWaypostWaitCommand(command) {
+			t.Errorf("hookcore.LooksLikeWaypostWaitCommand(%q) = true, want false", command)
 		}
 	}
 }
@@ -762,13 +830,14 @@ func TestWaypostMCPDenialReason(t *testing.T) {
 		{"/home/alice/.local/bin/waypost --state-dir /tmp/state recv", "waypost_recv"},
 		{"waypost --state-dir=/tmp/state send", "waypost_send"},
 	} {
-		reason, tool, guarded := waypostMCPDenialReason(tc.command)
+		tool, guarded := hookcore.WaypostMCPTool(tc.command)
+		reason := hookcore.WaypostCommandDenialReason(tool, MCPServerCommandDenialReason)
 		if !guarded || tool != tc.wantTool || !strings.Contains(reason, tc.wantTool) {
-			t.Errorf("waypostMCPDenialReason(%q) = %q, %q, %v; want tool %q", tc.command, reason, tool, guarded, tc.wantTool)
+			t.Errorf("WaypostMCPTool(%q)+WaypostCommandDenialReason = %q, %q, %v; want tool %q", tc.command, reason, tool, guarded, tc.wantTool)
 		}
 	}
-	if reason, tool, guarded := waypostMCPDenialReason("waypost mcp"); !guarded || tool != "" || reason != MCPServerCommandDenialReason {
-		t.Errorf("waypostMCPDenialReason(%q) = %q, %q, %v; want unconditional MCP server denial", "waypost mcp", reason, tool, guarded)
+	if tool, guarded := hookcore.WaypostMCPTool("waypost mcp"); !guarded || tool != "" || hookcore.WaypostCommandDenialReason(tool, MCPServerCommandDenialReason) != MCPServerCommandDenialReason {
+		t.Errorf("WaypostMCPTool(%q) = %q, %v; want unconditional MCP server denial", "waypost mcp", tool, guarded)
 	}
 
 	for _, command := range []string{
@@ -777,8 +846,8 @@ func TestWaypostMCPDenialReason(t *testing.T) {
 		"echo waypost send",
 		"cd /tmp && waypost recv",
 	} {
-		if reason, _, guarded := waypostMCPDenialReason(command); guarded {
-			t.Errorf("waypostMCPDenialReason(%q) = %q, true; want unguarded", command, reason)
+		if _, guarded := hookcore.WaypostMCPTool(command); guarded {
+			t.Errorf("WaypostMCPTool(%q) = guarded; want unguarded", command)
 		}
 	}
 }
@@ -885,6 +954,9 @@ func TestInstallRefreshesManagedGroupsInPlace(t *testing.T) {
 	receiveGroups := hooks["PostToolUse"].([]any)
 	if !groupHasCommand(receiveGroups[0].(map[string]any), command) {
 		t.Fatalf("PostToolUse[0] = %#v, want refreshed Waypost group", receiveGroups[0])
+	}
+	if _, exists := receiveGroups[0].(map[string]any)["matcher"]; exists {
+		t.Fatalf("PostToolUse[0] = %#v, want stale receive matcher replaced by match-everything", receiveGroups[0])
 	}
 	if !groupHasCommand(receiveGroups[1].(map[string]any), "keep-post-tool-position") {
 		t.Fatalf("PostToolUse[1] = %#v, want unrelated group at original position", receiveGroups[1])
@@ -1114,16 +1186,16 @@ func TestInstallPreservesUnrelatedHooksAndIsIdempotent(t *testing.T) {
 func TestManagedGroupsUseShortTimeout(t *testing.T) {
 	t.Parallel()
 
-	for _, spec := range managedHookSpecs("waypost devin-hook") {
+	for _, spec := range managedHooks.Events {
 		want := hookTimeoutJSON
-		if spec.event == "SessionEnd" {
+		if spec.Event == "SessionEnd" {
 			want = cleanupHookTimeoutJSON
 		}
-		group := spec.desired("waypost devin-hook")
+		group := spec.DesiredGroup("waypost devin-hook")
 		handlers := group["hooks"].([]any)
 		handler := handlers[0].(map[string]any)
 		if got := handler["timeout"]; got != want {
-			t.Errorf("%s timeout = %#v, want %s", spec.event, got, want)
+			t.Errorf("%s timeout = %#v, want %s", spec.Event, got, want)
 		}
 	}
 }
@@ -1132,24 +1204,24 @@ func TestManagedMatchersTargetDevinTools(t *testing.T) {
 	t.Parallel()
 
 	var preTool, postTool map[string]any
-	for _, spec := range managedHookSpecs("waypost devin-hook") {
-		switch spec.event {
+	for _, spec := range managedHooks.Events {
+		switch spec.Event {
 		case "PreToolUse":
-			preTool = spec.desired("waypost devin-hook")
+			preTool = spec.DesiredGroup("waypost devin-hook")
 		case "PostToolUse":
-			postTool = spec.desired("waypost devin-hook")
+			postTool = spec.DesiredGroup("waypost devin-hook")
 		case "PostCompaction", "SessionStart", "UserPromptSubmit", "SessionEnd":
-			group := spec.desired("waypost devin-hook")
+			group := spec.DesiredGroup("waypost devin-hook")
 			if _, exists := group["matcher"]; exists {
-				t.Errorf("%s group = %#v, want no matcher for lifecycle event", spec.event, group)
+				t.Errorf("%s group = %#v, want no matcher for lifecycle event", spec.Event, group)
 			}
 		}
 	}
 	if got := preTool["matcher"]; got != "^exec$" {
 		t.Fatalf("PreToolUse matcher = %v, want ^exec$", got)
 	}
-	if got := postTool["matcher"]; got != "^(exec|mcp__waypost__waypost_recv)$" {
-		t.Fatalf("PostToolUse matcher = %v, want exec plus waypost_recv", got)
+	if _, exists := postTool["matcher"]; exists {
+		t.Fatalf("PostToolUse group = %#v, want no matcher so a pending compact guard reaches the first post-compaction call", postTool)
 	}
 }
 
@@ -1387,7 +1459,7 @@ func TestDoctorRequiresAllManagedHooks(t *testing.T) {
 				"SessionStart":     `{"hooks":[{"type":"command","command":"waypost devin-hook","timeout":5}]}`,
 				"UserPromptSubmit": `{"hooks":[{"type":"command","command":"waypost devin-hook","timeout":5}]}`,
 				"PreToolUse":       `{"matcher":"^exec$","hooks":[{"type":"command","command":"waypost devin-hook","timeout":5}]}`,
-				"PostToolUse":      `{"matcher":"^(exec|mcp__waypost__waypost_recv)$","hooks":[{"type":"command","command":"waypost devin-hook","timeout":5}]}`,
+				"PostToolUse":      `{"hooks":[{"type":"command","command":"waypost devin-hook","timeout":5}]}`,
 				"SessionEnd":       `{"hooks":[{"type":"command","command":"waypost devin-hook","timeout":3}]}`,
 			}
 			var builder strings.Builder

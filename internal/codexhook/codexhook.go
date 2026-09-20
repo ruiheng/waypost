@@ -230,15 +230,10 @@ func successfulWaypostReceive(input hookInput) bool {
 		if err != nil {
 			return false
 		}
-		subcommand, ok := directWaypostCommand(command)
-		return ok && (subcommand == "recv" || subcommand == "receive") && hookcore.ShellReceiveOutputSucceeded(input.ToolResponse)
+		return hookcore.RunsWaypostReceive(command) && hookcore.ShellReceiveOutputSucceeded(input.ToolResponse)
 	default:
 		return false
 	}
-}
-
-func directWaypostCommand(command string) (string, bool) {
-	return hookcore.DirectWaypostCommand(command)
 }
 
 func bashCommand(raw json.RawMessage) (string, error) {

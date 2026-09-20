@@ -221,6 +221,49 @@ func TestHandleHookEventPreToolUseGuards(t *testing.T) {
 		}
 	})
 
+	t.Run("guarded command denied behind cd prefix", func(t *testing.T) {
+		var out bytes.Buffer
+		err := HandleHookEvent(context.Background(), shellInput("cd /tmp && waypost send --to a --body-file /b"), true, &out, transitionSpec,
+			func(context.Context) (MCPProbeRecord, error) {
+				return MCPProbeRecord{Available: true}, nil
+			}, NewMemoryNudgeStore())
+		if err != nil {
+			t.Fatalf("HandleHookEvent() error = %v", err)
+		}
+		if !strings.Contains(out.String(), "deny: ") {
+			t.Fatalf("output = %q, want denial", out.String())
+		}
+	})
+
+	t.Run("mcp subcommand denied behind cd prefix without probe", func(t *testing.T) {
+		var out bytes.Buffer
+		err := HandleHookEvent(context.Background(), shellInput("cd /tmp && waypost mcp"), true, &out, transitionSpec,
+			func(context.Context) (MCPProbeRecord, error) {
+				t.Fatal("probe called for always-denied command")
+				return MCPProbeRecord{}, nil
+			}, NewMemoryNudgeStore())
+		if err != nil {
+			t.Fatalf("HandleHookEvent() error = %v", err)
+		}
+		if !strings.Contains(out.String(), "deny: managed by harness") {
+			t.Fatalf("output = %q, want denial", out.String())
+		}
+	})
+
+	t.Run("denial wins over wait guidance in compound command", func(t *testing.T) {
+		var out bytes.Buffer
+		err := HandleHookEvent(context.Background(), shellInput("waypost wait && waypost send --to a"), true, &out, transitionSpec,
+			func(context.Context) (MCPProbeRecord, error) {
+				return MCPProbeRecord{Available: true}, nil
+			}, NewMemoryNudgeStore())
+		if err != nil {
+			t.Fatalf("HandleHookEvent() error = %v", err)
+		}
+		if !strings.Contains(out.String(), "deny: ") {
+			t.Fatalf("output = %q, want denial", out.String())
+		}
+	})
+
 	t.Run("guarded command allowed when tool disabled", func(t *testing.T) {
 		var out bytes.Buffer
 		err := HandleHookEvent(context.Background(), shellInput("waypost recv"), true, &out, transitionSpec,

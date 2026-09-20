@@ -195,8 +195,7 @@ func successfulWaypostReceive(input hookInput) bool {
 		if err != nil {
 			return false
 		}
-		subcommand, ok := directWaypostCommand(command)
-		return ok && (subcommand == "recv" || subcommand == "receive") && successfulExecResponse(input.ToolResponse)
+		return hookcore.RunsWaypostReceive(command) && successfulExecResponse(input.ToolResponse)
 	default:
 		return false
 	}
@@ -235,10 +234,6 @@ func decodeToolResponse(raw json.RawMessage) (devinToolResponse, bool) {
 		return devinToolResponse{}, false
 	}
 	return response, true
-}
-
-func directWaypostCommand(command string) (string, bool) {
-	return hookcore.DirectWaypostCommand(command)
 }
 
 func execCommand(raw json.RawMessage) (string, error) {

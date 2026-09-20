@@ -2,36 +2,54 @@ package hookcore
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 )
 
-func TestDirectWaypostCommand(t *testing.T) {
+func TestWaypostCommands(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		command string
-		want    string
-		ok      bool
+		want    []string
 	}{
-		{"waypost recv", "recv", true},
-		{"waypost recv --json", "recv", true},
-		{"/usr/local/bin/waypost status", "status", true},
-		{`'C:\Tools\waypost.exe' send`, "send", true},
-		{"waypost --state-dir /tmp/x recv", "recv", true},
-		{"waypost --state-dir=/tmp/x recv", "recv", true},
-		{`& "C:\Program Files\Waypost\waypost.exe" recv`, "recv", true},
-		{"waypost", "", false},
-		{"waypost --state-dir", "", false},
-		{"echo waypost recv", "", false},
-		{"my-wrapper waypost recv", "", false},
-		{"env WAYPOST=1 waypost recv", "", false},
-		{"", "", false},
+		{"waypost recv", []string{"recv"}},
+		{"waypost recv --json", []string{"recv"}},
+		{"/usr/local/bin/waypost status", []string{"status"}},
+		{`'C:\Tools\waypost.exe' send`, []string{"send"}},
+		{`"waypost" send`, []string{"send"}},
+		{`waypost se"nd"`, []string{"send"}},
+		{"waypost --state-dir /tmp/x recv", []string{"recv"}},
+		{"waypost --state-dir=/tmp/x recv", []string{"recv"}},
+		{`& "C:\Program Files\Waypost\waypost.exe" recv`, []string{"recv"}},
+		{"cd /tmp && waypost send --to a", []string{"send"}},
+		{"echo ok; waypost recv", []string{"recv"}},
+		{"waypost send | tee /tmp/log", []string{"send"}},
+		{"FOO=1 waypost recv", []string{"recv"}},
+		{"env WAYPOST=1 waypost recv", []string{"recv"}},
+		{"sudo waypost send", []string{"send"}},
+		{"sudo -u root waypost send", []string{"send"}},
+		{"nice -n 5 waypost send", []string{"send"}},
+		{"xargs waypost send", []string{"send"}},
+		{"bash -c 'cd /tmp && waypost send'", []string{"send"}},
+		{"sh -c \"waypost recv --json\"", []string{"recv"}},
+		{"echo $(waypost recv)", []string{"recv"}},
+		{"if true; then waypost send; fi", []string{"send"}},
+		{"waypost status && waypost send", []string{"status", "send"}},
+		{"waypost", nil},
+		{"waypost --state-dir", nil},
+		{"echo waypost recv", nil},
+		{"my-wrapper waypost recv", nil},
+		{`echo "waypost send"`, nil},
+		{"cat <<EOF\nwaypost send\nEOF", nil},
+		{"sudo less /var/log/waypost", nil},
+		{"", nil},
+		{"waypost send --body 'unclosed", nil},
 	}
 	for _, test := range tests {
-		got, ok := DirectWaypostCommand(test.command)
-		if ok != test.ok || got != test.want {
-			t.Errorf("DirectWaypostCommand(%q) = %q, %v; want %q, %v", test.command, got, ok, test.want, test.ok)
+		if got := WaypostCommands(test.command); !slices.Equal(got, test.want) {
+			t.Errorf("WaypostCommands(%q) = %v; want %v", test.command, got, test.want)
 		}
 	}
 }

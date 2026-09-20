@@ -638,6 +638,7 @@ func TestLooksLikeWaypostWaitCommand(t *testing.T) {
 		`& "C:\Users\alice\.local\bin\waypost.exe" wait --for workflow/reviewer`,
 		`waypost.exe --state-dir "C:\Users\alice\Waypost State" wait --timeout 30s`,
 		`waypost --state-dir=/tmp/waypost wait`,
+		"cd /tmp && waypost wait --for workflow/reviewer",
 	} {
 		if !hookcore.LooksLikeWaypostWaitCommand(command) {
 			t.Errorf("hookcore.LooksLikeWaypostWaitCommand(%q) = false, want true", command)
@@ -650,7 +651,6 @@ func TestLooksLikeWaypostWaitCommand(t *testing.T) {
 		"my-waypost wait",
 		"waypost --state-dir wait",
 		"waypost\nwait --for workflow/reviewer",
-		"cd /tmp && waypost wait --for workflow/reviewer",
 	} {
 		if hookcore.LooksLikeWaypostWaitCommand(command) {
 			t.Errorf("hookcore.LooksLikeWaypostWaitCommand(%q) = true, want false", command)
@@ -670,6 +670,8 @@ func TestWaypostMCPDenialReason(t *testing.T) {
 		{"/home/alice/.local/bin/waypost --state-dir /tmp/state recv", "waypost_recv"},
 		{`& "C:\Users\alice\.local\bin\waypost.exe" receive`, "waypost_recv"},
 		{"waypost --state-dir=/tmp/state send", "waypost_send"},
+		{"cd /tmp && waypost recv", "waypost_recv"},
+		{"cd /tmp && waypost send --to a --body-file /b", "waypost_send"},
 	} {
 		tool, guarded := hookcore.WaypostMCPTool(tc.command)
 		reason := hookcore.WaypostCommandDenialReason(tool, MCPServerCommandDenialReason)
@@ -685,7 +687,6 @@ func TestWaypostMCPDenialReason(t *testing.T) {
 		"waypost wait --for workflow/reviewer",
 		"waypost read --latest",
 		"echo waypost send",
-		"cd /tmp && waypost recv",
 	} {
 		if _, guarded := hookcore.WaypostMCPTool(command); guarded {
 			t.Errorf("WaypostMCPTool(%q) = guarded; want unguarded", command)

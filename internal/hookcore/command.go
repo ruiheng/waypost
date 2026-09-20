@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
+	"slices"
 	"strings"
+
+	"mvdan.cc/sh/v3/syntax"
 )
 
 // Shared hook copy. These strings are identical across harnesses; each
@@ -39,15 +42,15 @@ var WaypostMCPCommandBlacklist = map[string]string{
 // commands; an empty tool with guarded set marks a command that has no MCP
 // equivalent and must always be denied (`waypost mcp`).
 func WaypostMCPTool(command string) (tool string, guarded bool) {
-	subcommand, ok := DirectWaypostCommand(command)
-	if !ok {
-		return "", false
+	for _, subcommand := range WaypostCommands(command) {
+		if subcommand == "status" {
+			return "waypost_status", true
+		}
+		if tool, guarded = WaypostMCPCommandBlacklist[subcommand]; guarded {
+			return tool, true
+		}
 	}
-	if subcommand == "status" {
-		return "waypost_status", true
-	}
-	tool, guarded = WaypostMCPCommandBlacklist[subcommand]
-	return tool, guarded
+	return "", false
 }
 
 // WaypostCommandDenialReason renders the deny reason for a guarded command.
@@ -63,101 +66,170 @@ func WaypostCommandDenialReason(tool, serverReason string) string {
 	return fmt.Sprintf("The Waypost MCP tool %s is available. Use it instead of the Waypost CLI.", tool)
 }
 
-// LooksLikeWaypostWaitCommand reports whether command is a direct
-// `waypost wait` invocation.
+// LooksLikeWaypostWaitCommand reports whether command runs `waypost wait`.
 func LooksLikeWaypostWaitCommand(command string) bool {
-	subcommand, ok := DirectWaypostCommand(command)
-	return ok && subcommand == "wait"
+	return slices.Contains(WaypostCommands(command), "wait")
 }
 
-// DirectWaypostCommand extracts the subcommand from a shell command whose
-// first word is a waypost executable, skipping --state-dir flags. An optional
-// Windows `&` invocation prefix is honored.
-func DirectWaypostCommand(command string) (string, bool) {
-	rest := strings.TrimSpace(command)
-	executable, rest, ok := ConsumeCommandWord(rest)
+// RunsWaypostReceive reports whether command runs `waypost recv` (or its
+// `receive` alias), including invocations nested in compound commands,
+// command substitutions, and wrapper commands.
+func RunsWaypostReceive(command string) bool {
+	return slices.ContainsFunc(WaypostCommands(command), func(subcommand string) bool {
+		return subcommand == "recv" || subcommand == "receive"
+	})
+}
+
+// shellCommandWrappers execute one of their arguments as a command, so a
+// waypost invocation nested under them still runs waypost.
+var shellCommandWrappers = map[string]bool{
+	"builtin": true, "command": true, "doas": true, "env": true,
+	"nice": true, "nohup": true, "stdbuf": true, "sudo": true,
+	"time": true, "watch": true, "xargs": true,
+}
+
+// shellDashCCommands interpret the argument following -c (possibly bundled
+// as -lc, -ic, ...) as a command line.
+var shellDashCCommands = map[string]bool{
+	"ash": true, "bash": true, "dash": true, "fish": true,
+	"ksh": true, "sh": true, "zsh": true,
+}
+
+// WaypostCommands returns the subcommand of every `waypost <subcommand>`
+// invocation in a shell command, in source order. The command is parsed as
+// shell syntax, so invocations behind &&, ;, |, command substitutions,
+// subshells, wrapper commands (env, sudo, ...), and `sh -c` strings are all
+// recognized, while waypost merely mentioned inside quoted arguments or
+// other commands' operands is not. Unparseable commands report no
+// invocations — the guard fails open.
+func WaypostCommands(command string) []string {
+	// Windows PowerShell invocation prefix.
+	command = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(command), "&"))
+	file, err := syntax.NewParser().Parse(strings.NewReader(command), "")
+	if err != nil {
+		return nil
+	}
+	var subcommands []string
+	syntax.Walk(file, func(node syntax.Node) bool {
+		call, ok := node.(*syntax.CallExpr)
+		if !ok {
+			return true
+		}
+		if subcommand, ok := waypostCallSubcommand(call); ok {
+			subcommands = append(subcommands, subcommand)
+		}
+		if inner, ok := dashCCommand(call); ok {
+			subcommands = append(subcommands, WaypostCommands(inner)...)
+		}
+		return true
+	})
+	return subcommands
+}
+
+// waypostCallSubcommand extracts the subcommand of a call whose executable
+// is waypost, skipping --state-dir flags. For wrapper commands it first
+// locates the waypost token among the wrapper's arguments.
+func waypostCallSubcommand(call *syntax.CallExpr) (string, bool) {
+	if len(call.Args) == 0 {
+		return "", false
+	}
+	executable, ok := wordLiteral(call.Args[0])
 	if !ok {
 		return "", false
 	}
-	if executable == "&" {
-		executable, rest, ok = ConsumeCommandWord(rest)
-		if !ok {
+	args := call.Args[1:]
+	if shellCommandWrappers[commandBaseName(executable)] {
+		index := -1
+		for i, arg := range args {
+			if literal, ok := wordLiteral(arg); ok && IsWaypostExecutable(literal) {
+				index = i
+				break
+			}
+		}
+		if index < 0 {
 			return "", false
 		}
-	}
-	if !IsWaypostExecutable(executable) {
+		args = args[index+1:]
+	} else if !IsWaypostExecutable(executable) {
 		return "", false
 	}
-
-	for {
-		argument, remaining, ok := ConsumeCommandWord(rest)
+	for i := 0; i < len(args); i++ {
+		arg, ok := wordLiteral(args[i])
 		if !ok {
 			return "", false
 		}
 		switch {
-		case argument == "--state-dir":
-			_, rest, ok = ConsumeCommandWord(remaining)
-			if !ok {
-				return "", false
-			}
-		case strings.HasPrefix(argument, "--state-dir=") && len(argument) > len("--state-dir="):
-			rest = remaining
+		case arg == "--state-dir":
+			i++
+		case strings.HasPrefix(arg, "--state-dir="):
 		default:
-			return argument, true
+			return arg, true
 		}
 	}
+	return "", false
 }
 
-// ConsumeCommandWord reads the next shell word, honoring single and double
-// quotes and returning shell metacharacters as single-character words.
-func ConsumeCommandWord(input string) (string, string, bool) {
-	input = strings.TrimLeft(input, " \t\r")
-	if input == "" || input[0] == '\n' {
-		return "", input, false
+// dashCCommand returns the command line a `sh -c`-style call interprets.
+func dashCCommand(call *syntax.CallExpr) (string, bool) {
+	if len(call.Args) < 3 {
+		return "", false
 	}
-	if strings.ContainsRune(";&|<>()", rune(input[0])) {
-		return input[:1], input[1:], true
+	executable, ok := wordLiteral(call.Args[0])
+	if !ok || !shellDashCCommands[commandBaseName(executable)] {
+		return "", false
 	}
-
-	var word strings.Builder
-	var quote byte
-	for index := 0; index < len(input); index++ {
-		character := input[index]
-		if quote != 0 {
-			if character == quote {
-				quote = 0
-				continue
-			}
-			word.WriteByte(character)
+	for i := 1; i < len(call.Args)-1; i++ {
+		flag, ok := wordLiteral(call.Args[i])
+		if !ok {
 			continue
 		}
-		switch character {
-		case '\'', '"':
-			quote = character
-		case ' ', '\t', '\r':
-			return word.String(), input[index:], word.Len() != 0
-		case '\n', ';', '&', '|', '<', '>', '(', ')':
-			return word.String(), input[index:], word.Len() != 0
-		default:
-			word.WriteByte(character)
+		if flag == "-c" || (strings.HasPrefix(flag, "-") && !strings.HasPrefix(flag, "--") && strings.ContainsRune(flag[1:], 'c')) {
+			return wordLiteral(call.Args[i+1])
 		}
 	}
-	if quote != 0 || word.Len() == 0 {
-		return "", input, false
+	return "", false
+}
+
+// wordLiteral renders a word consisting solely of literal text — bare,
+// single-quoted, or double-quoted — and reports whether it was one.
+func wordLiteral(word *syntax.Word) (string, bool) {
+	var literal strings.Builder
+	for _, part := range word.Parts {
+		switch part := part.(type) {
+		case *syntax.Lit:
+			literal.WriteString(part.Value)
+		case *syntax.SglQuoted:
+			literal.WriteString(part.Value)
+		case *syntax.DblQuoted:
+			for _, inner := range part.Parts {
+				text, ok := inner.(*syntax.Lit)
+				if !ok {
+					return "", false
+				}
+				literal.WriteString(text.Value)
+			}
+		default:
+			return "", false
+		}
 	}
-	return word.String(), "", true
+	return literal.String(), len(word.Parts) > 0
 }
 
 // IsWaypostExecutable reports whether executable names a waypost binary,
 // tolerating slash and backslash separators, case differences, and the .exe
 // suffix.
 func IsWaypostExecutable(executable string) bool {
+	return commandBaseName(executable) == "waypost"
+}
+
+// commandBaseName normalizes an executable path to a lowercase base name
+// without the .exe suffix.
+func commandBaseName(executable string) string {
 	normalized := strings.ReplaceAll(executable, `\`, "/")
-	base := normalized
 	if separator := strings.LastIndexByte(normalized, '/'); separator >= 0 {
-		base = normalized[separator+1:]
+		normalized = normalized[separator+1:]
 	}
-	return strings.EqualFold(base, "waypost") || strings.EqualFold(base, "waypost.exe")
+	return strings.TrimSuffix(strings.ToLower(normalized), ".exe")
 }
 
 // SplitHookCommand extracts the executable token and the remaining argument

@@ -214,11 +214,11 @@ func HandleHookEvent(
 		if err != nil {
 			return err
 		}
-		if LooksLikeWaypostWaitCommand(command) {
-			return WriteHookContext(w, "PreToolUse", WaitPollingContext)
-		}
 		tool, guarded := WaypostMCPTool(command)
 		if !guarded {
+			if LooksLikeWaypostWaitCommand(command) {
+				return WriteHookContext(w, "PreToolUse", WaitPollingContext)
+			}
 			return nil
 		}
 		reason := WaypostCommandDenialReason(tool, spec.ServerDenialReason)

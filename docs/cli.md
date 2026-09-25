@@ -225,6 +225,73 @@ It reads the Devin hook event from stdin and emits the matching hook JSON
 contract (`decision`/`reason` for denials, `hookSpecificOutput` for additional
 context). It does not read or modify Waypost message state.
 
+## Claude Code Hooks
+
+Install the Claude Code lifecycle hooks:
+
+```bash
+waypost install claude-hook
+```
+
+The installer merges five idempotent handlers into the `hooks` object of the
+user-level Claude Code settings (`~/.claude/settings.json`, or
+`$CLAUDE_CONFIG_DIR/settings.json` when `CLAUDE_CONFIG_DIR` is set) and
+preserves unrelated hooks and settings:
+
+- a `UserPromptSubmit` handler records the exact Waypost nudge as pending,
+  clears prior nudge state for ordinary user prompts, and runs
+  `claude mcp get waypost` from the session working directory; it injects one
+  explicit receive instruction: `waypost_recv` when the MCP server is
+  configured, `waypost recv --json` otherwise. If the probe fails, the
+  instruction and the probe error are emitted as additional context and a
+  system message. An ordinary prompt also emits a compact guard left pending
+  by a compact-source session start, because Claude Code drops that event's
+  additional context
+- a `PreToolUse` `Bash` handler recognizes direct Waypost CLI invocations. A
+  `waypost wait` call receives a model-visible warning not to poll; it is not
+  blocked. When the MCP probe reports Waypost configured, `waypost status`,
+  `recv`, `receive`, and `send` are denied with a `permissionDecision`/`deny`
+  envelope in favor of the `waypost_status`, `waypost_recv`, and
+  `waypost_send` MCP tools. An unavailable probe leaves those CLI commands
+  untouched; a failed probe surfaces the error as a system message. The
+  `waypost mcp` command is always denied because the MCP server is managed by
+  Claude Code
+- a `PostToolUse` handler fires after every tool call so the first
+  post-compaction call re-injects a pending compact guard; it also observes
+  successful MCP or direct CLI receives and changes a pending nudge to
+  consumed — `received` and `no_message` are terminal receive results, while
+  active-lease and recovery-required results stay pending
+- a `SessionStart` handler emits the anti-repeat receive guard on a
+  compact-source start and marks it pending so the next honored event
+  re-injects it, because Claude Code drops compact-source SessionStart
+  additional context; it also delivers a still-pending guard on any source
+- a `SessionEnd` handler removes the session's nudge state
+
+The small session-scoped state lives under `waypost-hook-state/` inside the
+Claude Code config directory.
+
+Verify the installation:
+
+```bash
+waypost doctor claude-hook
+```
+
+The doctor verifies all five handler definitions and reports whether
+`claude mcp get waypost` sees Waypost for a new Claude Code process started in
+the current directory. The MCP result is diagnostic only: an already-running
+session may differ.
+
+Claude Code invokes the machine-facing entry point automatically:
+
+```bash
+waypost claude-hook
+```
+
+It reads the Claude Code hook event from stdin and emits the matching hook
+JSON contract (`hookSpecificOutput` with `permissionDecision` for denials and
+`additionalContext` for context injection, plus `systemMessage` for
+warnings). It does not read or modify Waypost message state.
+
 ### Migrate previous local state
 
 Stop all previous-version processes, then move the previous default state

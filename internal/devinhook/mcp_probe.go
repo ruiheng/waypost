@@ -2,9 +2,7 @@ package devinhook
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"os/exec"
 	"regexp"
 	"sort"
 	"strings"
@@ -65,39 +63,11 @@ func CurrentDirectoryWaypostMCPStatus(ctx context.Context) (WaypostMCPStatus, er
 }
 
 func probeWaypostMCPWithTimeout(ctx context.Context, timeout time.Duration) (waypostMCPStatus, error) {
-	probeCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	commandName, commandArgs := mcpProbeInvocation("mcp", "get", waypostMCPServerName)
-	output, err := exec.CommandContext(probeCtx, commandName, commandArgs...).Output()
-	if err != nil {
-		if probeErr := probeCtx.Err(); probeErr != nil {
-			return waypostMCPStatus{}, fmt.Errorf("run `devin mcp get waypost`: %w", probeErr)
-		}
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			if isMissingWaypostMCPError(string(exitErr.Stderr)) {
-				return waypostMCPStatus{}, nil
-			}
-			if detail := boundedProbeErrorDetail(exitErr.Stderr); detail != "" {
-				return waypostMCPStatus{}, fmt.Errorf("run `devin mcp get waypost`: %w: %s", err, detail)
-			}
-		}
-		return waypostMCPStatus{}, fmt.Errorf("run `devin mcp get waypost`: %w", err)
+	output, missing, err := hookcore.RunMCPGetProbe(ctx, timeout, "devin", isMissingWaypostMCPError)
+	if err != nil || missing {
+		return waypostMCPStatus{}, err
 	}
 	return parseWaypostMCPStatus(output)
-}
-
-func boundedProbeErrorDetail(stderr []byte) string {
-	detail := strings.TrimSpace(string(stderr))
-	const maxRunes = 500
-	runes := []rune(detail)
-	if len(runes) > maxRunes {
-		const marker = "…"
-		headRunes := maxRunes / 2
-		tailRunes := maxRunes - headRunes - len([]rune(marker))
-		detail = string(runes[:headRunes]) + marker + string(runes[len(runes)-tailRunes:])
-	}
-	return detail
 }
 
 func isMissingWaypostMCPError(detail string) bool {

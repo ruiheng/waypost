@@ -338,6 +338,10 @@ printf '%s\n' '{"name":"waypost","enabled":true}'
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CODEX_HOME", t.TempDir())
 
+	previousBudget := hookcore.RunBudget
+	hookcore.RunBudget = 30 * time.Second
+	defer func() { hookcore.RunBudget = previousBudget }()
+
 	realProbe := func(ctx context.Context) (bool, error) {
 		return probeWaypostMCPWithTimeout(ctx, 30*time.Second)
 	}
@@ -874,18 +878,6 @@ exit 1
 	available, err := probeWaypostMCPWithTimeout(context.Background(), 30*time.Second)
 	if err != nil || available {
 		t.Fatalf("probeWaypostMCPWithTimeout() = %v, %v; want unavailable", available, err)
-	}
-}
-
-func TestBoundedProbeErrorDetailPreservesHeadAndTail(t *testing.T) {
-	t.Parallel()
-
-	detail := boundedProbeErrorDetail([]byte("error prefix: " + strings.Repeat("x", 600) + " :root cause"))
-	if !strings.HasPrefix(detail, "error prefix: ") || !strings.HasSuffix(detail, " :root cause") {
-		t.Fatalf("boundedProbeErrorDetail() = %q, want preserved head and tail", detail)
-	}
-	if got := len([]rune(detail)); got != 500 {
-		t.Fatalf("boundedProbeErrorDetail() length = %d, want 500 runes", got)
 	}
 }
 

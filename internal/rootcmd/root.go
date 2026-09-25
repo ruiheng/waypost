@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/ruiheng/waypost/internal/claudehook"
 	"github.com/ruiheng/waypost/internal/codexhook"
 	"github.com/ruiheng/waypost/internal/devinhook"
 	"github.com/ruiheng/waypost/internal/mcpinstall"
@@ -26,6 +27,7 @@ type App struct {
 	runMCP                              func(context.Context, mcpserver.Options) error
 	runWeb                              func(context.Context, webui.Options) error
 	currentDirectoryWaypostMCPAvailable func(context.Context) (bool, error)
+	currentDirectoryClaudeMCPAvailable  func(context.Context) (bool, error)
 	currentDirectoryDevinMCPStatus      func(context.Context) (devinhook.WaypostMCPStatus, error)
 	installMCPServer                    func(context.Context) (mcpinstall.Result, error)
 	notifyWaypostSend                   waypost.SendNotifier
@@ -43,6 +45,7 @@ func New(stdin io.Reader, stdout, stderr io.Writer) *App {
 		},
 		runWeb:                              webui.Run,
 		currentDirectoryWaypostMCPAvailable: codexhook.CurrentDirectoryWaypostMCPAvailable,
+		currentDirectoryClaudeMCPAvailable:  claudehook.CurrentDirectoryWaypostMCPAvailable,
 		currentDirectoryDevinMCPStatus:      devinhook.CurrentDirectoryWaypostMCPStatus,
 		installMCPServer:                    mcpinstall.Install,
 		notifyWaypostSend:                   mcpserver.NotifyWaypostSend,
@@ -63,13 +66,16 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return err
 	}
 	if len(rest) == 0 {
-		return errors.New("expected a command: mcp, codex-hook, devin-hook, install, doctor, migrate, doc, send, forward, recv, wait, watch, read, show, ack, renew, release, defer, undefer, fail, dead-letter, list, stale, group, or address")
+		return errors.New("expected a command: mcp, codex-hook, devin-hook, claude-hook, install, doctor, migrate, doc, send, forward, recv, wait, watch, read, show, ack, renew, release, defer, undefer, fail, dead-letter, list, stale, group, or address")
 	}
 	if rest[0] == "codex-hook" {
 		return a.runCodexHookCommand(ctx, rest[1:])
 	}
 	if rest[0] == "devin-hook" {
 		return a.runDevinHookCommand(ctx, rest[1:])
+	}
+	if rest[0] == "claude-hook" {
+		return a.runClaudeHookCommand(ctx, rest[1:])
 	}
 	if rest[0] == "install" {
 		return a.runInstallCommand(ctx, rest[1:])
@@ -113,6 +119,17 @@ func (a *App) runDevinHookCommand(ctx context.Context, args []string) error {
 		return fmt.Errorf("devin-hook does not accept arguments")
 	}
 	return devinhook.Run(ctx, a.stdin, a.stdout)
+}
+
+func (a *App) runClaudeHookCommand(ctx context.Context, args []string) error {
+	if len(args) == 1 && isHelpArg(args[0]) {
+		a.writeClaudeHookHelp()
+		return waypost.ErrHelpRequested
+	}
+	if len(args) != 0 {
+		return fmt.Errorf("claude-hook does not accept arguments")
+	}
+	return claudehook.Run(ctx, a.stdin, a.stdout)
 }
 
 func (a *App) runInstallCommand(ctx context.Context, args []string) error {
@@ -180,6 +197,38 @@ func (a *App) runInstallCommand(ctx context.Context, args []string) error {
 		}
 		_, err = fmt.Fprint(a.stdout, summary.String())
 		return err
+	case "claude-hook":
+		if len(args) == 2 && isHelpArg(args[1]) {
+			a.writeInstallClaudeHookHelp()
+			return waypost.ErrHelpRequested
+		}
+		if len(args) != 1 {
+			return fmt.Errorf("install claude-hook does not accept arguments")
+		}
+
+		configDir, err := claudehook.DefaultConfigDir()
+		if err != nil {
+			return err
+		}
+		command, err := claudehook.CurrentCommand()
+		if err != nil {
+			return err
+		}
+		result, err := claudehook.Install(configDir, command)
+		if err != nil {
+			return err
+		}
+		status := "installed"
+		if !result.Changed {
+			status = "already installed"
+		}
+		var summary strings.Builder
+		fmt.Fprintf(&summary, "Claude Code hooks %s: %s\n", status, result.Path)
+		for _, warning := range result.Warnings {
+			fmt.Fprintf(&summary, "Warning: %s\n", warning)
+		}
+		_, err = fmt.Fprint(a.stdout, summary.String())
+		return err
 	case "mcp-server", "mcp-sever":
 		if len(args) == 2 && isHelpArg(args[1]) {
 			a.writeInstallMCPServerHelp()
@@ -229,7 +278,7 @@ func (a *App) runInstallCommand(ctx context.Context, args []string) error {
 		_, err = fmt.Fprint(a.stdout, summary.String())
 		return err
 	default:
-		return fmt.Errorf("unknown install target %q; expected codex-hook, devin-hook, or mcp-server", args[0])
+		return fmt.Errorf("unknown install target %q; expected codex-hook, devin-hook, claude-hook, or mcp-server", args[0])
 	}
 }
 
@@ -304,8 +353,41 @@ func (a *App) runDoctorCommand(ctx context.Context, args []string) error {
 		}
 		_, err = fmt.Fprintf(a.stdout, "Devin PostCompaction hook: configured\nDevin SessionStart hook: configured\nDevin nudge hook: configured\nDevin wait polling guard: configured\nDevin receive completion tracker: configured\nDevin nudge state cleanup: configured\nWaypost MCP: %s\nConfig file: %s\nCommand: %s\n", mcpStatus, result.Path, result.Command)
 		return err
+	case "claude-hook":
+		if len(args) == 2 && isHelpArg(args[1]) {
+			a.writeDoctorClaudeHookHelp()
+			return waypost.ErrHelpRequested
+		}
+		if len(args) != 1 {
+			return fmt.Errorf("doctor claude-hook does not accept arguments")
+		}
+
+		configDir, err := claudehook.DefaultConfigDir()
+		if err != nil {
+			return err
+		}
+		command, err := claudehook.CurrentCommand()
+		if err != nil {
+			return err
+		}
+		result, err := claudehook.Doctor(configDir, command)
+		if err != nil {
+			return err
+		}
+		mcpStatus := "not available to a new Claude Code process in the current directory (an already-running session may differ)"
+		if a.currentDirectoryClaudeMCPAvailable != nil {
+			available, probeErr := a.currentDirectoryClaudeMCPAvailable(ctx)
+			switch {
+			case probeErr != nil:
+				mcpStatus = fmt.Sprintf("availability to a new Claude Code process in the current directory is unknown: %v (an already-running session may differ)", probeErr)
+			case available:
+				mcpStatus = "available to a new Claude Code process in the current directory (an already-running session may differ)"
+			}
+		}
+		_, err = fmt.Fprintf(a.stdout, "Claude Code compact guard: configured\nClaude Code nudge hook: configured\nClaude Code wait polling guard: configured\nClaude Code receive completion tracker: configured\nClaude Code nudge state cleanup: configured\nWaypost MCP: %s\nSettings file: %s\nCommand: %s\n", mcpStatus, result.Path, result.Command)
+		return err
 	default:
-		return fmt.Errorf("unknown doctor target %q; expected codex-hook or devin-hook", args[0])
+		return fmt.Errorf("unknown doctor target %q; expected codex-hook, devin-hook, or claude-hook", args[0])
 	}
 }
 
@@ -443,6 +525,7 @@ func (a *App) writeRootHelp() {
 		"  mcp                 Run the built-in stdio MCP server",
 		"  codex-hook          Emit Codex Waypost hook context",
 		"  devin-hook          Emit Devin Waypost hook context",
+		"  claude-hook         Emit Claude Code Waypost hook context",
 		"  install             Install an optional integration",
 		"  doctor              Diagnose an optional integration",
 		"  migrate             Move state from the previous default directory",
@@ -507,6 +590,24 @@ func (a *App) writeDevinHookHelp() {
 	})
 }
 
+func (a *App) writeClaudeHookHelp() {
+	writeHelp(a.stdout, []string{
+		"Usage:",
+		"  waypost claude-hook",
+		"",
+		"Track pending and consumed Waypost nudges for the current Claude Code session.",
+		"For a Waypost nudge on UserPromptSubmit, probe `claude mcp get waypost` and",
+		"emit one receive instruction: waypost_recv when available, CLI otherwise.",
+		"After a successful receive, a compact-source SessionStart emits an",
+		"anti-repeat guard and marks it pending; the next PostToolUse,",
+		"UserPromptSubmit, or non-compact SessionStart emits it again because",
+		"Claude Code drops compact-source SessionStart additionalContext.",
+		"For PreToolUse Bash calls, warn before waypost wait; when MCP is available,",
+		"deny waypost status, recv, receive, and send in favor of Waypost MCP tools.",
+		"The waypost mcp CLI command is always denied; install it with waypost install mcp-server.",
+	})
+}
+
 func (a *App) writeInstallHelp() {
 	writeHelp(a.stdout, []string{
 		"Usage:",
@@ -515,6 +616,7 @@ func (a *App) writeInstallHelp() {
 		"Install optional Waypost integrations:",
 		"  codex-hook              Install Codex lifecycle hooks",
 		"  devin-hook              Install Devin lifecycle hooks",
+		"  claude-hook             Install Claude Code lifecycle hooks",
 		"  mcp-server              Install Waypost MCP in Codex and detected agent configs",
 	})
 }
@@ -538,6 +640,18 @@ func (a *App) writeInstallDevinHookHelp() {
 		"",
 		"Merge Devin nudge lifecycle, compaction guard, receive tracking, and wait",
 		"hooks into the user-level Devin config (~/.config/devin/config.json).",
+		"The command is idempotent and preserves unrelated hooks and settings.",
+	})
+}
+
+func (a *App) writeInstallClaudeHookHelp() {
+	writeHelp(a.stdout, []string{
+		"Usage:",
+		"  waypost install claude-hook",
+		"",
+		"Merge Claude Code nudge lifecycle, compaction guard, receive tracking, and",
+		"wait hooks into the user-level settings (~/.claude/settings.json, or",
+		"$CLAUDE_CONFIG_DIR/settings.json when CLAUDE_CONFIG_DIR is set).",
 		"The command is idempotent and preserves unrelated hooks and settings.",
 	})
 }
@@ -568,6 +682,7 @@ func (a *App) writeDoctorHelp() {
 		"Diagnose optional Waypost integrations:",
 		"  codex-hook              Diagnose Codex lifecycle hooks",
 		"  devin-hook              Diagnose Devin lifecycle hooks",
+		"  claude-hook             Diagnose Claude Code lifecycle hooks",
 	})
 }
 
@@ -587,6 +702,15 @@ func (a *App) writeDoctorDevinHookHelp() {
 		"  waypost doctor devin-hook",
 		"",
 		"Verify all Devin hook definitions and report MCP availability for a new Devin process in the current directory.",
+	})
+}
+
+func (a *App) writeDoctorClaudeHookHelp() {
+	writeHelp(a.stdout, []string{
+		"Usage:",
+		"  waypost doctor claude-hook",
+		"",
+		"Verify all Claude Code hook definitions and report MCP availability for a new Claude Code process in the current directory.",
 	})
 }
 

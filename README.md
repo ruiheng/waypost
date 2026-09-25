@@ -208,6 +208,11 @@ waypost install devin-hook
 waypost doctor devin-hook
 ```
 
+The equivalent integrations exist for Codex (`codex-hook`, stored in
+`$CODEX_HOME/hooks.json`) and Claude Code (`claude-hook`, stored in the
+`hooks` object of `~/.claude/settings.json` or
+`$CLAUDE_CONFIG_DIR/settings.json`).
+
 Windows:
 
 ```powershell

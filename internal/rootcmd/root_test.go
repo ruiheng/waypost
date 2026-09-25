@@ -128,6 +128,93 @@ func TestRunInstallAndDoctorCodexHook(t *testing.T) {
 	}
 }
 
+func TestRunClaudeHookEmitsHookSpecificOutput(t *testing.T) {
+	t.Parallel()
+
+	var stdout bytes.Buffer
+	app := New(strings.NewReader(""), &stdout, &bytes.Buffer{})
+
+	if err := app.Run(context.Background(), []string{"claude-hook"}); err != nil {
+		t.Fatalf("Run(claude-hook) error = %v", err)
+	}
+	if !strings.Contains(stdout.String(), `"hookEventName":"SessionStart"`) {
+		t.Fatalf("claude-hook output = %q, want SessionStart hook output", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "already handled before compaction") ||
+		!strings.Contains(stdout.String(), "Do not repeat the receive merely because of compaction") {
+		t.Fatalf("claude-hook output = %q, want compact guard", stdout.String())
+	}
+}
+
+func TestRunInstallAndDoctorClaudeHook(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+
+	var installOutput bytes.Buffer
+	installApp := New(strings.NewReader(""), &installOutput, &bytes.Buffer{})
+	if err := installApp.Run(context.Background(), []string{"install", "claude-hook"}); err != nil {
+		t.Fatalf("Run(install claude-hook) error = %v", err)
+	}
+	if !strings.Contains(installOutput.String(), "Claude Code hooks installed") {
+		t.Fatalf("install output = %q, want installed status", installOutput.String())
+	}
+	if _, err := os.Stat(filepath.Join(configDir, "settings.json")); err != nil {
+		t.Fatalf("installed settings.json = %v", err)
+	}
+
+	var secondInstallOutput bytes.Buffer
+	secondInstallApp := New(strings.NewReader(""), &secondInstallOutput, &bytes.Buffer{})
+	if err := secondInstallApp.Run(context.Background(), []string{"install", "claude-hook"}); err != nil {
+		t.Fatalf("Run(second install claude-hook) error = %v", err)
+	}
+	if !strings.Contains(secondInstallOutput.String(), "already installed") {
+		t.Fatalf("second install output = %q, want already installed", secondInstallOutput.String())
+	}
+
+	var doctorOutput bytes.Buffer
+	doctorApp := New(strings.NewReader(""), &doctorOutput, &bytes.Buffer{})
+	doctorApp.currentDirectoryClaudeMCPAvailable = func(context.Context) (bool, error) {
+		return true, nil
+	}
+	if err := doctorApp.Run(context.Background(), []string{"doctor", "claude-hook"}); err != nil {
+		t.Fatalf("Run(doctor claude-hook) error = %v", err)
+	}
+	for _, expected := range []string{
+		"Claude Code compact guard: configured",
+		"Claude Code nudge hook: configured",
+		"Claude Code wait polling guard: configured",
+		"Claude Code receive completion tracker: configured",
+		"Claude Code nudge state cleanup: configured",
+		"Waypost MCP: available to a new Claude Code process in the current directory",
+	} {
+		if !strings.Contains(doctorOutput.String(), expected) {
+			t.Fatalf("doctor output = %q, want %q", doctorOutput.String(), expected)
+		}
+	}
+}
+
+func TestRunDoctorClaudeHookReportsCurrentDirectoryMCPProbeErrorWithoutFailing(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+
+	installApp := New(strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+	if err := installApp.Run(context.Background(), []string{"install", "claude-hook"}); err != nil {
+		t.Fatalf("Run(install claude-hook) error = %v", err)
+	}
+
+	var doctorOutput bytes.Buffer
+	doctorApp := New(strings.NewReader(""), &doctorOutput, &bytes.Buffer{})
+	doctorApp.currentDirectoryClaudeMCPAvailable = func(context.Context) (bool, error) {
+		return false, errors.New("claude unavailable")
+	}
+	if err := doctorApp.Run(context.Background(), []string{"doctor", "claude-hook"}); err != nil {
+		t.Fatalf("Run(doctor claude-hook) error = %v", err)
+	}
+	if !strings.Contains(doctorOutput.String(), "availability to a new Claude Code process in the current directory is unknown: claude unavailable") {
+		t.Fatalf("doctor output = %q, want nonfatal current-directory probe error", doctorOutput.String())
+	}
+}
+
 func TestRunInstallMCPServer(t *testing.T) {
 	t.Parallel()
 

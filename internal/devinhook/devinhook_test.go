@@ -463,6 +463,10 @@ printf '%s\n' 'Server: waypost' '    Command: waypost mcp'
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
+	previousBudget := hookcore.RunBudget
+	hookcore.RunBudget = 30 * time.Second
+	defer func() { hookcore.RunBudget = previousBudget }()
+
 	realProbe := func(ctx context.Context) (waypostMCPStatus, error) {
 		return probeWaypostMCPWithTimeout(ctx, 30*time.Second)
 	}
@@ -1632,18 +1636,6 @@ exit 9
 	available, err := probeWaypostMCPWithTimeout(context.Background(), 30*time.Second)
 	if err == nil || !strings.Contains(err.Error(), "invalid Devin MCP configuration") {
 		t.Fatalf("probeWaypostMCPWithTimeout() = %v, %v; want stderr detail", available, err)
-	}
-}
-
-func TestBoundedProbeErrorDetailPreservesHeadAndTail(t *testing.T) {
-	t.Parallel()
-
-	detail := boundedProbeErrorDetail([]byte("error prefix: " + strings.Repeat("x", 600) + " :root cause"))
-	if !strings.HasPrefix(detail, "error prefix: ") || !strings.HasSuffix(detail, " :root cause") {
-		t.Fatalf("boundedProbeErrorDetail() = %q, want preserved head and tail", detail)
-	}
-	if got := len([]rune(detail)); got != 500 {
-		t.Fatalf("boundedProbeErrorDetail() length = %d, want 500 runes", got)
 	}
 }
 

@@ -14,12 +14,12 @@ import (
 // compact-aware SessionStart, a separate PostCompaction event whose context
 // the harness drops, and a fallback event.
 var transitionSpec = HarnessSpec{
-	Label:               "Test",
-	ShellTool:           "exec",
-	CompactSource:       "compact",
-	PostCompactionEvent: "PostCompaction",
-	FallbackEvent:       "SessionStart",
-	ServerDenialReason:  "managed by harness",
+	Label:              "Test",
+	ShellTool:          "exec",
+	CompactEvent:       "PostCompaction",
+	CompactSource:      "compact",
+	FallbackEvent:      "SessionStart",
+	ServerDenialReason: "managed by harness",
 	EmitDeny: func(w io.Writer, reason string) error {
 		_, err := io.WriteString(w, "deny: "+reason)
 		return err
@@ -159,6 +159,82 @@ func TestHandleHookEventTransitions(t *testing.T) {
 			}
 			if tc.wantOutput != "" && !strings.Contains(out.String(), tc.wantOutput) {
 				t.Errorf("output = %q, want %q", out.String(), tc.wantOutput)
+			}
+		})
+	}
+}
+
+// TestHandleHookEventCompactContextDropped pins the lifecycle variation for
+// harnesses that drop compact-source SessionStart additionalContext: the
+// compact start emits the guard and keeps it armed, a repeated compact start
+// leaves it armed, and the next honored event delivers it.
+func TestHandleHookEventCompactContextDropped(t *testing.T) {
+	t.Parallel()
+
+	const session = "dropped-compact-session"
+	droppedSpec := transitionSpec
+	droppedSpec.CompactEvent = ""
+	droppedSpec.CompactSourceDropped = true
+
+	cases := []struct {
+		name        string
+		initial     NudgeState
+		input       HookInput
+		wantState   NudgeState
+		wantContext string
+	}{
+		{name: "compact start arms guard", initial: NudgeConsumed,
+			input:     HookInput{HookEventName: "SessionStart", Source: "compact"},
+			wantState: NudgeGuardPending, wantContext: AdditionalContext},
+		{name: "repeated compact start keeps guard armed", initial: NudgeGuardPending,
+			input:     HookInput{HookEventName: "SessionStart", Source: "compact"},
+			wantState: NudgeGuardPending},
+		{name: "guard delivered by next tool use", initial: NudgeGuardPending,
+			input:     HookInput{HookEventName: "PostToolUse", ToolName: "edit"},
+			wantState: NudgeConsumed, wantContext: AdditionalContext},
+		{name: "guard delivered by non-compact start", initial: NudgeGuardPending,
+			input:     HookInput{HookEventName: "SessionStart", Source: "startup"},
+			wantState: NudgeConsumed, wantContext: AdditionalContext},
+		{name: "compact start ignores pending nudge", initial: NudgePending,
+			input:     HookInput{HookEventName: "SessionStart", Source: "compact"},
+			wantState: NudgePending},
+		{name: "compact start ignores none", initial: NudgeNone,
+			input:     HookInput{HookEventName: "SessionStart", Source: "compact"},
+			wantState: NudgeNone},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := NewMemoryNudgeStore()
+			if tc.initial != NudgeNone {
+				if err := store.Save(session, tc.initial); err != nil {
+					t.Fatalf("Save() error = %v", err)
+				}
+			}
+			input := tc.input
+			input.SessionID = session
+
+			var out bytes.Buffer
+			err := HandleHookEvent(context.Background(), input, true, &out, droppedSpec,
+				func(context.Context) (MCPProbeRecord, error) { return MCPProbeRecord{}, nil }, store)
+			if err != nil {
+				t.Fatalf("HandleHookEvent() error = %v", err)
+			}
+
+			state, err := store.Load(session)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if state != tc.wantState {
+				t.Errorf("state = %q, want %q", state, tc.wantState)
+			}
+			if tc.wantContext != "" && !strings.Contains(out.String(), tc.wantContext) {
+				t.Errorf("output = %q, want additionalContext containing %q", out.String(), tc.wantContext)
+			}
+			if tc.wantContext == "" && out.Len() != 0 {
+				t.Errorf("output = %q, want none", out.String())
 			}
 		})
 	}

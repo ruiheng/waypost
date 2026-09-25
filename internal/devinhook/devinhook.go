@@ -98,13 +98,13 @@ func recordProbe(probe waypostMCPProbe) func(context.Context) (hookcore.MCPProbe
 // re-injected through the next honored event. The shell tool is exec and
 // denials use the decision/block envelope.
 var harnessSpec = hookcore.HarnessSpec{
-	Label:               harnessLabel,
-	ShellTool:           execToolName,
-	CompactSource:       "compact",
-	PostCompactionEvent: "PostCompaction",
-	FallbackEvent:       "PostCompaction",
-	ServerDenialReason:  MCPServerCommandDenialReason,
-	EmitDeny:            writeDenyOutput,
+	Label:              harnessLabel,
+	ShellTool:          execToolName,
+	CompactEvent:       "PostCompaction",
+	CompactSource:      "compact",
+	FallbackEvent:      "PostCompaction",
+	ServerDenialReason: MCPServerCommandDenialReason,
+	EmitDeny:           writeDenyOutput,
 	EmitProbeFailure: func(w io.Writer, probeErr error) error {
 		return hookcore.WriteHookContext(w, "PreToolUse", hookcore.MCPProbeFailureMessage(probeErr))
 	},

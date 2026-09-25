@@ -3,11 +3,11 @@ package codexhook
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/ruiheng/waypost/internal/hookcore"
 )
 
 const mcpProbeTimeout = 4 * time.Second
@@ -27,39 +27,11 @@ func CurrentDirectoryWaypostMCPAvailable(ctx context.Context) (bool, error) {
 }
 
 func probeWaypostMCPWithTimeout(ctx context.Context, timeout time.Duration) (bool, error) {
-	probeCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	commandName, commandArgs := mcpProbeInvocation("mcp", "get", waypostMCPServerName, "--json")
-	output, err := exec.CommandContext(probeCtx, commandName, commandArgs...).Output()
-	if err != nil {
-		if probeErr := probeCtx.Err(); probeErr != nil {
-			return false, fmt.Errorf("run `codex mcp get waypost --json`: %w", probeErr)
-		}
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			if isMissingWaypostMCPError(string(exitErr.Stderr)) {
-				return false, nil
-			}
-			if detail := boundedProbeErrorDetail(exitErr.Stderr); detail != "" {
-				return false, fmt.Errorf("run `codex mcp get waypost --json`: %w: %s", err, detail)
-			}
-		}
-		return false, fmt.Errorf("run `codex mcp get waypost --json`: %w", err)
+	output, missing, err := hookcore.RunMCPGetProbe(ctx, timeout, "codex", isMissingWaypostMCPError, "--json")
+	if err != nil || missing {
+		return false, err
 	}
 	return parseWaypostMCPAvailable(output)
-}
-
-func boundedProbeErrorDetail(stderr []byte) string {
-	detail := strings.TrimSpace(string(stderr))
-	const maxRunes = 500
-	runes := []rune(detail)
-	if len(runes) > maxRunes {
-		const marker = "…"
-		headRunes := maxRunes / 2
-		tailRunes := maxRunes - headRunes - len([]rune(marker))
-		detail = string(runes[:headRunes]) + marker + string(runes[len(runes)-tailRunes:])
-	}
-	return detail
 }
 
 func isMissingWaypostMCPError(detail string) bool {

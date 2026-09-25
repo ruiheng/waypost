@@ -22,18 +22,24 @@ type HarnessSpec struct {
 	// {"command": ...} ("exec", "Bash").
 	ShellTool string
 
+	// CompactEvent names a post-compaction hook event whose additionalContext
+	// the harness drops (Devin's PostCompaction), or empty when the harness
+	// has none. A consumed nudge is marked NudgeGuardPending on that event so
+	// the next honored event re-injects the guard, and the event keeps a
+	// pending guard armed rather than spending it on a dropped channel.
+	CompactEvent string
+
 	// CompactSource is the SessionStart source marking a post-compaction
-	// start ("compact"). Empty disables the direct SessionStart compact
-	// emission.
+	// start ("compact"). Empty disables the SessionStart compact trigger.
 	CompactSource string
 
-	// PostCompactionEvent names the harness's post-compaction hook event, or
-	// empty when the harness reports compaction only through SessionStart.
-	// A consumed nudge is marked NudgeGuardPending on that event so the next
-	// PostToolUse, UserPromptSubmit, or SessionStart re-injects the guard:
-	// required for harnesses that drop the event's additionalContext,
-	// harmless for ones that honor it.
-	PostCompactionEvent string
+	// CompactSourceDropped marks a harness that drops compact-source
+	// SessionStart additionalContext (Claude Code). The trigger then arms
+	// and re-delivers the guard like CompactEvent instead of only emitting
+	// once. When unset, a compact-source SessionStart is an honored channel:
+	// it emits the guard directly for a consumed nudge and delivers a
+	// pending guard like any other honored event.
+	CompactSourceDropped bool
 
 	// FallbackEvent names the hookEventName reported when the harness sends
 	// no payload (a manual invocation or an empty stdin).
@@ -113,7 +119,7 @@ func HandleHookEvent(
 	// tracking degrades gracefully instead of failing the hook.
 	sessionID := strings.TrimSpace(input.SessionID)
 	switch {
-	case spec.PostCompactionEvent != "" && input.HookEventName == spec.PostCompactionEvent:
+	case input.HookEventName == "SessionStart" || (spec.CompactEvent != "" && input.HookEventName == spec.CompactEvent):
 		if sessionID == "" {
 			return nil
 		}
@@ -121,37 +127,42 @@ func HandleHookEvent(
 		if err != nil {
 			return err
 		}
-		if state != NudgeConsumed {
-			return nil
-		}
-		// Harnesses that drop PostCompaction additionalContext carry the
-		// guard as pending state so the next PostToolUse or
-		// UserPromptSubmit re-injects it. The output is still emitted for
-		// harnesses that honor it.
-		if err := store.Save(sessionID, NudgeGuardPending); err != nil {
-			return err
-		}
-		return WriteHookContext(w, spec.PostCompactionEvent, AdditionalContext)
-	case input.HookEventName == "SessionStart":
-		if sessionID == "" {
-			return nil
-		}
-		state, err := store.Load(sessionID)
-		if err != nil {
-			return err
+		// Compaction arrives on a named event or as a SessionStart source.
+		// Named compact events always drop their context; a compact source
+		// drops it only when the spec declares CompactSourceDropped.
+		compact := spec.CompactEvent != "" && input.HookEventName == spec.CompactEvent
+		compactDropped := compact
+		if !compact && spec.CompactSource != "" && input.Source == spec.CompactSource {
+			compact = true
+			compactDropped = spec.CompactSourceDropped
 		}
 		if state == NudgeGuardPending {
-			// A pending guard survives restarts; SessionStart delivers it
-			// regardless of source and re-arms for the next compaction.
+			if compactDropped {
+				// The harness drops this signal's context, so the guard
+				// stays armed for the next honored event instead of
+				// emitting into a channel that discards it.
+				return nil
+			}
+			// A pending guard survives restarts; any honored start event
+			// delivers it regardless of source and re-arms for the next
+			// compaction.
 			if err := store.Save(sessionID, NudgeConsumed); err != nil {
 				return err
 			}
-			return WriteHookContext(w, "SessionStart", AdditionalContext)
+			return WriteHookContext(w, input.HookEventName, AdditionalContext)
 		}
-		if spec.CompactSource == "" || input.Source != spec.CompactSource || state != NudgeConsumed {
+		if !compact || state != NudgeConsumed {
 			return nil
 		}
-		return WriteHookContext(w, "SessionStart", AdditionalContext)
+		if compactDropped {
+			// The compact context may be dropped, so the guard is also
+			// armed for re-injection by the next honored event. The output
+			// is still emitted for harnesses that honor it.
+			if err := store.Save(sessionID, NudgeGuardPending); err != nil {
+				return err
+			}
+		}
+		return WriteHookContext(w, input.HookEventName, AdditionalContext)
 	case input.HookEventName == "UserPromptSubmit":
 		if !LooksLikeWaypostNudge(input.Prompt) {
 			if sessionID == "" {

@@ -468,7 +468,7 @@ func waypostSendResultMap(input waypostSendInput, fromAddress string, sendResult
 }
 
 func prepareWaypostSendTarget(req *mcp.CallToolRequest, input *waypostSendInput) (bool, error) {
-	if req == nil || len(req.Params.Arguments) == 0 {
+	if req == nil || req.Params == nil || len(req.Params.Arguments) == 0 {
 		return false, errors.New("waypost_send requires to")
 	}
 
@@ -491,7 +491,7 @@ func prepareWaypostSendTarget(req *mcp.CallToolRequest, input *waypostSendInput)
 }
 
 func (s *Service) prepareWaypostSendBody(req *mcp.CallToolRequest, input *waypostSendInput) error {
-	if req == nil || len(req.Params.Arguments) == 0 {
+	if req == nil || req.Params == nil || len(req.Params.Arguments) == 0 {
 		return errors.New("waypost_send requires body or body_file")
 	}
 

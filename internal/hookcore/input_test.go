@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -27,13 +28,16 @@ func TestBeginRunBoundsContextAndPipeRead(t *testing.T) {
 		t.Fatal("BeginRun() ctx has no deadline")
 	}
 
-	_, _, err = ReadHookInput(readEnd, "Test")
+	_, _, err = ReadHookInput(ctx, readEnd, "Test")
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("ReadHookInput() error = %v, want os.ErrDeadlineExceeded", err)
 	}
 }
 
 func TestSetInputReadDeadlineBoundsPipeRead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows pipe handles are synchronous and do not support read deadlines; BeginRun bounds them through ctx instead")
+	}
 	t.Parallel()
 
 	readEnd, writeEnd, err := os.Pipe()
@@ -46,7 +50,7 @@ func TestSetInputReadDeadlineBoundsPipeRead(t *testing.T) {
 	SetInputReadDeadline(readEnd, time.Now().Add(20*time.Millisecond))
 
 	start := time.Now()
-	_, _, err = ReadHookInput(readEnd, "Test")
+	_, _, err = ReadHookInput(context.Background(), readEnd, "Test")
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("ReadHookInput() error = %v, want os.ErrDeadlineExceeded", err)
 	}
@@ -61,7 +65,7 @@ func TestSetInputReadDeadlineIgnoresUnsupportedSources(t *testing.T) {
 	input := bytes.NewReader([]byte(`{"hook_event_name":"SessionStart"}`))
 	SetInputReadDeadline(input, time.Now().Add(-time.Second))
 
-	parsed, hasInput, err := ReadHookInput(input, "Test")
+	parsed, hasInput, err := ReadHookInput(context.Background(), input, "Test")
 	if err != nil || !hasInput {
 		t.Fatalf("ReadHookInput() = %v, %v, %v; want parsed input", parsed, hasInput, err)
 	}

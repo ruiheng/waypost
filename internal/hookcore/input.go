@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"time"
 )
 
@@ -52,15 +53,38 @@ func BeginRun(ctx context.Context, r io.Reader) (context.Context, context.Cancel
 }
 
 // ReadHookInput decodes one hook payload. An empty stream reports hasInput
-// false; label names the harness in the parse error.
-func ReadHookInput(r io.Reader, label string) (HookInput, bool, error) {
-	var input HookInput
-	err := json.NewDecoder(r).Decode(&input)
-	if errors.Is(err, io.EOF) {
-		return HookInput{}, false, nil
+// false; label names the harness in the parse error. The decode runs on a
+// helper goroutine so ctx still bounds the read when the source cannot
+// enforce a deadline itself, such as a synchronous Windows pipe handle; on
+// timeout the orphaned goroutine exits once the source is closed or the
+// process ends.
+func ReadHookInput(ctx context.Context, r io.Reader, label string) (HookInput, bool, error) {
+	type result struct {
+		input    HookInput
+		hasInput bool
+		err      error
 	}
-	if err != nil {
+	done := make(chan result, 1)
+	go func() {
+		var input HookInput
+		err := json.NewDecoder(r).Decode(&input)
+		switch {
+		case errors.Is(err, io.EOF):
+			done <- result{}
+		case err != nil:
+			done <- result{err: fmt.Errorf("parse %s hook input: %w", label, err)}
+		default:
+			done <- result{input: input, hasInput: true}
+		}
+	}()
+	select {
+	case res := <-done:
+		return res.input, res.hasInput, res.err
+	case <-ctx.Done():
+		err := ctx.Err()
+		if errors.Is(err, context.DeadlineExceeded) {
+			err = os.ErrDeadlineExceeded
+		}
 		return HookInput{}, false, fmt.Errorf("parse %s hook input: %w", label, err)
 	}
-	return input, true, nil
 }

@@ -30,8 +30,12 @@ func TestReadConfigDocumentPreservesNumbers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadConfigDocument() error = %v", err)
 	}
-	if mode != 0o640 {
-		t.Fatalf("mode = %o, want 640", mode)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat(%q) error = %v", path, err)
+	}
+	if mode != info.Mode().Perm() {
+		t.Fatalf("mode = %o, want %o", mode, info.Mode().Perm())
 	}
 	if wasJSONC {
 		t.Fatal("wasJSONC = true for plain JSON")

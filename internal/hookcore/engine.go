@@ -87,7 +87,7 @@ func RunHook(
 ) error {
 	ctx, cancel := BeginRun(ctx, r)
 	defer cancel()
-	input, hasInput, err := ReadHookInput(r, spec.Label)
+	input, hasInput, err := ReadHookInput(ctx, r, spec.Label)
 	if err != nil {
 		if errors.Is(err, os.ErrDeadlineExceeded) && spec.EmitInputTimeout != nil {
 			return spec.EmitInputTimeout(w)

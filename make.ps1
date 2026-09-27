@@ -283,12 +283,52 @@ function Install-Launcher {
         return
     }
 
-    # Windows upgrades are a hard cut. Activating a new child behind an older,
-    # locked launcher would mix launcher and child protocols.
+    # Windows upgrades are a hard cut: activating a new child behind an
+    # older launcher would mix launcher and child protocols. A running
+    # process locks its mapped executable against overwrite but not against
+    # rename, so a locked launcher is moved aside and the new build still
+    # takes the stable path; running processes keep their mapped copy.
     try {
         Copy-Item -LiteralPath $LauncherOutput -Destination $Destination -Force -ErrorAction Stop
+        return
     } catch {
-        throw "Could not replace locked launcher '$Destination'. Stop running Waypost and Codex processes, then rerun install. No new version was activated. Original error: $($_.Exception.Message)"
+        $overwriteError = $_.Exception.Message
+    }
+
+    # Stage the new launcher under a scratch name first so the only steps
+    # after the locked file moves aside are same-directory renames; a stale
+    # destination can then be rolled back without a copy in between.
+    $staged = "$Destination.new-$PID"
+    $retired = "$Destination.retired-$PID"
+    try {
+        Copy-Item -LiteralPath $LauncherOutput -Destination $staged -ErrorAction Stop
+        Move-Item -LiteralPath $Destination -Destination $retired -ErrorAction Stop
+        Move-Item -LiteralPath $staged -Destination $Destination -ErrorAction Stop
+    } catch {
+        if (-not (Test-Path -LiteralPath $Destination) -and (Test-Path -LiteralPath $retired)) {
+            try { Move-Item -LiteralPath $retired -Destination $Destination -ErrorAction Stop } catch {}
+        }
+        throw "Could not replace locked launcher '$Destination'. Stop running Waypost and Codex processes, then rerun install. No new version was activated. Original error: $overwriteError; retire error: $($_.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-RetiredLaunchers {
+    param(
+        [string]$Directory
+    )
+
+    if (-not (Test-Path -LiteralPath $Directory)) {
+        return
+    }
+
+    Get-ChildItem -LiteralPath $Directory -Filter "*.retired-*" -File -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
+        } catch {
+            Write-Verbose "Retired launcher '$($_.FullName)' is still in use; leaving it for a later install."
+        }
     }
 }
 
@@ -366,7 +406,7 @@ function Show-Help {
         "  ./make.ps1 run -- <args>      Run the CLI with go run and pass args through"
         "  ./make.ps1 run-mcp            Run the built-in stdio MCP server with go run"
         "  ./make.ps1 install            Install launcher into $installDir and versioned CLI into $appRoot"
-        "                                 Stop running Waypost and Codex processes first"
+        "                                 Running processes keep their version; new launches get the update"
         "  ./make.ps1 clean              Remove local build output"
     ) | ForEach-Object { Write-Output $_ }
 }
@@ -430,6 +470,7 @@ switch ($Target) {
             Invoke-Go @("build", "-o", $launcherBuildOutput, $launcherCmdPath)
             Copy-FileReplacing -Source $cliBuildOutput -Destination $versionedBinary
             Install-Launcher -LauncherOutput $launcherBuildOutput -Destination $launcherDestination
+            Remove-RetiredLaunchers -Directory $destinationRoot
             Write-ActiveVersionManifest -ManifestPath $manifestPath -Version $version -Executable $manifestExecutable
         } finally {
             Remove-Item -LiteralPath $cliBuildOutput -Force -ErrorAction SilentlyContinue

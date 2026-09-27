@@ -10,6 +10,8 @@ import (
 	"runtime"
 
 	_ "github.com/mattn/go-sqlite3"
+
+	"github.com/ruiheng/waypost/internal/userdirs"
 )
 
 const (
@@ -132,15 +134,11 @@ func resolveStateDir(override string) (string, error) {
 	if value := os.Getenv("WAYPOST_STATE_DIR"); value != "" {
 		return filepath.Clean(value), nil
 	}
-	if value := os.Getenv("XDG_STATE_HOME"); value != "" {
-		return filepath.Join(value, defaultStateDirSuffix), nil
-	}
-
-	homeDir, err := os.UserHomeDir()
+	root, err := userdirs.StateRoot(os.UserHomeDir)
 	if err != nil {
 		return "", fmt.Errorf("resolve home directory: %w", err)
 	}
-	return filepath.Join(homeDir, ".local", "state", defaultStateDirSuffix), nil
+	return filepath.Join(root, defaultStateDirSuffix), nil
 }
 
 // ResolveStateDir reports the same state directory OpenRuntime will use for a

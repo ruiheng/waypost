@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
+
+	"github.com/ruiheng/waypost/internal/userdirs"
 )
 
 // ponytail: fragile adapter for agent-deck private state.db; replace with a public agent-deck API when one exists.
@@ -274,9 +276,9 @@ func agentDeckStateDBPaths() []string {
 
 	// Agent Deck migrated its data from ~/.agent-deck to the XDG data
 	// directory. Keep both roots so existing installations continue to work.
-	xdgDataHome := strings.TrimSpace(os.Getenv("XDG_DATA_HOME"))
-	if xdgDataHome == "" || !filepath.IsAbs(xdgDataHome) {
-		xdgDataHome = filepath.Join(homeDir, ".local", "share")
+	xdgDataHome, err := userdirs.DataRoot(userdirs.AtHome(homeDir))
+	if err != nil {
+		return nil
 	}
 	baseDirs := []string{
 		filepath.Join(xdgDataHome, "agent-deck"),

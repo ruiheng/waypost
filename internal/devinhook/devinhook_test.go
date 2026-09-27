@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"github.com/ruiheng/waypost/internal/hookcore"
+	"github.com/ruiheng/waypost/internal/hookcore/hooktest"
 	"github.com/ruiheng/waypost/internal/launchpath"
+	"github.com/ruiheng/waypost/internal/testenv"
 )
 
 func TestWriteOutputEmitsPostCompactionAdditionalContext(t *testing.T) {
@@ -461,7 +463,7 @@ printf '%s\n' 'Server: waypost' '    Command: waypost mcp'
 		t.Fatalf("WriteFile(devin probe) error = %v", err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	testenv.IsolateUserDirs(t, t.TempDir())
 
 	previousBudget := hookcore.RunBudget
 	hookcore.RunBudget = 30 * time.Second
@@ -1943,29 +1945,14 @@ func TestRunPreToolUseHonorsDisabledWaypostTools(t *testing.T) {
 	}
 }
 
-// TestRunFailsStalledHookInputWithinBudget feeds run() a stdin pipe whose
-// payload never arrives: the internal budget must end the wait below the
-// harness deadline and surface the read failure instead of dying to an opaque
-// kill.
+// TestRunFailsStalledHookInputWithinBudget asserts the shared stalled-input
+// contract for this harness: exit within budget and surface the read failure
+// instead of dying to an opaque kill.
 func TestRunFailsStalledHookInputWithinBudget(t *testing.T) {
-	previous := hookcore.RunBudget
-	hookcore.RunBudget = 50 * time.Millisecond
-	defer func() { hookcore.RunBudget = previous }()
-
-	readEnd, writeEnd, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe() error = %v", err)
-	}
-	defer readEnd.Close()
-	defer writeEnd.Close() // payload never arrives
-
-	var output bytes.Buffer
-	start := time.Now()
-	err = run(context.Background(), readEnd, &output)
-	if !errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("run() error = %v, want os.ErrDeadlineExceeded", err)
-	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Fatalf("run() took %v, want exit well below the harness deadline", elapsed)
-	}
+	hooktest.CheckStalledInputExitsWithinBudget(t, 50*time.Millisecond, run, func(t *testing.T, _ []byte, runErr error) {
+		t.Helper()
+		if !errors.Is(runErr, os.ErrDeadlineExceeded) {
+			t.Fatalf("run() error = %v, want os.ErrDeadlineExceeded", runErr)
+		}
+	})
 }

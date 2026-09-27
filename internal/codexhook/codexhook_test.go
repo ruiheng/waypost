@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/ruiheng/waypost/internal/hookcore"
+	"github.com/ruiheng/waypost/internal/hookcore/hooktest"
 	"github.com/ruiheng/waypost/internal/launchpath"
+	"github.com/ruiheng/waypost/internal/testenv"
 )
 
 func TestWriteOutputEmitsSessionStartAdditionalContext(t *testing.T) {
@@ -336,7 +338,7 @@ printf '%s\n' '{"name":"waypost","enabled":true}'
 		t.Fatalf("WriteFile(codex probe) error = %v", err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("CODEX_HOME", t.TempDir())
+	testenv.IsolateUserDirs(t, t.TempDir())
 
 	previousBudget := hookcore.RunBudget
 	hookcore.RunBudget = 30 * time.Second
@@ -1554,36 +1556,22 @@ func runPreToolHook(t *testing.T, command string, probe waypostMCPProbe) (hookOu
 	return output, true
 }
 
-// TestRunReportsStalledHookInputWithinBudget feeds run() a stdin pipe whose
-// payload never arrives: the internal budget must end the wait below the
-// harness deadline and emit a systemMessage instead of dying to an opaque
-// kill.
+// TestRunReportsStalledHookInputWithinBudget asserts the shared stalled-input
+// contract for this harness: exit within budget and emit a systemMessage
+// instead of dying to an opaque kill.
 func TestRunReportsStalledHookInputWithinBudget(t *testing.T) {
-	previous := hookcore.RunBudget
-	hookcore.RunBudget = 50 * time.Millisecond
-	defer func() { hookcore.RunBudget = previous }()
-
-	readEnd, writeEnd, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe() error = %v", err)
-	}
-	defer readEnd.Close()
-	defer writeEnd.Close() // payload never arrives
-
-	var output bytes.Buffer
-	start := time.Now()
-	if err := run(context.Background(), readEnd, &output); err != nil {
-		t.Fatalf("run() error = %v, want graceful systemMessage", err)
-	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Fatalf("run() took %v, want exit well below the harness deadline", elapsed)
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(output.Bytes(), &payload); err != nil {
-		t.Fatalf("Unmarshal(hook output) error = %v", err)
-	}
-	message, _ := payload["systemMessage"].(string)
-	if !strings.Contains(message, "timed out") {
-		t.Fatalf("systemMessage = %q, want timeout notice", message)
-	}
+	hooktest.CheckStalledInputExitsWithinBudget(t, 50*time.Millisecond, run, func(t *testing.T, output []byte, runErr error) {
+		t.Helper()
+		if runErr != nil {
+			t.Fatalf("run() error = %v, want graceful systemMessage", runErr)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(output, &payload); err != nil {
+			t.Fatalf("Unmarshal(hook output) error = %v", err)
+		}
+		message, _ := payload["systemMessage"].(string)
+		if !strings.Contains(message, "timed out") {
+			t.Fatalf("systemMessage = %q, want timeout notice", message)
+		}
+	})
 }

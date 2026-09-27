@@ -8,10 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 
 	"github.com/ruiheng/waypost/internal/hookcore"
 	"github.com/ruiheng/waypost/internal/launchpath"
+	"github.com/ruiheng/waypost/internal/userdirs"
 )
 
 const (
@@ -283,14 +283,11 @@ func bashCommand(raw json.RawMessage) (string, error) {
 // DefaultConfigDir returns the directory Claude Code reads user-level
 // settings from: $CLAUDE_CONFIG_DIR when set, else ~/.claude.
 func DefaultConfigDir() (string, error) {
-	if configured := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); configured != "" {
-		return filepath.Abs(configured)
-	}
-	home, err := os.UserHomeDir()
+	dir, err := userdirs.EnvOrHome("CLAUDE_CONFIG_DIR", os.UserHomeDir, ".claude")
 	if err != nil {
 		return "", fmt.Errorf("resolve user home for Claude Code hooks: %w", err)
 	}
-	return filepath.Join(home, ".claude"), nil
+	return dir, nil
 }
 
 func CurrentCommand() (string, error) {

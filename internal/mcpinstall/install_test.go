@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/ruiheng/waypost/internal/devinconfig"
+	"github.com/ruiheng/waypost/internal/testenv"
 )
 
 func TestEnsureWaypostSectionCreatesConfig(t *testing.T) {
@@ -656,7 +657,7 @@ func TestEnsureDevinConfigRejectsSingleQuotedJSON5(t *testing.T) {
 
 func TestInstallOptionalAgentsDetectsDevinByConfigJSON(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+	testenv.IsolateUserDirs(t, home)
 	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, "claude"))
 	devinDir := devinconfig.UserConfigDir(home)
 	if err := os.MkdirAll(devinDir, 0o700); err != nil {
@@ -729,10 +730,12 @@ func TestDevinProjectOverrideWarnings(t *testing.T) {
 }
 
 func TestInstallOptionalAgentsOnlyTouchesInstalledAgents(t *testing.T) {
-	t.Parallel()
-
 	home := t.TempDir()
-	claudePath := filepath.Join(home, claudeConfigName)
+	testenv.IsolateUserDirs(t, home)
+	claudePath := claudeConfigPath(home)
+	if err := os.MkdirAll(filepath.Dir(claudePath), 0o700); err != nil {
+		t.Fatalf("MkdirAll(Claude config dir) error = %v", err)
+	}
 	if err := os.WriteFile(claudePath, []byte(`{"mcpServers": {"other": {"command": "other"}}}`), 0o600); err != nil {
 		t.Fatalf("WriteFile(Claude config) error = %v", err)
 	}
@@ -763,6 +766,7 @@ func TestInstallOptionalAgentsOnlyTouchesInstalledAgents(t *testing.T) {
 
 func TestClaudeConfigPathHonorsOverride(t *testing.T) {
 	home := t.TempDir()
+	testenv.IsolateUserDirs(t, home)
 	configDir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
 	path := filepath.Join(configDir, claudeConfigName)
@@ -858,15 +862,18 @@ func TestInstallWithDependenciesDoesNotAddAfterUnknownGetError(t *testing.T) {
 }
 
 func TestInstallWithDependenciesValidatesOptionalConfigsBeforeCodexMutation(t *testing.T) {
-	t.Parallel()
-
 	root := t.TempDir()
 	codexHome := filepath.Join(root, "codex")
 	userHome := filepath.Join(root, "user")
+	testenv.IsolateUserDirs(t, userHome)
 	if err := os.MkdirAll(userHome, 0o700); err != nil {
 		t.Fatalf("MkdirAll(user home) error = %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(userHome, claudeConfigName), []byte(`{"mcpServers":`), 0o600); err != nil {
+	claudePath := claudeConfigPath(userHome)
+	if err := os.MkdirAll(filepath.Dir(claudePath), 0o700); err != nil {
+		t.Fatalf("MkdirAll(Claude config dir) error = %v", err)
+	}
+	if err := os.WriteFile(claudePath, []byte(`{"mcpServers":`), 0o600); err != nil {
 		t.Fatalf("WriteFile(Claude config) error = %v", err)
 	}
 	called := false
@@ -1015,29 +1022,29 @@ approval_mode = "approve"
 }
 
 func TestInstallWithDependenciesRequiresADetectedAgent(t *testing.T) {
-	t.Parallel()
-
 	for _, tc := range []struct {
-		name            string
-		resolveUserHome func() (string, error)
+		name     string
+		userHome bool
 	}{
 		{name: "without user home"},
-		{name: "with user home", resolveUserHome: func() (string, error) { return t.TempDir(), nil }},
+		{name: "with user home", userHome: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
 			deps := dependencies{
 				lookPath: func(string) (string, error) { return "", errors.New("not found") },
 				resolveHome: func() (string, error) {
 					return t.TempDir(), nil
 				},
-				resolveUserHome:   tc.resolveUserHome,
 				resolveExecutable: func() (string, error) { return "/opt/waypost", nil },
 				run: func(context.Context, string, ...string) (commandOutput, error) {
 					t.Fatal("run called when no agent is detected")
 					return commandOutput{}, nil
 				},
+			}
+			if tc.userHome {
+				userHome := t.TempDir()
+				testenv.IsolateUserDirs(t, userHome)
+				deps.resolveUserHome = func() (string, error) { return userHome, nil }
 			}
 
 			_, err := installWithDependencies(context.Background(), deps)
@@ -1049,10 +1056,9 @@ func TestInstallWithDependenciesRequiresADetectedAgent(t *testing.T) {
 }
 
 func TestInstallWithDependenciesInstallsDevinWithoutCodex(t *testing.T) {
-	t.Parallel()
-
 	codexHome := filepath.Join(t.TempDir(), "codex")
 	userHome := t.TempDir()
+	testenv.IsolateUserDirs(t, userHome)
 	deps := dependencies{
 		lookPath: func(name string) (string, error) {
 			if name == "devin" {
@@ -1142,11 +1148,11 @@ args = ["mcp", "--include-debug-tool"]
 
 func TestInstallOptionalAgentsKeepsConfiguredAgentsOnLaterFailure(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
-	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, "claude"))
+	testenv.IsolateUserDirs(t, home)
 
-	// Claude is configured first, then Devin detection fails because its
-	// config directory is a regular file (ENOTDIR on stat).
+	// Claude is configured first; Devin is then detected but its
+	// mcp_config.json is a directory, so the configure step fails on every
+	// platform (a stat-based ENOTDIR trick reads as ErrNotExist on Windows).
 	claudePath := claudeConfigPath(home)
 	if err := os.MkdirAll(filepath.Dir(claudePath), 0o700); err != nil {
 		t.Fatalf("MkdirAll(claude dir) error = %v", err)
@@ -1154,12 +1160,8 @@ func TestInstallOptionalAgentsKeepsConfiguredAgentsOnLaterFailure(t *testing.T) 
 	if err := os.WriteFile(claudePath, []byte(`{"mcpServers": {}}`), 0o600); err != nil {
 		t.Fatalf("WriteFile(Claude config) error = %v", err)
 	}
-	devinBlocker := devinconfig.UserConfigDir(home)
-	if err := os.MkdirAll(filepath.Dir(devinBlocker), 0o700); err != nil {
-		t.Fatalf("MkdirAll(devin parent) error = %v", err)
-	}
-	if err := os.WriteFile(devinBlocker, []byte("not a directory"), 0o600); err != nil {
-		t.Fatalf("WriteFile(devin blocker) error = %v", err)
+	if err := os.MkdirAll(devinMCPConfigPath(home), 0o700); err != nil {
+		t.Fatalf("MkdirAll(devin mcp_config.json) error = %v", err)
 	}
 
 	configured, _, changed, err := installOptionalAgents(home, "/opt/waypost", func() (string, error) { return t.TempDir(), nil }, func(string) (string, error) {
@@ -1216,7 +1218,7 @@ func TestInstallWithDependenciesReportsCodexConfiguredOnConfigWriteFailure(t *te
 func TestInstallWithDependenciesWarnsWhenGetwdFails(t *testing.T) {
 	home := t.TempDir()
 	userHome := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(userHome, "xdg"))
+	testenv.IsolateUserDirs(t, userHome)
 	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(userHome, "claude"))
 
 	// Devin is detected through an existing user-level config.json.
@@ -1257,7 +1259,7 @@ func TestInstallWithDependenciesWarnsWhenGetwdFails(t *testing.T) {
 func TestInstallWithDependenciesSkipsGetwdWarningWithoutDevin(t *testing.T) {
 	home := t.TempDir()
 	userHome := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(userHome, "xdg"))
+	testenv.IsolateUserDirs(t, userHome)
 	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(userHome, "claude"))
 
 	// Only Codex is detected (via an existing config.toml); no Devin

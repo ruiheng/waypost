@@ -3,10 +3,9 @@
 package devinconfig
 
 import (
-	"os"
 	"path/filepath"
-	"runtime"
-	"strings"
+
+	"github.com/ruiheng/waypost/internal/userdirs"
 )
 
 // UserConfigDir returns the directory Devin reads user-level configuration
@@ -14,14 +13,7 @@ import (
 // AppData\Roaming fallback, $XDG_CONFIG_HOME/devin or ~/.config/devin on
 // other platforms.
 func UserConfigDir(home string) string {
-	if runtime.GOOS == "windows" {
-		if appData := strings.TrimSpace(os.Getenv("APPDATA")); appData != "" {
-			return filepath.Join(appData, "devin")
-		}
-		return filepath.Join(home, "AppData", "Roaming", "devin")
-	}
-	if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
-		return filepath.Join(xdg, "devin")
-	}
-	return filepath.Join(home, ".config", "devin")
+	// AtHome never fails, so the platform root always resolves here.
+	root, _ := userdirs.ConfigRoot(userdirs.AtHome(home))
+	return filepath.Join(root, "devin")
 }

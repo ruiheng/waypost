@@ -18,6 +18,7 @@ import (
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/ruiheng/waypost/internal/testenv"
 	"github.com/ruiheng/waypost/internal/waypost"
 )
 
@@ -2121,7 +2122,7 @@ func TestAgentDeckSessionNotFoundDetailSuggestsNearbyBoundAddress(t *testing.T) 
 
 func TestAgentDeckSessionNotFoundDetailReadsXDGStateDB(t *testing.T) {
 	home := t.TempDir()
-	setTestHome(t, home)
+	testenv.PinHome(t, home)
 	xdgDataHome := filepath.Join(home, "xdg-data")
 	t.Setenv("XDG_DATA_HOME", xdgDataHome)
 	isolateAutoBindEnv(t)
@@ -2138,7 +2139,7 @@ func TestAgentDeckSessionNotFoundDetailReadsXDGStateDB(t *testing.T) {
 
 func TestAgentDeckStateDBPathsDefaultToXDGDataHome(t *testing.T) {
 	home := t.TempDir()
-	setTestHome(t, home)
+	testenv.PinHome(t, home)
 	t.Setenv("XDG_DATA_HOME", "")
 
 	want := filepath.Join(home, ".local", "share", "agent-deck", "profiles", "default", "state.db")
@@ -9044,7 +9045,7 @@ func TestAutoBindFindsClaudeCodeSessionFromEnv(t *testing.T) {
 
 func TestAutoBindFindsAgentDeckSessionFromCodexStateDB(t *testing.T) {
 	home := t.TempDir()
-	setTestHome(t, home)
+	testenv.PinHome(t, home)
 	isolateAutoBindEnv(t)
 	t.Setenv("CODEX_THREAD_ID", "0123456789abcdef")
 	t.Setenv("AGENTDECK_PROFILE", "bad")
@@ -9084,7 +9085,7 @@ func TestAutoBindFindsAgentDeckSessionFromCodexStateDB(t *testing.T) {
 
 func TestAutoBindPrefersCodexLinkedAgentDeckSessionOverAmbientCurrent(t *testing.T) {
 	home := t.TempDir()
-	setTestHome(t, home)
+	testenv.PinHome(t, home)
 	isolateAutoBindEnv(t)
 	t.Setenv("CODEX_THREAD_ID", "0123456789abcdef")
 	writeAgentDeckStateDB(t, home, "default", "deck-session-1", "/tmp/project", "0123456789abcdef")
@@ -9135,7 +9136,7 @@ func TestAutoBindPrefersCodexLinkedAgentDeckSessionOverAmbientCurrent(t *testing
 func TestAutoBindDoesNotChooseAgentDeckSessionFromStateDBByWorkdirAlone(t *testing.T) {
 	home := t.TempDir()
 	workdir := t.TempDir()
-	setTestHome(t, home)
+	testenv.PinHome(t, home)
 	isolateAutoBindEnv(t)
 	t.Setenv("AGENTDECK_PROFILE", "work")
 	writeAgentDeckStateDB(t, home, "work", "deck-session-1", workdir, "0123456789abcdef")
@@ -9174,7 +9175,7 @@ func TestAutoBindDoesNotChooseAgentDeckSessionFromStateDBByWorkdirAlone(t *testi
 func TestAutoBindComplementsCurrentAgentDeckSessionFromStateDBByWorkdir(t *testing.T) {
 	home := t.TempDir()
 	workdir := t.TempDir()
-	setTestHome(t, home)
+	testenv.PinHome(t, home)
 	isolateAutoBindEnv(t)
 	t.Setenv("AGENTDECK_PROFILE", "work")
 	writeAgentDeckStateDB(t, home, "work", "deck-session-1", workdir, "0123456789abcdef")
@@ -9214,7 +9215,7 @@ func TestAutoBindComplementsCurrentAgentDeckSessionFromStateDBByWorkdir(t *testi
 func TestAutoBindUsesSessionShowPathBeforeStateDBWorkdirLookup(t *testing.T) {
 	home := t.TempDir()
 	workdir := t.TempDir()
-	setTestHome(t, home)
+	testenv.PinHome(t, home)
 	isolateAutoBindEnv(t)
 	t.Setenv("AGENTDECK_PROFILE", "work")
 	writeAgentDeckStateDB(t, home, "work", "deck-session-1", workdir, "0123456789abcdef")
@@ -9261,7 +9262,7 @@ func TestAutoBindUsesSessionShowPathBeforeStateDBWorkdirLookup(t *testing.T) {
 func TestAutoBindFindsCurrentSessionWhenNewerCodexSessionSharesWorkdir(t *testing.T) {
 	home := t.TempDir()
 	workdir := t.TempDir()
-	setTestHome(t, home)
+	testenv.PinHome(t, home)
 	isolateAutoBindEnv(t)
 	t.Setenv("AGENTDECK_PROFILE", "work")
 	writeAgentDeckStateDBRows(t, home, "work", []agentDeckStateDBRow{
@@ -9316,7 +9317,7 @@ func TestAutoBindFindsCurrentSessionWhenNewerCodexSessionSharesWorkdir(t *testin
 func TestAutoBindDoesNotRetryStateDBAfterEmptyResultWithoutAgentDeckSignal(t *testing.T) {
 	home := t.TempDir()
 	workdir := t.TempDir()
-	setTestHome(t, home)
+	testenv.PinHome(t, home)
 	isolateAutoBindEnv(t)
 	t.Setenv("AGENTDECK_PROFILE", "work")
 
@@ -9360,7 +9361,7 @@ func TestAutoBindDoesNotRetryStateDBAfterEmptyResultWithoutAgentDeckSignal(t *te
 func TestAutoBindRetriesAgentDeckStateDBAfterAgentDeckOnlyResult(t *testing.T) {
 	home := t.TempDir()
 	workdir := t.TempDir()
-	setTestHome(t, home)
+	testenv.PinHome(t, home)
 	isolateAutoBindEnv(t)
 	t.Setenv("AGENTDECK_PROFILE", "work")
 
@@ -9408,7 +9409,7 @@ func TestAutoBindRetriesAgentDeckStateDBAfterAgentDeckOnlyResult(t *testing.T) {
 
 func TestAutoBindSkipsBadAgentDeckDBAndFallsBackToCodexOnly(t *testing.T) {
 	home := t.TempDir()
-	setTestHome(t, home)
+	testenv.PinHome(t, home)
 	isolateAutoBindEnv(t)
 	t.Setenv("CODEX_THREAD_ID", "0123456789abcdef")
 	t.Setenv("AGENTDECK_PROFILE", "bad")
@@ -9445,7 +9446,7 @@ func TestAutoBindSkipsBadAgentDeckDBAndFallsBackToCodexOnly(t *testing.T) {
 
 func TestAutoBindRetriesAgentDeckAfterCodexOnlyFallback(t *testing.T) {
 	home := t.TempDir()
-	setTestHome(t, home)
+	testenv.PinHome(t, home)
 	isolateAutoBindEnv(t)
 	t.Setenv("CODEX_THREAD_ID", "0123456789abcdef")
 
@@ -9500,7 +9501,7 @@ func TestAutoBindRetriesAgentDeckAfterCodexOnlyFallback(t *testing.T) {
 
 func TestAutoBindRetriesAgentDeckAfterCodexFallbackWithExtraToolAddress(t *testing.T) {
 	home := t.TempDir()
-	setTestHome(t, home)
+	testenv.PinHome(t, home)
 	isolateAutoBindEnv(t)
 	t.Setenv("CODEX_THREAD_ID", "0123456789abcdef")
 	t.Setenv("CLAUDE_CODE_SESSION_ID", "aaaaaaaaaaaaaaaa")
@@ -9564,7 +9565,7 @@ func TestAutoBindRetriesAgentDeckAfterCodexFallbackWithExtraToolAddress(t *testi
 
 func TestAutoBindRetriesAgentDeckAfterClaudeOnlyFallback(t *testing.T) {
 	home := t.TempDir()
-	setTestHome(t, home)
+	testenv.PinHome(t, home)
 	isolateAutoBindEnv(t)
 	t.Setenv("CLAUDE_CODE_SESSION_ID", "aaaaaaaaaaaaaaaa")
 
@@ -9625,7 +9626,7 @@ func TestAutoBindRetriesAgentDeckAfterClaudeOnlyFallback(t *testing.T) {
 
 func TestWaypostBindDisablesAgentDeckRetryUpgrade(t *testing.T) {
 	home := t.TempDir()
-	setTestHome(t, home)
+	testenv.PinHome(t, home)
 	isolateAutoBindEnv(t)
 	t.Setenv("CODEX_THREAD_ID", "0123456789abcdef")
 
@@ -9730,7 +9731,7 @@ func TestWaypostBindManualOverrideWarnsWhenNoToolAddressRemains(t *testing.T) {
 
 func TestAgentDeckRetryRechecksFallbackStateBeforeUpgrade(t *testing.T) {
 	home := t.TempDir()
-	setTestHome(t, home)
+	testenv.PinHome(t, home)
 	isolateAutoBindEnv(t)
 	t.Setenv("CODEX_THREAD_ID", "0123456789abcdef")
 
@@ -9890,12 +9891,6 @@ func writeBrokenAgentDeckStateDB(t *testing.T, home, profile string) {
 	if _, err := db.Exec(`CREATE TABLE unrelated (id TEXT PRIMARY KEY)`); err != nil {
 		t.Fatalf("create broken state db table: %v", err)
 	}
-}
-
-func setTestHome(t *testing.T, home string) {
-	t.Helper()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
 }
 
 func isolateAutoBindEnv(t *testing.T) {

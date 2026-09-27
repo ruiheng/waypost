@@ -11,6 +11,7 @@ import (
 
 	"github.com/ruiheng/waypost/internal/mcpinstall"
 	"github.com/ruiheng/waypost/internal/mcpserver"
+	"github.com/ruiheng/waypost/internal/testenv"
 	"github.com/ruiheng/waypost/internal/version"
 	"github.com/ruiheng/waypost/internal/waypost"
 	"github.com/ruiheng/waypost/internal/webui"
@@ -74,6 +75,7 @@ func TestRunCodexHookEmitsHookSpecificOutput(t *testing.T) {
 
 func TestRunInstallAndDoctorCodexHook(t *testing.T) {
 	home := t.TempDir()
+	testenv.IsolateUserDirs(t, home)
 	t.Setenv("CODEX_HOME", home)
 
 	var installOutput bytes.Buffer
@@ -148,6 +150,7 @@ func TestRunClaudeHookEmitsHookSpecificOutput(t *testing.T) {
 
 func TestRunInstallAndDoctorClaudeHook(t *testing.T) {
 	configDir := t.TempDir()
+	testenv.IsolateUserDirs(t, configDir)
 	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
 
 	var installOutput bytes.Buffer
@@ -195,6 +198,7 @@ func TestRunInstallAndDoctorClaudeHook(t *testing.T) {
 
 func TestRunDoctorClaudeHookReportsCurrentDirectoryMCPProbeErrorWithoutFailing(t *testing.T) {
 	configDir := t.TempDir()
+	testenv.IsolateUserDirs(t, configDir)
 	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
 
 	installApp := New(strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
@@ -286,6 +290,7 @@ func TestRunInstallMCPServerHelp(t *testing.T) {
 
 func TestRunDoctorCodexHookReportsUnavailableCurrentDirectoryMCPWithoutFailing(t *testing.T) {
 	home := t.TempDir()
+	testenv.IsolateUserDirs(t, home)
 	t.Setenv("CODEX_HOME", home)
 
 	installApp := New(strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
@@ -308,6 +313,7 @@ func TestRunDoctorCodexHookReportsUnavailableCurrentDirectoryMCPWithoutFailing(t
 
 func TestRunDoctorCodexHookReportsCurrentDirectoryMCPProbeErrorWithoutFailing(t *testing.T) {
 	home := t.TempDir()
+	testenv.IsolateUserDirs(t, home)
 	t.Setenv("CODEX_HOME", home)
 
 	installApp := New(strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})

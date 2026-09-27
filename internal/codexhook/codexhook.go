@@ -8,10 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 
 	"github.com/ruiheng/waypost/internal/hookcore"
 	"github.com/ruiheng/waypost/internal/launchpath"
+	"github.com/ruiheng/waypost/internal/userdirs"
 )
 
 const (
@@ -241,14 +241,11 @@ func bashCommand(raw json.RawMessage) (string, error) {
 }
 
 func DefaultHome() (string, error) {
-	if configured := strings.TrimSpace(os.Getenv("CODEX_HOME")); configured != "" {
-		return filepath.Abs(configured)
-	}
-	home, err := os.UserHomeDir()
+	dir, err := userdirs.EnvOrHome("CODEX_HOME", os.UserHomeDir, ".codex")
 	if err != nil {
 		return "", fmt.Errorf("resolve user home for Codex hooks: %w", err)
 	}
-	return filepath.Join(home, ".codex"), nil
+	return dir, nil
 }
 
 func CurrentCommand() (string, error) {

@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/ruiheng/waypost/internal/userdirs"
 )
 
 const (
@@ -500,15 +502,11 @@ func resolveLegacyStateDir(override string) (string, error) {
 	if override != "" {
 		return filepath.Clean(override), nil
 	}
-	if value := os.Getenv("XDG_STATE_HOME"); value != "" {
-		return filepath.Join(value, legacyStateDirSuffix), nil
-	}
-
-	homeDir, err := os.UserHomeDir()
+	root, err := userdirs.StateRoot(os.UserHomeDir)
 	if err != nil {
 		return "", fmt.Errorf("resolve home directory: %w", err)
 	}
-	return filepath.Join(homeDir, ".local", "state", legacyStateDirSuffix), nil
+	return filepath.Join(root, legacyStateDirSuffix), nil
 }
 
 func newMigrationMarker(source, destination string) migrationMarker {

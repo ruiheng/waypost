@@ -17,6 +17,7 @@ import (
 	"github.com/ruiheng/waypost/internal/hookcore"
 	"github.com/ruiheng/waypost/internal/jsonc"
 	"github.com/ruiheng/waypost/internal/launchpath"
+	"github.com/ruiheng/waypost/internal/userdirs"
 )
 
 const (
@@ -369,10 +370,9 @@ func shouldConfigureDevin(home, mcpConfigPath string, lookPath func(string) (str
 }
 
 func claudeConfigPath(home string) string {
-	if configured := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); configured != "" {
-		return filepath.Join(configured, claudeConfigName)
-	}
-	return filepath.Join(home, claudeConfigName)
+	// AtHome never fails; env overrides come back normalized to absolute paths.
+	dir, _ := userdirs.EnvOrHome("CLAUDE_CONFIG_DIR", userdirs.AtHome(home))
+	return filepath.Join(dir, claudeConfigName)
 }
 
 func devinMCPConfigPath(home string) string {

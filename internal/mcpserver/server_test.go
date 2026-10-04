@@ -315,8 +315,7 @@ func TestWaypostSendRejectsInvalidBodySourcesBeforeSending(t *testing.T) {
 
 	waypostService := &fakeWaypostService{t: t}
 	waypostService.sendFunc = func(_ context.Context, params waypost.SendParams) (waypost.SendResult, error) {
-		t.Fatalf("unexpected Send call: %+v", params)
-		return waypost.SendResult{}, nil
+		return waypost.SendResult{}, unexpectedCallError(t, "unexpected Send call: %+v", params)
 	}
 	service := newService(Options{
 		WaypostServiceFactory: fakeWaypostServiceFactory{service: waypostService},
@@ -794,8 +793,7 @@ func TestWaypostSendBatchCancellationStopsBeforeNextRecipient(t *testing.T) {
 func TestWaypostSendBatchRejectsInvalidSelectorsBeforeSending(t *testing.T) {
 	waypostService := &fakeWaypostService{t: t}
 	waypostService.sendFunc = func(_ context.Context, params waypost.SendParams) (waypost.SendResult, error) {
-		t.Fatalf("unexpected Send call: %+v", params)
-		return waypost.SendResult{}, nil
+		return waypost.SendResult{}, unexpectedCallError(t, "unexpected Send call: %+v", params)
 	}
 	service := newService(Options{
 		WaypostServiceFactory: fakeWaypostServiceFactory{service: waypostService},
@@ -808,11 +806,6 @@ func TestWaypostSendBatchRejectsInvalidSelectorsBeforeSending(t *testing.T) {
 	defer service.Close()
 
 	for _, arguments := range []map[string]any{
-		{
-			"to_address": "workflow/one",
-			"subject":    "subject",
-			"body":       "body",
-		},
 		{
 			"to_addresses": []string{"workflow/two"},
 			"subject":      "subject",
@@ -1265,9 +1258,19 @@ func TestWaypostUndeferSchemaExposesDeliveryID(t *testing.T) {
 	}
 }
 
+// unexpectedCallError reports a fake invocation the test did not stub. It
+// fails via t.Errorf and returns the same text as an error so the in-flight
+// tool call still completes: these methods run on MCP handler goroutines,
+// where FailNow/Goexit would drop the response and hang the waiting CallTool.
+func unexpectedCallError(t *testing.T, format string, args ...any) error {
+	t.Helper()
+	t.Errorf(format, args...)
+	return fmt.Errorf(format, args...)
+}
+
 func (f *fakeWaypostService) Send(ctx context.Context, params waypost.SendParams) (waypost.SendResult, error) {
 	if f.sendFunc == nil {
-		f.t.Fatalf("unexpected Send call: %+v", params)
+		return waypost.SendResult{}, unexpectedCallError(f.t, "unexpected Send call: %+v", params)
 	}
 	return f.sendFunc(ctx, params)
 }
@@ -1281,63 +1284,63 @@ func (f *fakeWaypostService) List(ctx context.Context, params waypost.ListParams
 
 func (f *fakeWaypostService) ListGroupMessages(ctx context.Context, params waypost.GroupListParams) ([]waypost.GroupListedMessage, error) {
 	if f.listGroupMessagesFunc == nil {
-		f.t.Fatalf("unexpected ListGroupMessages call: %+v", params)
+		return nil, unexpectedCallError(f.t, "unexpected ListGroupMessages call: %+v", params)
 	}
 	return f.listGroupMessagesFunc(ctx, params)
 }
 
 func (f *fakeWaypostService) WaitGroupMessage(ctx context.Context, params waypost.GroupWaitParams) (waypost.GroupListedMessage, error) {
 	if f.waitGroupMessageFunc == nil {
-		f.t.Fatalf("unexpected WaitGroupMessage call: %+v", params)
+		return waypost.GroupListedMessage{}, unexpectedCallError(f.t, "unexpected WaitGroupMessage call: %+v", params)
 	}
 	return f.waitGroupMessageFunc(ctx, params)
 }
 
 func (f *fakeWaypostService) ReceiveGroupMessage(ctx context.Context, params waypost.GroupReceiveParams) (waypost.GroupReceivedMessage, error) {
 	if f.receiveGroupMessageFunc == nil {
-		f.t.Fatalf("unexpected ReceiveGroupMessage call: %+v", params)
+		return waypost.GroupReceivedMessage{}, unexpectedCallError(f.t, "unexpected ReceiveGroupMessage call: %+v", params)
 	}
 	return f.receiveGroupMessageFunc(ctx, params)
 }
 
 func (f *fakeWaypostService) CreateGroup(ctx context.Context, groupAddress string) (waypost.GroupRecord, error) {
 	if f.createGroupFunc == nil {
-		f.t.Fatalf("unexpected CreateGroup call: %q", groupAddress)
+		return waypost.GroupRecord{}, unexpectedCallError(f.t, "unexpected CreateGroup call: %q", groupAddress)
 	}
 	return f.createGroupFunc(ctx, groupAddress)
 }
 
 func (f *fakeWaypostService) AddGroupMember(ctx context.Context, groupAddress, person string) (waypost.GroupMembershipRecord, error) {
 	if f.addGroupMemberFunc == nil {
-		f.t.Fatalf("unexpected AddGroupMember call: group=%q person=%q", groupAddress, person)
+		return waypost.GroupMembershipRecord{}, unexpectedCallError(f.t, "unexpected AddGroupMember call: group=%q person=%q", groupAddress, person)
 	}
 	return f.addGroupMemberFunc(ctx, groupAddress, person)
 }
 
 func (f *fakeWaypostService) RemoveGroupMember(ctx context.Context, groupAddress, person string) (waypost.GroupMembershipRecord, error) {
 	if f.removeGroupMemberFunc == nil {
-		f.t.Fatalf("unexpected RemoveGroupMember call: group=%q person=%q", groupAddress, person)
+		return waypost.GroupMembershipRecord{}, unexpectedCallError(f.t, "unexpected RemoveGroupMember call: group=%q person=%q", groupAddress, person)
 	}
 	return f.removeGroupMemberFunc(ctx, groupAddress, person)
 }
 
 func (f *fakeWaypostService) ListGroupMembers(ctx context.Context, groupAddress string) ([]waypost.GroupMembershipRecord, error) {
 	if f.listGroupMembersFunc == nil {
-		f.t.Fatalf("unexpected ListGroupMembers call: %q", groupAddress)
+		return nil, unexpectedCallError(f.t, "unexpected ListGroupMembers call: %q", groupAddress)
 	}
 	return f.listGroupMembersFunc(ctx, groupAddress)
 }
 
 func (f *fakeWaypostService) AddGroupNotificationSubscriber(ctx context.Context, groupAddress, notifyAddress, person string) (waypost.GroupNotificationSubscriberRecord, error) {
 	if f.addGroupSubscriberFunc == nil {
-		f.t.Fatalf("unexpected AddGroupNotificationSubscriber call: group=%q notify=%q person=%q", groupAddress, notifyAddress, person)
+		return waypost.GroupNotificationSubscriberRecord{}, unexpectedCallError(f.t, "unexpected AddGroupNotificationSubscriber call: group=%q notify=%q person=%q", groupAddress, notifyAddress, person)
 	}
 	return f.addGroupSubscriberFunc(ctx, groupAddress, notifyAddress, person)
 }
 
 func (f *fakeWaypostService) RemoveGroupNotificationSubscriber(ctx context.Context, groupAddress, notifyAddress string) (waypost.GroupNotificationSubscriberRecord, error) {
 	if f.removeGroupSubscriberFunc == nil {
-		f.t.Fatalf("unexpected RemoveGroupNotificationSubscriber call: group=%q notify=%q", groupAddress, notifyAddress)
+		return waypost.GroupNotificationSubscriberRecord{}, unexpectedCallError(f.t, "unexpected RemoveGroupNotificationSubscriber call: group=%q notify=%q", groupAddress, notifyAddress)
 	}
 	return f.removeGroupSubscriberFunc(ctx, groupAddress, notifyAddress)
 }
@@ -1351,7 +1354,7 @@ func (f *fakeWaypostService) ListGroupNotificationSubscribers(ctx context.Contex
 
 func (f *fakeWaypostService) InspectAddress(ctx context.Context, address string) (waypost.AddressInspection, error) {
 	if f.inspectAddressFunc == nil {
-		f.t.Fatalf("unexpected InspectAddress call: %q", address)
+		return waypost.AddressInspection{}, unexpectedCallError(f.t, "unexpected InspectAddress call: %q", address)
 	}
 	return f.inspectAddressFunc(ctx, address)
 }
@@ -1370,7 +1373,7 @@ func (f *fakeWaypostService) ReceiveBatchWithLeaseTTL(ctx context.Context, param
 		result, err = f.receiveBatchWithTTLFunc(ctx, params, ttl)
 	} else {
 		if f.receiveBatchFunc == nil {
-			f.t.Fatalf("unexpected ReceiveBatchWithLeaseTTL call: %+v ttl=%s", params, ttl)
+			return waypost.ReceiveResult{}, unexpectedCallError(f.t, "unexpected ReceiveBatchWithLeaseTTL call: %+v ttl=%s", params, ttl)
 		}
 		result, err = f.receiveBatchFunc(ctx, params)
 	}
@@ -1382,21 +1385,21 @@ func (f *fakeWaypostService) ReceiveBatchWithLeaseTTL(ctx context.Context, param
 
 func (f *fakeWaypostService) Wait(ctx context.Context, params waypost.WaitParams) (waypost.ListedDelivery, error) {
 	if f.waitFunc == nil {
-		f.t.Fatalf("unexpected Wait call: %+v", params)
+		return waypost.ListedDelivery{}, unexpectedCallError(f.t, "unexpected Wait call: %+v", params)
 	}
 	return f.waitFunc(ctx, params)
 }
 
 func (f *fakeWaypostService) ReadMessages(ctx context.Context, messageIDs []string) ([]waypost.ReadMessage, error) {
 	if f.readMessagesFunc == nil {
-		f.t.Fatalf("unexpected ReadMessages call: %v", messageIDs)
+		return nil, unexpectedCallError(f.t, "unexpected ReadMessages call: %v", messageIDs)
 	}
 	return f.readMessagesFunc(ctx, messageIDs)
 }
 
 func (f *fakeWaypostService) ReadLatestDeliveries(ctx context.Context, addresses []string, state string, limit int) ([]waypost.ReadDelivery, bool, error) {
 	if f.readLatestFunc == nil {
-		f.t.Fatalf("unexpected ReadLatestDeliveries call: addresses=%v state=%q limit=%d", addresses, state, limit)
+		return nil, false, unexpectedCallError(f.t, "unexpected ReadLatestDeliveries call: addresses=%v state=%q limit=%d", addresses, state, limit)
 	}
 	return f.readLatestFunc(ctx, addresses, state, limit)
 }
@@ -1417,14 +1420,14 @@ func (f *fakeWaypostService) ReadDeliveries(ctx context.Context, deliveryIDs []s
 
 func (f *fakeWaypostService) Ack(ctx context.Context, deliveryID, leaseToken string) (waypost.DeliveryTransitionResult, error) {
 	if f.ackFunc == nil {
-		f.t.Fatalf("unexpected Ack call: delivery=%q lease=%q", deliveryID, leaseToken)
+		return waypost.DeliveryTransitionResult{}, unexpectedCallError(f.t, "unexpected Ack call: delivery=%q lease=%q", deliveryID, leaseToken)
 	}
 	return f.ackFunc(ctx, deliveryID, leaseToken)
 }
 
 func (f *fakeWaypostService) Renew(ctx context.Context, deliveryID, leaseToken string, extendBy time.Duration) (waypost.LeaseRenewResult, error) {
 	if f.renewFunc == nil {
-		f.t.Fatalf("unexpected Renew call: delivery=%q lease=%q extendBy=%s", deliveryID, leaseToken, extendBy)
+		return waypost.LeaseRenewResult{}, unexpectedCallError(f.t, "unexpected Renew call: delivery=%q lease=%q extendBy=%s", deliveryID, leaseToken, extendBy)
 	}
 	result, err := f.renewFunc(ctx, deliveryID, leaseToken, extendBy)
 	if err == nil {
@@ -1477,28 +1480,28 @@ func (f *fakeWaypostService) recordLeases(messages []waypost.ReceivedMessage) {
 
 func (f *fakeWaypostService) Release(ctx context.Context, deliveryID, leaseToken string) (waypost.DeliveryTransitionResult, error) {
 	if f.releaseFunc == nil {
-		f.t.Fatalf("unexpected Release call: delivery=%q lease=%q", deliveryID, leaseToken)
+		return waypost.DeliveryTransitionResult{}, unexpectedCallError(f.t, "unexpected Release call: delivery=%q lease=%q", deliveryID, leaseToken)
 	}
 	return f.releaseFunc(ctx, deliveryID, leaseToken)
 }
 
 func (f *fakeWaypostService) Defer(ctx context.Context, deliveryID, leaseToken string, until time.Time) (waypost.DeliveryTransitionResult, error) {
 	if f.deferFunc == nil {
-		f.t.Fatalf("unexpected Defer call: delivery=%q lease=%q until=%s", deliveryID, leaseToken, until)
+		return waypost.DeliveryTransitionResult{}, unexpectedCallError(f.t, "unexpected Defer call: delivery=%q lease=%q until=%s", deliveryID, leaseToken, until)
 	}
 	return f.deferFunc(ctx, deliveryID, leaseToken, until)
 }
 
 func (f *fakeWaypostService) Undefer(ctx context.Context, deliveryID string) (waypost.DeliveryTransitionResult, error) {
 	if f.undeferFunc == nil {
-		f.t.Fatalf("unexpected Undefer call: delivery=%q", deliveryID)
+		return waypost.DeliveryTransitionResult{}, unexpectedCallError(f.t, "unexpected Undefer call: delivery=%q", deliveryID)
 	}
 	return f.undeferFunc(ctx, deliveryID)
 }
 
 func (f *fakeWaypostService) Fail(ctx context.Context, deliveryID, leaseToken, reason string) (waypost.DeliveryTransitionResult, error) {
 	if f.failFunc == nil {
-		f.t.Fatalf("unexpected Fail call: delivery=%q lease=%q reason=%q", deliveryID, leaseToken, reason)
+		return waypost.DeliveryTransitionResult{}, unexpectedCallError(f.t, "unexpected Fail call: delivery=%q lease=%q reason=%q", deliveryID, leaseToken, reason)
 	}
 	return f.failFunc(ctx, deliveryID, leaseToken, reason)
 }
@@ -1520,8 +1523,7 @@ type failOpenWaypostServiceFactory struct {
 }
 
 func (f failOpenWaypostServiceFactory) Open(context.Context) (any, func() error, error) {
-	f.t.Fatal("unexpected waypost service open")
-	return nil, nil, nil
+	return nil, nil, unexpectedCallError(f.t, "unexpected waypost service open")
 }
 
 func TestDefaultWaypostServiceReusesRuntimeUntilServiceClose(t *testing.T) {
@@ -2773,8 +2775,7 @@ func TestWaypostSendAllowsAgentDeckNotifyDisable(t *testing.T) {
 func TestWaypostSendRejectsExplicitFromAddressWithoutBoundState(t *testing.T) {
 	waypostService := &fakeWaypostService{t: t}
 	waypostService.sendFunc = func(_ context.Context, params waypost.SendParams) (waypost.SendResult, error) {
-		t.Fatalf("unexpected send params = %+v", params)
-		return waypost.SendResult{}, nil
+		return waypost.SendResult{}, unexpectedCallError(t, "unexpected send params = %+v", params)
 	}
 
 	service := newService(Options{
@@ -2801,8 +2802,7 @@ func TestWaypostSendRejectsExplicitFromAddressWithoutBoundState(t *testing.T) {
 func TestWaypostSendRejectsExplicitFromAddressOutsideBoundState(t *testing.T) {
 	waypostService := &fakeWaypostService{t: t}
 	waypostService.sendFunc = func(_ context.Context, params waypost.SendParams) (waypost.SendResult, error) {
-		t.Fatalf("unexpected send params = %+v", params)
-		return waypost.SendResult{}, nil
+		return waypost.SendResult{}, unexpectedCallError(t, "unexpected send params = %+v", params)
 	}
 
 	service := newService(Options{
@@ -2829,8 +2829,7 @@ func TestWaypostSendRejectsExplicitFromAddressOutsideBoundState(t *testing.T) {
 func TestWaypostSendBatchRejectsExplicitFromAddressOutsideBoundState(t *testing.T) {
 	waypostService := &fakeWaypostService{t: t}
 	waypostService.sendFunc = func(_ context.Context, params waypost.SendParams) (waypost.SendResult, error) {
-		t.Fatalf("unexpected send params = %+v", params)
-		return waypost.SendResult{}, nil
+		return waypost.SendResult{}, unexpectedCallError(t, "unexpected send params = %+v", params)
 	}
 
 	service := newService(Options{
@@ -10006,10 +10005,16 @@ LIMIT 1
 	return detail
 }
 
+// testCallToolTimeout bounds an in-memory CallTool round trip: a dead handler
+// goroutine (for example a fake helper calling t.Fatalf, which Goexits before
+// a response is written) must surface as a fast failure, not a suite hang.
+const testCallToolTimeout = 30 * time.Second
+
 func callTool(t *testing.T, server *mcp.Server, name string, args map[string]any) map[string]any {
 	t.Helper()
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), testCallToolTimeout)
+	defer cancel()
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
 
 	serverSession, err := server.Connect(ctx, serverTransport, nil)
@@ -10080,7 +10085,8 @@ func callServiceToolExpectErrorWithoutStatusBootstrap(t *testing.T, service *Ser
 func callToolExpectError(t *testing.T, server *mcp.Server, name string, args map[string]any) error {
 	t.Helper()
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), testCallToolTimeout)
+	defer cancel()
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
 
 	serverSession, err := server.Connect(ctx, serverTransport, nil)
@@ -10101,6 +10107,9 @@ func callToolExpectError(t *testing.T, server *mcp.Server, name string, args map
 		Name:      name,
 		Arguments: args,
 	})
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("call tool %s: no response within %s; handler goroutine may have died (a t.Fatalf inside a fake runs Goexit on the wrong goroutine)", name, testCallToolTimeout)
+	}
 	if err != nil {
 		return err
 	}

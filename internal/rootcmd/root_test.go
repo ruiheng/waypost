@@ -593,7 +593,7 @@ func TestRunGroupWebHelp(t *testing.T) {
 func TestRunDelegatesWaypostCommandsWithStateDir(t *testing.T) {
 	t.Parallel()
 
-	stateDir := t.TempDir()
+	stateDir := filepath.Join(t.TempDir(), "waypost-state")
 	var stdout bytes.Buffer
 	app := New(strings.NewReader(""), &stdout, &bytes.Buffer{})
 
@@ -614,7 +614,7 @@ func TestRunDelegatesWaypostCommandsWithStateDir(t *testing.T) {
 func TestRunSendNotifyUsesConfiguredNotifier(t *testing.T) {
 	t.Parallel()
 
-	stateDir := t.TempDir()
+	stateDir := filepath.Join(t.TempDir(), "waypost-state")
 	var stdout bytes.Buffer
 	app := New(strings.NewReader("body\n"), &stdout, &bytes.Buffer{})
 	app.notifyWaypostSend = func(_ context.Context, _ *waypost.Store, request waypost.SendNotificationRequest) waypost.SendNotificationOutcome {

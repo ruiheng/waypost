@@ -16,8 +16,8 @@ durable-state Waypost capability surface available through CLI.
 
 ## Hard-Cut Decision
 
-Waypost MCP exposes exactly twelve tools by default. `waypost_debug` is a
-thirteenth, explicitly opt-in diagnostic tool enabled only by `waypost mcp
+Waypost MCP exposes exactly ten tools by default. `waypost_debug` is an
+eleventh, explicitly opt-in diagnostic tool enabled only by `waypost mcp
 --include-debug-tool`; there is no legacy tool set, capability manifest, or
 runtime capability registry.
 
@@ -36,8 +36,6 @@ The default retained tools are:
 - `waypost_ack`
 - `waypost_release`
 - `waypost_defer`
-- `agent_deck_create_session`
-- `agent_deck_require_session`
 - `session_create`
 - `session_require`
 
@@ -53,15 +51,17 @@ read-only diagnostics for an explicitly requested diagnostic session.
 message path. Receive and these common lease transitions also interact with
 the MCP active-lease tracker and renewal loop.
 
-The two Agent Deck session tools remain because they are frequent structured
-operations. The two host-neutral session tools cover the fixed Agent Deck and
+The two host-neutral session tools cover the fixed Agent Deck and
 Thurbox host set; they do not expose a generic lifecycle or command surface.
 `session_require` owns both lookup and readiness enforcement: it returns
 `not_found` for an absent target and accepts `auto_restart=false` for read-only
 inspection. There is no separate resolve tool. `session_create` accepts the
 optional caller-supplied opaque launch values `full_command_line` and
 `thurbox_agent_key`; after host selection it consumes only the applicable
-value and does not resolve roles or profiles.
+value and does not resolve roles or profiles. For Agent Deck it also accepts
+`transition_notify` and `assert_done`, which opt back into Agent Deck's
+native child-to-parent notifications; both default to suppression and are
+ignored for Thurbox.
 
 Lease lifecycle operations stay separate. There is no synthetic `settle`
 operation.
@@ -194,11 +194,10 @@ func registerWaypostTools(server *mcp.Server) {
     registerMessagePath(server)
     registerLeaseLifecycle(server)
     registerGenericSessionTools(server)
-    registerAgentDeckSessionTools(server)
 }
 ```
 
-Tests assert the exact twelve default tool names and the thirteen names when
+Tests assert the exact ten default tool names and the eleven names when
 the debug flag is enabled. A removed tool appearing in either MCP list is a
 test failure.
 
@@ -619,7 +618,7 @@ Topic responsibilities:
   testing their commands keeps them version-matched.
 - Remaining-state counting adds receive-path work. The index, query-plan test,
   rollback invariant, and benchmark bound the risk.
-- Thirteen tools are not the theoretical minimum, but each retained tool is
+- Eleven tools are not the theoretical minimum, but each retained tool is
   justified by frequency or live MCP state.
 
 ## Rejected Alternatives
@@ -648,8 +647,10 @@ them as tools.
 
 ### Move Agent Deck session tools to CLI
 
-Rejected because they are frequent structured operations and are explicitly
-retained.
+Rejected. Session creation and readiness enforcement are frequent structured
+operations that need host adapters inside the long-running MCP process. The
+dedicated `agent_deck_*` tools were removed in favor of the host-neutral
+`session_create` and `session_require`, not moved to CLI.
 
 ### Generic `waypost_command` MCP tool
 

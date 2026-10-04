@@ -257,8 +257,6 @@ The default Go MCP entrypoint exposes these Waypost tools:
 - `waypost_ack`
 - `waypost_release`
 - `waypost_defer`
-- `agent_deck_create_session`
-- `agent_deck_require_session`
 - `session_create`
 - `session_require`
 
@@ -276,6 +274,14 @@ and ignored.
 For generic Agent Deck creation, the adapter inherits the direct parent's
 non-empty group from its preflight snapshot; callers do not provide a group
 field. Root-group and nested-parent cases are rejected before launch.
+
+Created Agent Deck sessions suppress Agent Deck's own child-to-parent
+notifications by default: launches pass `--no-transition-notify` (no
+status-transition or done events into the parent's inbox) and
+`--no-assert-done` (no `===AGENTDECK_DONE===` instruction appended to the
+startup message). Waypost remains the notification channel between sessions.
+Set `transition_notify = true` or `assert_done = true` to keep the native
+Agent Deck behavior instead; both switches are ignored for Thurbox.
 
 Call `waypost_status` once after starting each MCP server process. It
 auto-binds detectable session addresses from `agent-deck session current`,
@@ -384,15 +390,8 @@ directory. `waypost wait --json` observes work without claiming it; after it
 returns a message, call MCP `waypost_recv` to claim a personal delivery. See
 [`docs/cli.md`](docs/cli.md) for the CLI forms and group behavior.
 
-`agent_deck_create_session` is for lifecycle allocation only. It creates a new
-session, errors if the target already exists, supports explicit group placement
-through `group_path` or `group_parent_session_id` plus `child_group_name`, and
-can launch detached sessions with `no_parent_link = true`. `startup_instruction`
-is optional startup-only input passed to `agent-deck launch --message`; do not
-use it for task payloads or normal wakeups.
-
-`session_require` and `agent_deck_require_session` are the session lookup and
-send-time guards. They never create a session. Each resolves `session_id` or
+`session_require` is the session lookup and
+send-time guard. It never creates a session. It resolves `session_id` or
 `session_ref`, returns `status = not_found` without an MCP error when the
 target is absent, verifies an existing target belongs to the explicit
 `workdir`, and starts it if needed. `auto_restart` defaults to `true`; set it

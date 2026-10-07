@@ -11,15 +11,29 @@ const (
 	genericAgentDeckGroupMismatchDetail    = "refreshed agent-deck session group does not match the parent group snapshot"
 )
 
+// agentDeckSwitches carries the opt-in Agent Deck launch behaviors that
+// session_create suppresses by default; every field is ignored for other
+// hosts.
+type agentDeckSwitches struct {
+	transitionNotify bool
+	assertDone       bool
+}
+
 // launchAgentDeckSession runs agent-deck launch and parses its receipt. A nil
 // result with nil error means the host returned unusable output and the
 // caller must report create recovery rather than a generic failure.
-func (m *sessionManager) launchAgentDeckSession(ctx context.Context, name, launchValue, group, parentSessionID, workdir string, transitionNotify, assertDone bool) (*hostSessionData, error) {
+//
+// --no-identity is unconditional: sessions created here coordinate through
+// waypost, so the agent-deck identity block (CLI reference, skills pointer,
+// completion-sentinel convention) is dead weight in the child's system
+// prompt. Waypost auto-binding is unaffected — AGENTDECK_INSTANCE_ID is
+// exported to the child's environment regardless.
+func (m *sessionManager) launchAgentDeckSession(ctx context.Context, name, launchValue, group, parentSessionID, workdir string, switches agentDeckSwitches) (*hostSessionData, error) {
 	launchArgs := []string{
 		"agent-deck", "launch", "--json", "--title", name, "--cmd", launchValue,
-		"--group", group, "--parent", parentSessionID,
+		"--group", group, "--parent", parentSessionID, "--no-identity",
 	}
-	launchArgs = append(launchArgs, agentDeckNotificationArgs(transitionNotify, assertDone)...)
+	launchArgs = append(launchArgs, agentDeckSuppressionArgs(switches)...)
 	launchArgs = append(launchArgs, workdir)
 	result, err := runRedactedCommand(ctx, m.runner, launchArgs, runOptions{}, "generic agent-deck session create")
 	if err != nil {
@@ -47,17 +61,17 @@ func hostSessionFromAgentDeck(data *sessionData) *hostSessionData {
 	}
 }
 
-// agentDeckNotificationArgs maps the create-tool notification switches onto
-// agent-deck launch flags. Both default to suppressed: waypost is the
-// notification channel for sessions this tool creates, so child-to-parent
-// transition events and the completion-sentinel instruction stay off unless
-// a caller explicitly opts back in.
-func agentDeckNotificationArgs(transitionNotify, assertDone bool) []string {
+// agentDeckSuppressionArgs maps the create-tool switches onto agent-deck
+// launch flags. Both default to suppressed: waypost is the notification
+// channel for sessions this tool creates, so child-to-parent transition
+// events and the completion-sentinel instruction stay off unless a caller
+// explicitly opts back in.
+func agentDeckSuppressionArgs(switches agentDeckSwitches) []string {
 	var args []string
-	if !transitionNotify {
+	if !switches.transitionNotify {
 		args = append(args, "--no-transition-notify")
 	}
-	if !assertDone {
+	if !switches.assertDone {
 		args = append(args, "--no-assert-done")
 	}
 	return args

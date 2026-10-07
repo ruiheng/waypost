@@ -192,7 +192,7 @@ func selectedHostLaunchValue(host sessionHost, fullCommandLine, thurboxAgentKey 
 	}
 }
 
-func (m *sessionManager) createHostSession(ctx context.Context, host sessionHost, name, workdir, parentSessionID, fullCommandLine, thurboxAgentKey string, transitionNotify, assertDone bool) (map[string]any, error) {
+func (m *sessionManager) createHostSession(ctx context.Context, host sessionHost, name, workdir, parentSessionID, fullCommandLine, thurboxAgentKey string, switches agentDeckSwitches) (map[string]any, error) {
 	name, err := validateGenericSessionName(name)
 	if err != nil {
 		return nil, err
@@ -248,7 +248,7 @@ func (m *sessionManager) createHostSession(ctx context.Context, host sessionHost
 	var created *hostSessionData
 	switch host {
 	case sessionHostAgentDeck:
-		created, err = m.launchAgentDeckSession(ctx, name, launchValue, parentGroupSnapshot, parentSessionID, canonicalWorkdir, transitionNotify, assertDone)
+		created, err = m.launchAgentDeckSession(ctx, name, launchValue, parentGroupSnapshot, parentSessionID, canonicalWorkdir, switches)
 	case sessionHostThurbox:
 		created, err = m.createThurboxSession(ctx, name, launchValue, parentSessionID, canonicalWorkdir)
 	default:

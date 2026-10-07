@@ -61,7 +61,10 @@ optional caller-supplied opaque launch values `full_command_line` and
 value and does not resolve roles or profiles. For Agent Deck it also accepts
 `transition_notify` and `assert_done`, which opt back into Agent Deck's
 native child-to-parent notifications; both default to suppression and are
-ignored for Thurbox.
+ignored for Thurbox. Agent Deck launches always pass `--no-identity`: the
+identity block is dead weight for waypost-coordinated sessions, and the
+`AGENTDECK_INSTANCE_ID` environment export used for auto-binding is
+unaffected.
 
 Lease lifecycle operations stay separate. There is no synthetic `settle`
 operation.

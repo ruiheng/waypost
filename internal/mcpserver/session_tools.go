@@ -49,7 +49,10 @@ func (s *Service) sessionCreate(ctx context.Context, _ *mcp.CallToolRequest, inp
 	if err != nil {
 		return nil, nil, err
 	}
-	out, err := s.sessions.createHostSession(ctx, host, input.SessionName, input.Workdir, input.ParentSessionID, input.FullCommandLine, input.ThurboxAgentKey, input.TransitionNotify, input.AssertDone)
+	out, err := s.sessions.createHostSession(ctx, host, input.SessionName, input.Workdir, input.ParentSessionID, input.FullCommandLine, input.ThurboxAgentKey, agentDeckSwitches{
+		transitionNotify: input.TransitionNotify,
+		assertDone:       input.AssertDone,
+	})
 	if err != nil {
 		return nil, nil, err
 	}

@@ -32,7 +32,7 @@ func TestGenericSessionToolSchemasAreHostNeutral(t *testing.T) {
 			t.Fatalf("create required fields = %v, want %q", createSchema.Required, field)
 		}
 	}
-	for _, field := range []string{"launch_profile", "ensure_cmd", "group_path", "startup_instruction", "thurbox_agent"} {
+	for _, field := range []string{"launch_profile", "ensure_cmd", "group_path", "startup_instruction", "thurbox_agent", "inject_identity"} {
 		if _, ok := createSchema.Properties[field]; ok {
 			t.Fatalf("generic create schema unexpectedly exposes host-specific %q", field)
 		}
@@ -59,7 +59,7 @@ func TestGenericSessionToolSchemasAreHostNeutral(t *testing.T) {
 	if containsString(requireSchema.Required, "auto_restart") {
 		t.Fatalf("generic require schema unexpectedly requires auto_restart: %v", requireSchema.Required)
 	}
-	for _, field := range []string{"launch_profile", "full_command_line", "thurbox_agent_key", "ensure_cmd", "group_path"} {
+	for _, field := range []string{"launch_profile", "full_command_line", "thurbox_agent_key", "ensure_cmd", "group_path", "transition_notify", "assert_done", "inject_identity"} {
 		if _, ok := requireSchema.Properties[field]; ok {
 			t.Fatalf("generic require schema unexpectedly exposes %q", field)
 		}
@@ -459,7 +459,7 @@ func TestGenericAgentDeckCreateAllowsDifferentParentWorkdirAndUsesAuthoritativeR
 			return RunResult{ExitCode: 0, Stdout: parent}, nil
 		case reflect.DeepEqual(args, []string{"agent-deck", "session", "show", "architect-reviewer", "--json"}):
 			return RunResult{ExitCode: 2, Stderr: "not found"}, nil
-		case reflect.DeepEqual(args, []string{"agent-deck", "launch", "--json", "--title", "architect-reviewer", "--cmd", "codex --model gpt-5.6", "--group", "waypost", "--parent", "agent-parent", "--no-transition-notify", "--no-assert-done", canonicalWorkdir}):
+		case reflect.DeepEqual(args, []string{"agent-deck", "launch", "--json", "--title", "architect-reviewer", "--cmd", "codex --model gpt-5.6", "--group", "waypost", "--parent", "agent-parent", "--no-identity", "--no-transition-notify", "--no-assert-done", canonicalWorkdir}):
 			launchCalls++
 			return RunResult{ExitCode: 0, Stdout: launchReceipt}, nil
 		case reflect.DeepEqual(args, []string{"agent-deck", "session", "show", "agent-child", "--json"}):
@@ -507,7 +507,7 @@ func TestGenericAgentDeckCreateNotificationSwitchesOptIn(t *testing.T) {
 			return RunResult{ExitCode: 0, Stdout: parent}, nil
 		case reflect.DeepEqual(args, []string{"agent-deck", "session", "show", "architect-reviewer", "--json"}):
 			return RunResult{ExitCode: 2, Stderr: "not found"}, nil
-		case reflect.DeepEqual(args, []string{"agent-deck", "launch", "--json", "--title", "architect-reviewer", "--cmd", "claude", "--group", "waypost", "--parent", "agent-parent", canonicalWorkdir}):
+		case reflect.DeepEqual(args, []string{"agent-deck", "launch", "--json", "--title", "architect-reviewer", "--cmd", "claude", "--group", "waypost", "--parent", "agent-parent", "--no-identity", canonicalWorkdir}):
 			return RunResult{ExitCode: 0, Stdout: `{"id":"agent-child"}`}, nil
 		case reflect.DeepEqual(args, []string{"agent-deck", "session", "show", "agent-child", "--json"}):
 			return RunResult{ExitCode: 0, Stdout: refreshed}, nil
@@ -536,22 +536,21 @@ func TestGenericAgentDeckCreateNotificationSwitchesOptIn(t *testing.T) {
 	}
 }
 
-func TestAgentDeckNotificationArgs(t *testing.T) {
+func TestAgentDeckSuppressionArgs(t *testing.T) {
 	for _, test := range []struct {
-		name             string
-		transitionNotify bool
-		assertDone       bool
-		want             []string
+		name     string
+		switches agentDeckSwitches
+		want     []string
 	}{
-		{name: "suppression is the default", transitionNotify: false, assertDone: false, want: []string{"--no-transition-notify", "--no-assert-done"}},
-		{name: "transition notify opt-in only", transitionNotify: true, assertDone: false, want: []string{"--no-assert-done"}},
-		{name: "assert done opt-in only", transitionNotify: false, assertDone: true, want: []string{"--no-transition-notify"}},
-		{name: "both opt-in", transitionNotify: true, assertDone: true, want: nil},
+		{name: "suppression is the default", switches: agentDeckSwitches{}, want: []string{"--no-transition-notify", "--no-assert-done"}},
+		{name: "transition notify opt-in only", switches: agentDeckSwitches{transitionNotify: true}, want: []string{"--no-assert-done"}},
+		{name: "assert done opt-in only", switches: agentDeckSwitches{assertDone: true}, want: []string{"--no-transition-notify"}},
+		{name: "all opt-in", switches: agentDeckSwitches{transitionNotify: true, assertDone: true}, want: nil},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got := agentDeckNotificationArgs(test.transitionNotify, test.assertDone)
+			got := agentDeckSuppressionArgs(test.switches)
 			if !reflect.DeepEqual(got, test.want) {
-				t.Fatalf("agentDeckNotificationArgs(%v, %v) = %v, want %v", test.transitionNotify, test.assertDone, got, test.want)
+				t.Fatalf("agentDeckSuppressionArgs(%+v) = %v, want %v", test.switches, got, test.want)
 			}
 		})
 	}
@@ -591,7 +590,7 @@ func TestGenericAgentDeckCreateUsesCapturedParentGroupSnapshot(t *testing.T) {
 					return RunResult{ExitCode: 0, Stdout: parent}, nil
 				case reflect.DeepEqual(args, []string{"agent-deck", "session", "show", "architect-reviewer", "--json"}):
 					return RunResult{ExitCode: 2, Stderr: "not found"}, nil
-				case reflect.DeepEqual(args, []string{"agent-deck", "launch", "--json", "--title", "architect-reviewer", "--cmd", "codex", "--group", test.wantGroup, "--parent", "agent-parent", "--no-transition-notify", "--no-assert-done", canonicalWorkdir}):
+				case reflect.DeepEqual(args, []string{"agent-deck", "launch", "--json", "--title", "architect-reviewer", "--cmd", "codex", "--group", test.wantGroup, "--parent", "agent-parent", "--no-identity", "--no-transition-notify", "--no-assert-done", canonicalWorkdir}):
 					// Agent Deck v1.10.11 launch_cmd.go creates a supplied non-empty
 					// group path. Generic create must not probe or create it first.
 					launchCalls++
@@ -732,7 +731,7 @@ func TestGenericAgentDeckCreateReturnsRecoveryForRefreshedGroupMismatch(t *testi
 					return RunResult{ExitCode: 0, Stdout: parent}, nil
 				case reflect.DeepEqual(args, []string{"agent-deck", "session", "show", "architect-reviewer", "--json"}):
 					return RunResult{ExitCode: 2, Stderr: "not found"}, nil
-				case reflect.DeepEqual(args, []string{"agent-deck", "launch", "--json", "--title", "architect-reviewer", "--cmd", "codex", "--group", "waypost", "--parent", "agent-parent", "--no-transition-notify", "--no-assert-done", canonicalWorkdir}):
+				case reflect.DeepEqual(args, []string{"agent-deck", "launch", "--json", "--title", "architect-reviewer", "--cmd", "codex", "--group", "waypost", "--parent", "agent-parent", "--no-identity", "--no-transition-notify", "--no-assert-done", canonicalWorkdir}):
 					launchCalls++
 					return RunResult{ExitCode: 0, Stdout: `{"id":"agent-child"}`}, nil
 				case reflect.DeepEqual(args, []string{"agent-deck", "session", "show", "agent-child", "--json"}):
@@ -801,7 +800,7 @@ func TestGenericSessionCreateRedactsCallerLaunchValueFromCommandErrors(t *testin
 						return RunResult{ExitCode: 0, Stdout: `{"id":"agent-parent","title":"planner","status":"waiting","group":"parent-group-secret","path":` + jsonString(t, canonicalWorkdir) + `}`}, nil
 					case reflect.DeepEqual(args, []string{"agent-deck", "session", "show", "architect-reviewer", "--json"}):
 						return RunResult{ExitCode: 2, Stderr: "not found"}, nil
-					case reflect.DeepEqual(args, []string{"agent-deck", "launch", "--json", "--title", "architect-reviewer", "--cmd", launchValue, "--group", "parent-group-secret", "--parent", parentID, "--no-transition-notify", "--no-assert-done", canonicalWorkdir}):
+					case reflect.DeepEqual(args, []string{"agent-deck", "launch", "--json", "--title", "architect-reviewer", "--cmd", launchValue, "--group", "parent-group-secret", "--parent", parentID, "--no-identity", "--no-transition-notify", "--no-assert-done", canonicalWorkdir}):
 						if test.mode == "runner" {
 							return RunResult{}, errors.New("runner echoed " + launchValue)
 						}
@@ -985,7 +984,7 @@ func TestGenericAgentDeckCreateRecoveryUsesFixedRedactedDetail(t *testing.T) {
 					return RunResult{ExitCode: 0, Stdout: parent}, nil
 				case reflect.DeepEqual(args, []string{"agent-deck", "session", "show", "architect-reviewer", "--json"}):
 					return RunResult{ExitCode: 2, Stderr: "not found"}, nil
-				case reflect.DeepEqual(args, []string{"agent-deck", "launch", "--json", "--title", "architect-reviewer", "--cmd", "selected-secret", "--group", "waypost", "--parent", "agent-parent", "--no-transition-notify", "--no-assert-done", canonicalWorkdir}):
+				case reflect.DeepEqual(args, []string{"agent-deck", "launch", "--json", "--title", "architect-reviewer", "--cmd", "selected-secret", "--group", "waypost", "--parent", "agent-parent", "--no-identity", "--no-transition-notify", "--no-assert-done", canonicalWorkdir}):
 					return RunResult{ExitCode: 0, Stdout: createOutput}, nil
 				default:
 					t.Fatalf("unexpected command args: %v", args)

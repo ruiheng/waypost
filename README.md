@@ -276,12 +276,16 @@ non-empty group from its preflight snapshot; callers do not provide a group
 field. Root-group and nested-parent cases are rejected before launch.
 
 Created Agent Deck sessions suppress Agent Deck's own child-to-parent
-notifications by default: launches pass `--no-transition-notify` (no
-status-transition or done events into the parent's inbox) and
+notifications and prompt injections: launches pass `--no-transition-notify`
+(no status-transition or done events into the parent's inbox),
 `--no-assert-done` (no `===AGENTDECK_DONE===` instruction appended to the
-startup message). Waypost remains the notification channel between sessions.
+startup message), and always `--no-identity` (no agent-deck identity block
+in the child's system prompt — the `AGENTDECK_INSTANCE_ID` environment
+variable is still exported, so Waypost auto-binding is unaffected). Waypost
+remains the notification and coordination channel between sessions.
 Set `transition_notify = true` or `assert_done = true` to keep the native
-Agent Deck behavior instead; both switches are ignored for Thurbox.
+Agent Deck notification behavior instead; both switches are ignored for
+Thurbox.
 
 Call `waypost_status` once after starting each MCP server process. It
 auto-binds detectable session addresses from `agent-deck session current`,

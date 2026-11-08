@@ -338,8 +338,6 @@ var notificationRetryDelays = [...]time.Duration{
 const (
 	groupNotifyFanoutTimeout     = 15 * time.Second
 	groupNotifyFanoutConcurrency = 4
-	agentDeckNotifyDeferTimeout  = 5 * time.Second
-	agentDeckNotifyReadyTimeout  = 5 * time.Second
 )
 
 func (m *notificationManager) notifyRouteWithRetry(ctx context.Context, event notificationEvent) notificationOutcome {
@@ -528,12 +526,14 @@ func (n agentDeckNotifier) Notify(ctx context.Context, event notificationEvent) 
 		}
 	}
 
+	// --queue parks the nudge in the durable send queue; a background worker
+	// types it when the target idles. A busy Codex session legitimately runs
+	// turns for minutes, so a bounded --defer-if-busy here expired and the
+	// nudge was dropped — the durable queue is the wake semantic that fits.
 	return n.runNudge(ctx, []string{
 		"agent-deck", "session", "send",
 		"--json",
-		"-defer-if-busy",
-		"-defer-timeout", agentDeckNotifyDeferTimeout.String(),
-		"-timeout", agentDeckNotifyReadyTimeout.String(),
+		"--queue",
 		event.Route.Target, notifyMessage,
 	})
 }
@@ -622,6 +622,12 @@ func classifyAgentDeckNudgeResult(scheme string, result RunResult, payload agent
 			Status: "unconfirmed",
 			Scheme: scheme,
 			Detail: "nudge was sent but agent-deck could not verify whether the target accepted it",
+		}
+	case "queued":
+		return notificationOutcome{
+			Status: "unconfirmed",
+			Scheme: scheme,
+			Detail: "nudge accepted into the durable send queue; it is typed when the target is idle",
 		}
 	case "no_evidence":
 		return notificationOutcome{

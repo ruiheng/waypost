@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/ruiheng/waypost/internal/hideconsole"
 	"github.com/ruiheng/waypost/internal/launchpath"
 )
 
@@ -74,6 +75,7 @@ func newChildCommand(executable string, args []string) (*exec.Cmd, error) {
 		return nil, fmt.Errorf("resolve absolute launcher executable path: %w", err)
 	}
 	cmd := exec.Command(executable, args...)
+	hideconsole.Hide(cmd)
 	cmd.Env = append(os.Environ(), launchpath.StableExecutableEnv+"="+launcherExecutable)
 	return cmd, nil
 }

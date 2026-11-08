@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/ruiheng/waypost/internal/hideconsole"
 )
 
 // RunMCPGetProbe runs `<binary> mcp get waypost` (plus extraArgs) with the
@@ -27,7 +29,9 @@ func RunMCPGetProbe(
 	args := append([]string{"mcp", "get", "waypost"}, extraArgs...)
 	commandName, commandArgs := mcpGetInvocation(binary, args)
 	commandDesc := binary + " " + strings.Join(args, " ")
-	out, runErr := exec.CommandContext(probeCtx, commandName, commandArgs...).Output()
+	probeCmd := exec.CommandContext(probeCtx, commandName, commandArgs...)
+	hideconsole.Hide(probeCmd)
+	out, runErr := probeCmd.Output()
 	if runErr == nil {
 		return out, false, nil
 	}

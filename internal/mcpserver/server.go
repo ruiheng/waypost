@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/ruiheng/waypost/internal/hideconsole"
 	"github.com/ruiheng/waypost/internal/version"
 	"github.com/ruiheng/waypost/internal/waypost"
 )
@@ -448,6 +449,7 @@ func (r osCommandRunner) Run(ctx context.Context, args []string, input string) (
 		return RunResult{}, errors.New("missing command")
 	}
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	hideconsole.Hide(cmd)
 	if r.cwd != "" {
 		cmd.Dir = r.cwd
 	}

@@ -42,11 +42,18 @@ type visibleWaypostState struct {
 	OldestEligibleAt   string
 }
 
+type queuedWakeState struct {
+	QueuedAt   string
+	Until      string
+	QueueKnown bool
+}
+
 type wakeRuntime struct {
 	ScopeID           string
 	PendingSince      string
 	LastAnyWakeAt     string
 	LastWakeByChannel map[WakeChannelName]string
+	QueuedByChannel   map[WakeChannelName]queuedWakeState
 }
 
 type wakeSchedulerState struct {
@@ -191,6 +198,14 @@ func (s *Service) tryWakeChannel(ctx context.Context, snapshot wakeSnapshot, run
 				logWakeSuppressed(snapshot, runtime, now, channel, config.Category, target.Target, "unavailable:channel_budget_exhausted")
 				break
 			}
+			if probe.PendingNudge {
+				logWakeSuppressed(snapshot, runtime, now, channel, config.Category, target.Target, "suppressed:queued_nudge_pending")
+				s.wakeSchedulerState.markQueuedPending(snapshot.ScopeID, channel, now, snapshot.PendingSince)
+				return false
+			}
+			if probe.QueueKnown {
+				s.wakeSchedulerState.clearQueued(snapshot.ScopeID, channel)
+			}
 			attemptedWakeableTarget = true
 			outcome := s.notifications.notifyRoute(wakeCtx, notificationEvent{
 				Kind:  notificationFallbackWake,
@@ -198,7 +213,7 @@ func (s *Service) tryWakeChannel(ctx context.Context, snapshot wakeSnapshot, run
 			})
 			logWakeAttempt(snapshot, now, channel, config.Category, target.Target, outcome)
 			if notificationOutcomeAttempted(outcome) {
-				s.wakeSchedulerState.markAttempted(snapshot.ScopeID, channel, now, snapshot.PendingSince)
+				s.wakeSchedulerState.markAttemptedOutcome(snapshot.ScopeID, channel, now, snapshot.PendingSince, outcome, probe.QueueKnown)
 				return true
 			}
 			if wakeCtx.Err() != nil {
@@ -419,7 +434,30 @@ func allowWakeAttempt(snapshot wakeSnapshot, runtime wakeRuntime, now time.Time,
 	if inWakeCooldown(runtime.LastWakeByChannel[channel], now, config.Cooldown) {
 		return false, "suppressed:channel_cooldown"
 	}
+	if hasUnprobedQueuedWake(snapshot, runtime, now, channel) {
+		return false, "suppressed:queued_nudge_pending"
+	}
 	return true, ""
+}
+
+func hasUnprobedQueuedWake(snapshot wakeSnapshot, runtime wakeRuntime, now time.Time, channel WakeChannelName) bool {
+	queued, ok := runtime.QueuedByChannel[channel]
+	if !ok || queued.QueueKnown {
+		return false
+	}
+	pendingSince, err := time.Parse(time.RFC3339Nano, snapshot.PendingSince)
+	if err != nil {
+		return false
+	}
+	queuedAt, err := time.Parse(time.RFC3339Nano, queued.QueuedAt)
+	if err != nil {
+		return false
+	}
+	until, err := time.Parse(time.RFC3339Nano, queued.Until)
+	if err != nil {
+		return false
+	}
+	return !pendingSince.After(queuedAt) && now.Before(until)
 }
 
 func inWakeCooldown(lastWakeAt string, now time.Time, cooldown time.Duration) bool {
@@ -470,32 +508,92 @@ func logWakeAttempt(snapshot wakeSnapshot, now time.Time, channel WakeChannelNam
 	)
 }
 
-func (s *wakeSchedulerState) runtimeForScope(scopeID, pendingSince string) wakeRuntime {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *wakeSchedulerState) ensureRuntimeLocked(scopeID, pendingSince string) wakeRuntime {
 	runtime := s.runtimes[scopeID]
 	runtime.ScopeID = scopeID
 	runtime.PendingSince = pendingSince
 	if runtime.LastWakeByChannel == nil {
 		runtime.LastWakeByChannel = map[WakeChannelName]string{}
 	}
-	s.runtimes[scopeID] = runtime
+	if runtime.QueuedByChannel == nil {
+		runtime.QueuedByChannel = map[WakeChannelName]queuedWakeState{}
+	}
 	return runtime
 }
 
-func (s *wakeSchedulerState) markAttempted(scopeID string, channel WakeChannelName, now time.Time, pendingSince string) {
+func (s *wakeSchedulerState) runtimeForScope(scopeID, pendingSince string) wakeRuntime {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	runtime := s.runtimes[scopeID]
-	runtime.ScopeID = scopeID
-	runtime.PendingSince = pendingSince
-	if runtime.LastWakeByChannel == nil {
-		runtime.LastWakeByChannel = map[WakeChannelName]string{}
+	runtime := s.ensureRuntimeLocked(scopeID, pendingSince)
+	s.runtimes[scopeID] = runtime
+
+	snapshot := runtime
+	snapshot.LastWakeByChannel = make(map[WakeChannelName]string, len(runtime.LastWakeByChannel))
+	for k, v := range runtime.LastWakeByChannel {
+		snapshot.LastWakeByChannel[k] = v
 	}
+	snapshot.QueuedByChannel = make(map[WakeChannelName]queuedWakeState, len(runtime.QueuedByChannel))
+	for k, v := range runtime.QueuedByChannel {
+		snapshot.QueuedByChannel[k] = v
+	}
+	return snapshot
+}
+
+func (s *wakeSchedulerState) markAttempted(scopeID string, channel WakeChannelName, now time.Time, pendingSince string) {
+	s.markAttemptedOutcome(scopeID, channel, now, pendingSince, notificationOutcome{}, false)
+}
+
+func (s *wakeSchedulerState) markAttemptedOutcome(scopeID string, channel WakeChannelName, now time.Time, pendingSince string, outcome notificationOutcome, queueKnown bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	runtime := s.ensureRuntimeLocked(scopeID, pendingSince)
 	timestamp := now.Format(time.RFC3339Nano)
 	runtime.LastAnyWakeAt = timestamp
 	runtime.LastWakeByChannel[channel] = timestamp
+	if outcome.Queued {
+		runtime.QueuedByChannel[channel] = queuedWakeState{
+			QueuedAt:   timestamp,
+			Until:      resolveQueuedWakeUntil(outcome.QueuedDeadline, now),
+			QueueKnown: queueKnown,
+		}
+	} else {
+		delete(runtime.QueuedByChannel, channel)
+	}
 	s.runtimes[scopeID] = runtime
+}
+
+func (s *wakeSchedulerState) markQueuedPending(scopeID string, channel WakeChannelName, now time.Time, pendingSince string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	runtime := s.ensureRuntimeLocked(scopeID, pendingSince)
+	timestamp := now.Format(time.RFC3339Nano)
+	runtime.LastWakeByChannel[channel] = timestamp
+	runtime.QueuedByChannel[channel] = queuedWakeState{
+		QueuedAt:   timestamp,
+		Until:      now.Add(defaultAgentDeckQueueBudget).Format(time.RFC3339Nano),
+		QueueKnown: true,
+	}
+	s.runtimes[scopeID] = runtime
+}
+
+func (s *wakeSchedulerState) clearQueued(scopeID string, channel WakeChannelName) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	runtime, ok := s.runtimes[scopeID]
+	if !ok || runtime.QueuedByChannel == nil {
+		return
+	}
+	delete(runtime.QueuedByChannel, channel)
+	s.runtimes[scopeID] = runtime
+}
+
+func resolveQueuedWakeUntil(rawDeadline string, now time.Time) string {
+	if trimmed := strings.TrimSpace(rawDeadline); trimmed != "" {
+		if deadline, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
+			return deadline.UTC().Format(time.RFC3339Nano)
+		}
+	}
+	return now.Add(defaultAgentDeckQueueBudget).Format(time.RFC3339Nano)
 }
 
 func (s *wakeSchedulerState) reset() {

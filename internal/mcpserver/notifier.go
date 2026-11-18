@@ -24,17 +24,21 @@ type notificationEvent struct {
 }
 
 type notificationOutcome struct {
-	Status string
-	Scheme string
-	Detail string
-	Err    error
+	Status         string
+	Scheme         string
+	Detail         string
+	Err            error
+	Queued         bool
+	QueuedDeadline string
 }
 
 type notificationProbe struct {
-	Status   string
-	Scheme   string
-	Wakeable bool
-	Err      error
+	Status       string
+	Scheme       string
+	Wakeable     bool
+	QueueKnown   bool
+	PendingNudge bool
+	Err          error
 }
 
 type managerNotifier interface {
@@ -338,11 +342,20 @@ var notificationRetryDelays = [...]time.Duration{
 const (
 	groupNotifyFanoutTimeout     = 15 * time.Second
 	groupNotifyFanoutConcurrency = 4
+	defaultAgentDeckQueueBudget  = 30 * time.Minute
 )
 
 func (m *notificationManager) notifyRouteWithRetry(ctx context.Context, event notificationEvent) notificationOutcome {
 	probe := m.probeRouteForSendWithRetry(ctx, event.Route)
 	if probe.Wakeable {
+		if !wakeNotifyDisabled(event.DisableNotifyMessage) && probe.PendingNudge {
+			return notificationOutcome{
+				Status: "unconfirmed",
+				Scheme: probe.Scheme,
+				Detail: "nudge already pending in the durable send queue; it is typed when the target is idle",
+				Queued: true,
+			}
+		}
 		// Notify is a non-idempotent side effect. Once it has been attempted,
 		// its error is ambiguous: the target may already have received the
 		// message. Only retry failures that happen before Notify is called.
@@ -493,10 +506,13 @@ func (n agentDeckNotifier) Probe(ctx context.Context, route notificationRoute) n
 		}
 	}
 	if activeSessionStatuses[status] {
+		queueKnown := targetSession.Queue != nil
 		return notificationProbe{
-			Status:   "wakeable",
-			Scheme:   n.Name(),
-			Wakeable: true,
+			Status:       "wakeable",
+			Scheme:       n.Name(),
+			Wakeable:     true,
+			QueueKnown:   queueKnown,
+			PendingNudge: queueKnown && hasPendingWaypostNudge(*targetSession.Queue),
 		}
 	}
 	return notificationProbe{
@@ -542,6 +558,9 @@ type agentDeckNudgeResult struct {
 	Success   *bool  `json:"success"`
 	Delivery  string `json:"delivery"`
 	Submitted *bool  `json:"submitted"`
+	SendID    string `json:"send_id"`
+	State     string `json:"state"`
+	Deadline  string `json:"deadline"`
 	Error     string `json:"error"`
 	Code      string `json:"code"`
 }
@@ -600,7 +619,13 @@ func parseAgentDeckNudgeResult(stdout string) (agentDeckNudgeResult, bool) {
 	if err := json.Unmarshal([]byte(trimmed), &payload); err != nil {
 		return agentDeckNudgeResult{}, false
 	}
-	structured := payload.Success != nil || payload.Submitted != nil || strings.TrimSpace(payload.Delivery) != "" || strings.TrimSpace(payload.Error) != "" || strings.TrimSpace(payload.Code) != ""
+	structured := payload.Success != nil ||
+		payload.Submitted != nil ||
+		strings.TrimSpace(payload.Delivery) != "" ||
+		strings.TrimSpace(payload.SendID) != "" ||
+		strings.TrimSpace(payload.State) != "" ||
+		strings.TrimSpace(payload.Error) != "" ||
+		strings.TrimSpace(payload.Code) != ""
 	return payload, structured
 }
 
@@ -624,24 +649,27 @@ func classifyAgentDeckNudgeResult(scheme string, result RunResult, payload agent
 			Detail: "nudge was sent but agent-deck could not verify whether the target accepted it",
 		}
 	case "queued":
-		return notificationOutcome{
-			Status: "unconfirmed",
-			Scheme: scheme,
-			Detail: "nudge accepted into the durable send queue; it is typed when the target is idle",
-		}
+		return queuedAgentDeckOutcome(scheme, payload.Deadline)
 	case "no_evidence":
 		return notificationOutcome{
 			Status: "unconfirmed",
 			Scheme: scheme,
 			Detail: "nudge was attempted but no delivery evidence was observed",
 		}
-	case "typed_not_submitted", "line_too_long", "send_failed":
+	case "typed_not_submitted", "line_too_long", "send_failed", "pane_gone":
 		return notificationOutcome{
 			Status: "failed",
 			Scheme: scheme,
 			Err:    agentDeckNudgeError(result, payload),
 		}
 	case "":
+		state := strings.ToLower(strings.TrimSpace(payload.State))
+		if state == "queued" {
+			return queuedAgentDeckOutcome(scheme, payload.Deadline)
+		}
+		if state == "failed" {
+			return notificationOutcome{Status: "failed", Scheme: scheme, Err: agentDeckNudgeError(result, payload)}
+		}
 		if payload.Success != nil && *payload.Success && result.ExitCode == 0 {
 			return notificationOutcome{Status: "sent", Scheme: scheme}
 		}
@@ -657,11 +685,28 @@ func classifyAgentDeckNudgeResult(scheme string, result RunResult, payload agent
 		}
 		return notificationOutcome{Status: "failed", Scheme: scheme, Err: agentDeckNudgeError(result, payload)}
 	default:
+		if strings.EqualFold(strings.TrimSpace(payload.State), "failed") {
+			return notificationOutcome{
+				Status: "failed",
+				Scheme: scheme,
+				Err:    agentDeckNudgeError(result, payload),
+			}
+		}
 		return notificationOutcome{
 			Status: "unconfirmed",
 			Scheme: scheme,
 			Detail: fmt.Sprintf("agent-deck returned an unknown delivery verdict %q", delivery),
 		}
+	}
+}
+
+func queuedAgentDeckOutcome(scheme, deadline string) notificationOutcome {
+	return notificationOutcome{
+		Status:         "unconfirmed",
+		Scheme:         scheme,
+		Detail:         "nudge accepted into the durable send queue; it is typed when the target is idle",
+		Queued:         true,
+		QueuedDeadline: strings.TrimSpace(deadline),
 	}
 }
 

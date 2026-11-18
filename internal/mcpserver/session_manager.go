@@ -108,14 +108,44 @@ func (d toolSessionDescriptor) invalidHint() string {
 	return "a hex session id"
 }
 
+type sessionQueueEntry struct {
+	ID          string `json:"id"`
+	TextPreview string `json:"text_preview"`
+	EnqueuedAt  string `json:"enqueued_at"`
+	State       string `json:"state"`
+}
+
 type sessionData struct {
-	ID              string `json:"id"`
-	Title           string `json:"title"`
-	Status          string `json:"status"`
-	Group           string `json:"group"`
-	Path            string `json:"path"`
-	ParentSessionID string `json:"parent_session_id,omitempty"`
-	Success         *bool  `json:"success,omitempty"`
+	ID              string               `json:"id"`
+	Title           string               `json:"title"`
+	Status          string               `json:"status"`
+	Group           string               `json:"group"`
+	Path            string               `json:"path"`
+	ParentSessionID string               `json:"parent_session_id,omitempty"`
+	Success         *bool                `json:"success,omitempty"`
+	Queue           *[]sessionQueueEntry `json:"queue,omitempty"`
+}
+
+func hasPendingWaypostNudge(entries []sessionQueueEntry) bool {
+	for _, entry := range entries {
+		switch strings.ToLower(strings.TrimSpace(entry.State)) {
+		case "queued", "typing":
+			if isWaypostNudgePreview(entry.TextPreview) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isWaypostNudgePreview(preview string) bool {
+	normalized := strings.Join(strings.Fields(preview), " ")
+	if strings.HasPrefix(normalized, "[agent-deck from:") {
+		if end := strings.IndexByte(normalized, ']'); end >= 0 {
+			normalized = strings.TrimSpace(normalized[end+1:])
+		}
+	}
+	return strings.EqualFold(normalized, defaultNotifyMessage)
 }
 
 type psRow struct {

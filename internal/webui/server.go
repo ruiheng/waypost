@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ruiheng/waypost/internal/hideconsole"
 	"github.com/ruiheng/waypost/internal/waypost"
 )
 
@@ -174,6 +175,7 @@ func copyTextWithSystemCommand(ctx context.Context, text string) error {
 			continue
 		}
 		cmd := exec.CommandContext(ctx, path, candidate[1:]...)
+		hideconsole.Hide(cmd)
 		cmd.Stdin = strings.NewReader(text)
 		if err := cmd.Run(); err != nil {
 			failures = append(failures, fmt.Sprintf("%s: %v", candidate[0], err))

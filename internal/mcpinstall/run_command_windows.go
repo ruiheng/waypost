@@ -30,9 +30,12 @@ func configureCommand(command *exec.Cmd, originalName, commandName string, comma
 	if extension != ".cmd" && extension != ".bat" {
 		return
 	}
-	command.SysProcAttr = &syscall.SysProcAttr{
-		CmdLine: windowsCommandLine(commandName, commandArgs),
+	attr := command.SysProcAttr
+	if attr == nil {
+		attr = &syscall.SysProcAttr{}
 	}
+	attr.CmdLine = windowsCommandLine(commandName, commandArgs)
+	command.SysProcAttr = attr
 }
 
 func windowsCommandLine(commandName string, commandArgs []string) string {

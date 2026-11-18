@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 
@@ -55,6 +56,9 @@ func run(args []string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	interrupts := make(chan os.Signal, 1)
+	signal.Notify(interrupts, os.Interrupt)
+	defer signal.Stop(interrupts)
 	if err := cmd.Run(); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
@@ -75,7 +79,7 @@ func newChildCommand(executable string, args []string) (*exec.Cmd, error) {
 		return nil, fmt.Errorf("resolve absolute launcher executable path: %w", err)
 	}
 	cmd := exec.Command(executable, args...)
-	hideconsole.Hide(cmd)
+	hideconsole.HideIfConsoleless(cmd)
 	cmd.Env = append(os.Environ(), launchpath.StableExecutableEnv+"="+launcherExecutable)
 	return cmd, nil
 }

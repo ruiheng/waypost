@@ -49,9 +49,10 @@ var (
 )
 
 type consoleTestChild struct {
-	name   string
-	cmd    *exec.Cmd
-	stderr *bytes.Buffer
+	name     string
+	cmd      *exec.Cmd
+	stderr   *bytes.Buffer
+	scanDone chan struct{}
 }
 
 func consoleTestCP() uintptr {
@@ -312,7 +313,7 @@ func consoleTestParentMain() {
 	launcherExe := filepath.Join(prefix, "bin", "waypost.exe")
 	lines := make(chan string, 256)
 	children := map[string]*consoleTestChild{}
-	start := func(name string, build func() (*exec.Cmd, error), role string) bool {
+	start := func(name string, build func() (*exec.Cmd, error), extraEnv map[string]string) bool {
 		cmd, err := build()
 		if err != nil {
 			fmt.Printf("PARENT_ERROR build %s: %v\n", name, err)
@@ -322,10 +323,7 @@ func consoleTestParentMain() {
 		if base == nil {
 			base = os.Environ()
 		}
-		cmd.Env = consoleTestEnvWith(base, map[string]string{
-			consoleTestRoleEnv:             role,
-			launchpath.StableExecutableEnv: "",
-		})
+		cmd.Env = consoleTestEnvWith(base, extraEnv)
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
 			fmt.Printf("PARENT_ERROR stdout pipe %s: %v\n", name, err)
@@ -337,21 +335,28 @@ func consoleTestParentMain() {
 			fmt.Printf("PARENT_ERROR start %s: %v\n", name, err)
 			return false
 		}
-		children[name] = &consoleTestChild{name: name, cmd: cmd, stderr: stderr}
-		go func(pipe io.Reader) {
+		scanDone := make(chan struct{})
+		children[name] = &consoleTestChild{name: name, cmd: cmd, stderr: stderr, scanDone: scanDone}
+		go func(pipe io.Reader, done chan struct{}) {
+			defer close(done)
 			scanner := bufio.NewScanner(pipe)
 			for scanner.Scan() {
 				lines <- name + " " + scanner.Text()
 			}
-		}(stdout)
+		}(stdout, scanDone)
 		return true
 	}
 
 	if !start("direct", func() (*exec.Cmd, error) {
 		return newChildCommand(os.Args[0], []string{"-test.run=" + consoleTestInheritName})
-	}, consoleTestRoleChild) || !start("launcher", func() (*exec.Cmd, error) {
+	}, map[string]string{
+		consoleTestRoleEnv: consoleTestRoleChild,
+	}) || !start("launcher", func() (*exec.Cmd, error) {
 		return exec.Command(launcherExe, "-test.run="+consoleTestInheritName), nil
-	}, consoleTestRoleRunLauncher) {
+	}, map[string]string{
+		consoleTestRoleEnv:             consoleTestRoleRunLauncher,
+		launchpath.StableExecutableEnv: "",
+	}) {
 		consoleTestKillAll(children)
 		os.Exit(2)
 	}
@@ -408,6 +413,14 @@ outcomeLoop:
 	exitCh := make(chan childExit, len(children))
 	for _, child := range children {
 		go func(c *consoleTestChild) {
+			select {
+			case <-c.scanDone:
+			case <-time.After(8 * time.Second):
+				if c.cmd.Process != nil {
+					_ = c.cmd.Process.Kill()
+				}
+				<-c.scanDone
+			}
 			err := c.cmd.Wait()
 			if err == nil {
 				exitCh <- childExit{name: c.name, code: "0"}

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"strings"
 
@@ -56,9 +55,7 @@ func run(args []string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	interrupts := make(chan os.Signal, 1)
-	signal.Notify(interrupts, os.Interrupt)
-	defer signal.Stop(interrupts)
+	defer suppressParentInterrupt()()
 	if err := cmd.Run(); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {

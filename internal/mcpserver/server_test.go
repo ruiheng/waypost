@@ -4700,6 +4700,7 @@ func TestWakeSchedulerUsesSessionShowQueueTruthForPendingAndSettledNudges(t *tes
 			service := newService(Options{
 				WaypostServiceFactory: fakeWaypostServiceFactory{service: &fakeWaypostService{t: t}},
 				CommandRunner:         commandRunner,
+				Now:                   func() time.Time { return current },
 				DisableWakeScheduler:  true,
 			})
 			defer service.Close()
@@ -4796,9 +4797,11 @@ func TestWaypostSendSkipsDuplicateEnqueueWhenTargetAlreadyHasPendingQueuedNudge(
 				}
 			}}
 
+			current := time.Date(2026, 4, 3, 6, 0, 0, 0, time.UTC)
 			service := newService(Options{
 				WaypostServiceFactory: fakeWaypostServiceFactory{service: waypostService},
 				CommandRunner:         commandRunner,
+				Now:                   func() time.Time { return current },
 				NotifyDelay:           -1,
 				DisableWakeScheduler:  true,
 			})
@@ -4868,6 +4871,251 @@ func TestWaypostSendTreatsAgentDeckPaneGoneQueuedFailureAsFailed(t *testing.T) {
 	}
 	if got := output["notify_error"]; got == nil || !strings.Contains(got.(string), "target not running") {
 		t.Fatalf("notify_error = %v, want target not running detail", got)
+	}
+}
+
+func TestWakeSchedulerAndSendIgnoreExpiredOrphanedQueueEntries(t *testing.T) {
+	current := time.Date(2026, 4, 3, 6, 0, 0, 0, time.UTC)
+	expiredAt := current.Add(-(defaultAgentDeckQueueBudget + time.Minute)).Format(time.RFC3339Nano)
+
+	for _, tc := range []struct {
+		name       string
+		enqueuedAt string
+		state      string
+	}{
+		{name: "expired queued orphan", enqueuedAt: expiredAt, state: "queued"},
+		{name: "expired typing orphan", enqueuedAt: expiredAt, state: "typing"},
+		{name: "invalid enqueued_at", enqueuedAt: "not-a-timestamp", state: "queued"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			waypostService := &fakeWaypostService{t: t}
+			waypostService.sendFunc = func(_ context.Context, params waypost.SendParams) (waypost.SendResult, error) {
+				return waypost.SendResult{DeliveryID: "dlv_orphan"}, nil
+			}
+			waypostService.readDeliveriesFunc = func(_ context.Context, deliveryIDs []string) ([]waypost.ReadDelivery, error) {
+				return []waypost.ReadDelivery{{DeliveryID: "dlv_orphan", State: "queued"}}, nil
+			}
+
+			sendCalls := 0
+			commandRunner := &fakeRunner{t: t, handler: func(args []string, input string) (RunResult, error) {
+				switch {
+				case reflect.DeepEqual(args, []string{"agent-deck", "session", "show", "worker", "--json"}):
+					return RunResult{
+						ExitCode: 0,
+						Stdout: fmt.Sprintf(
+							`{"id":"worker","status":"running","queue":[{"id":"orphan","text_preview":%q,"enqueued_at":%q,"state":%q}]}`,
+							defaultNotifyMessage,
+							tc.enqueuedAt,
+							tc.state,
+						),
+					}, nil
+				case isAgentDeckQueuedSend(args):
+					sendCalls++
+					return RunResult{ExitCode: 0, Stdout: `{"success":true,"submitted":false,"state":"queued","send_id":"fresh"}`}, nil
+				default:
+					t.Fatalf("unexpected command args: %v", args)
+					return RunResult{}, nil
+				}
+			}}
+
+			service := newService(Options{
+				WaypostServiceFactory: fakeWaypostServiceFactory{service: waypostService},
+				CommandRunner:         commandRunner,
+				Now:                   func() time.Time { return current },
+				NotifyDelay:           -1,
+				DisableWakeScheduler:  true,
+			})
+			defer service.Close()
+			service.state.boundAddresses = []string{"agent-deck/self"}
+			service.state.defaultSender = "agent-deck/self"
+			service.state.autoBindAttempted = true
+
+			output := callServiceTool(t, service, "waypost_send", map[string]any{
+				"to":      "agent-deck/worker",
+				"subject": "wake",
+				"body":    "body",
+			})
+			if sendCalls != 1 {
+				t.Fatalf("waypost_send sendCalls = %d, want 1 despite %s", sendCalls, tc.name)
+			}
+			if got := output["notify_status"]; got != "unconfirmed" {
+				t.Fatalf("waypost_send notify_status = %v, want unconfirmed", got)
+			}
+
+			snapshot := wakeSnapshot{
+				ScopeID:      "local/agent-deck/worker",
+				PendingSince: current.Add(-4 * time.Minute).Format(time.RFC3339Nano),
+				WakeTargets:  []WakeTarget{{Channel: WakeChannelAgentDeck, Target: "worker"}},
+			}
+			runtime := service.wakeSchedulerState.runtimeForScope(snapshot.ScopeID, snapshot.PendingSince)
+			if attempted := service.tryWakeChannel(context.Background(), snapshot, runtime, current, WakeChannelAgentDeck); !attempted {
+				t.Fatalf("tryWakeChannel should not suppress for %s", tc.name)
+			}
+			if sendCalls != 2 {
+				t.Fatalf("scheduler sendCalls = %d, want 2 after %s", sendCalls, tc.name)
+			}
+		})
+	}
+}
+
+func TestParseSessionDataIgnoresNonArrayQueueField(t *testing.T) {
+	for _, raw := range []string{
+		`{"id":"worker","status":"running","queue":2}`,
+		`{"id":"worker","status":"running","queue":{"depth":1}}`,
+	} {
+		data, err := parseSessionData(raw, "agent-deck session show")
+		if err != nil {
+			t.Fatalf("parseSessionData(%s) error = %v", raw, err)
+		}
+		if data.ID != "worker" || data.Status != "running" {
+			t.Fatalf("parseSessionData(%s) = %+v", raw, data)
+		}
+
+		commandRunner := &fakeRunner{t: t, handler: func(args []string, input string) (RunResult, error) {
+			return RunResult{ExitCode: 0, Stdout: raw}, nil
+		}}
+		notifier := agentDeckNotifier{
+			runner:   commandRunner,
+			sessions: newSessionManager(commandRunner, &serverState{}),
+			now:      func() time.Time { return time.Date(2026, 4, 3, 6, 0, 0, 0, time.UTC) },
+		}
+		probe := notifier.Probe(context.Background(), notificationRoute{Manager: "agent-deck", Target: "worker"})
+		if !probe.Wakeable || probe.QueueKnown || probe.PendingNudge {
+			t.Fatalf("Probe(%s) = %+v, want wakeable with QueueKnown=false PendingNudge=false", raw, probe)
+		}
+	}
+}
+
+func TestWaypostSendDisableNotifyOverridesPendingQueueNudge(t *testing.T) {
+	current := time.Date(2026, 4, 3, 6, 0, 0, 0, time.UTC)
+	waypostService := &fakeWaypostService{t: t}
+	waypostService.sendFunc = func(_ context.Context, params waypost.SendParams) (waypost.SendResult, error) {
+		return waypost.SendResult{DeliveryID: "dlv_disabled_queue"}, nil
+	}
+
+	commandRunner := &fakeRunner{t: t, handler: func(args []string, input string) (RunResult, error) {
+		if reflect.DeepEqual(args, []string{"agent-deck", "session", "show", "target", "--json"}) {
+			return RunResult{
+				ExitCode: 0,
+				Stdout: fmt.Sprintf(
+					`{"id":"target","status":"running","queue":[{"id":"q1","text_preview":%q,"enqueued_at":"2026-04-03T05:59:00Z","state":"queued"}]}`,
+					defaultNotifyMessage,
+				),
+			}, nil
+		}
+		t.Fatalf("unexpected command args: %v", args)
+		return RunResult{}, nil
+	}}
+
+	service := newService(Options{
+		WaypostServiceFactory: fakeWaypostServiceFactory{service: waypostService},
+		CommandRunner:         commandRunner,
+		Now:                   func() time.Time { return current },
+		DisableWakeScheduler:  true,
+	})
+	defer service.Close()
+	service.state.boundAddresses = []string{"agent-deck/self"}
+	service.state.defaultSender = "agent-deck/self"
+	service.state.autoBindAttempted = true
+
+	output := callServiceTool(t, service, "waypost_send", map[string]any{
+		"to":                     "agent-deck/target",
+		"subject":                "delegate",
+		"body":                   "body",
+		"disable_notify_message": true,
+		"diagnostics":            true,
+	})
+	if got := output["notify_status"]; got != "skipped_disabled" {
+		t.Fatalf("notify_status = %v, want skipped_disabled", got)
+	}
+}
+
+func TestWakeSchedulerSuppressesMultiTargetFallbackWhenFirstTargetHasPendingQueueNudge(t *testing.T) {
+	current := time.Date(2026, 4, 3, 6, 0, 0, 0, time.UTC)
+	commandRunner := &fakeRunner{t: t, handler: func(args []string, input string) (RunResult, error) {
+		if reflect.DeepEqual(args, []string{"agent-deck", "session", "show", "worker-a", "--json"}) {
+			return RunResult{
+				ExitCode: 0,
+				Stdout: fmt.Sprintf(
+					`{"id":"worker-a","status":"running","queue":[{"id":"q1","text_preview":%q,"enqueued_at":"2026-04-03T05:59:00Z","state":"queued"}]}`,
+					defaultNotifyMessage,
+				),
+			}, nil
+		}
+		t.Fatalf("unexpected command args (must not probe or nudge worker-b): %v", args)
+		return RunResult{}, nil
+	}}
+
+	service := newService(Options{
+		WaypostServiceFactory: fakeWaypostServiceFactory{service: &fakeWaypostService{t: t}},
+		CommandRunner:         commandRunner,
+		Now:                   func() time.Time { return current },
+		DisableWakeScheduler:  true,
+	})
+	defer service.Close()
+
+	snapshot := wakeSnapshot{
+		ScopeID:      "local/agent-deck/worker-a",
+		PendingSince: current.Add(-4 * time.Minute).Format(time.RFC3339Nano),
+		WakeTargets: []WakeTarget{
+			{Channel: WakeChannelAgentDeck, Target: "worker-a"},
+			{Channel: WakeChannelAgentDeck, Target: "worker-b"},
+		},
+	}
+
+	runtime := service.wakeSchedulerState.runtimeForScope(snapshot.ScopeID, snapshot.PendingSince)
+	if attempted := service.tryWakeChannel(context.Background(), snapshot, runtime, current, WakeChannelAgentDeck); attempted {
+		t.Fatal("tryWakeChannel should suppress without falling through to worker-b")
+	}
+	if calls := commandRunner.Calls(); len(calls) != 1 {
+		t.Fatalf("command calls = %v, want only worker-a session show", calls)
+	}
+	runtime = service.wakeSchedulerState.runtimeForScope(snapshot.ScopeID, snapshot.PendingSince)
+	if _, hasQueued := runtime.QueuedByChannel[WakeChannelAgentDeck]; hasQueued {
+		t.Fatal("QueueKnown=true probe must not store dead QueuedByChannel fallback state")
+	}
+}
+
+func TestResolveQueuedWakeUntilBoundsAndSuccessFalseQueuedClassification(t *testing.T) {
+	now := time.Date(2026, 4, 3, 6, 0, 0, 0, time.UTC)
+	wantMax := now.Add(defaultAgentDeckQueueBudget).Format(time.RFC3339Nano)
+
+	if got := resolveQueuedWakeUntil(now.Add(-time.Minute).Format(time.RFC3339Nano), now); got != wantMax {
+		t.Fatalf("past deadline resolveQueuedWakeUntil = %q, want %q", got, wantMax)
+	}
+	if got := resolveQueuedWakeUntil(now.Format(time.RFC3339Nano), now); got != wantMax {
+		t.Fatalf("equal deadline resolveQueuedWakeUntil = %q, want %q", got, wantMax)
+	}
+	if got := resolveQueuedWakeUntil(now.Add(2*time.Hour).Format(time.RFC3339Nano), now); got != wantMax {
+		t.Fatalf("far-future deadline resolveQueuedWakeUntil = %q, want %q", got, wantMax)
+	}
+	valid := now.Add(10 * time.Minute).Format(time.RFC3339Nano)
+	if got := resolveQueuedWakeUntil(valid, now); got != valid {
+		t.Fatalf("in-bounds deadline resolveQueuedWakeUntil = %q, want %q", got, valid)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		stdout string
+	}{
+		{name: "delivery queued with success false", stdout: `{"success":false,"delivery":"queued","reason":"queue full"}`},
+		{name: "state queued with success false", stdout: `{"success":false,"state":"queued","reason":"queue full"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &fakeRunner{t: t, handler: func(args []string, input string) (RunResult, error) {
+				return RunResult{ExitCode: 1, Stdout: tc.stdout}, nil
+			}}
+			outcome := (agentDeckNotifier{runner: runner}).runNudge(context.Background(), agentDeckQueuedSendArgs("target", defaultNotifyMessage))
+			if outcome.Status != "failed" {
+				t.Fatalf("status = %q, want failed", outcome.Status)
+			}
+			if outcome.Queued {
+				t.Fatal("failed queued response must not set Queued=true")
+			}
+			if outcome.Err == nil || !strings.Contains(outcome.Err.Error(), "queue full") {
+				t.Fatalf("err = %v, want queue full reason", outcome.Err)
+			}
+		})
 	}
 }
 

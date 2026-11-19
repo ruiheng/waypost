@@ -116,21 +116,40 @@ type sessionQueueEntry struct {
 }
 
 type sessionData struct {
-	ID              string               `json:"id"`
-	Title           string               `json:"title"`
-	Status          string               `json:"status"`
-	Group           string               `json:"group"`
-	Path            string               `json:"path"`
-	ParentSessionID string               `json:"parent_session_id,omitempty"`
-	Success         *bool                `json:"success,omitempty"`
-	Queue           *[]sessionQueueEntry `json:"queue,omitempty"`
+	ID              string          `json:"id"`
+	Title           string          `json:"title"`
+	Status          string          `json:"status"`
+	Group           string          `json:"group"`
+	Path            string          `json:"path"`
+	ParentSessionID string          `json:"parent_session_id,omitempty"`
+	Success         *bool           `json:"success,omitempty"`
+	Queue           json.RawMessage `json:"queue,omitempty"`
 }
 
-func hasPendingWaypostNudge(entries []sessionQueueEntry) bool {
+func parseSessionQueue(raw json.RawMessage) ([]sessionQueueEntry, bool) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil, false
+	}
+	var entries []sessionQueueEntry
+	if err := json.Unmarshal([]byte(trimmed), &entries); err != nil {
+		return nil, false
+	}
+	return entries, true
+}
+
+func hasPendingWaypostNudge(entries []sessionQueueEntry, now time.Time) bool {
 	for _, entry := range entries {
 		switch strings.ToLower(strings.TrimSpace(entry.State)) {
 		case "queued", "typing":
-			if isWaypostNudgePreview(entry.TextPreview) {
+			if !isWaypostNudgePreview(entry.TextPreview) {
+				continue
+			}
+			enqueuedAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(entry.EnqueuedAt))
+			if err != nil {
+				continue
+			}
+			if now.Sub(enqueuedAt) < defaultAgentDeckQueueBudget {
 				return true
 			}
 		}

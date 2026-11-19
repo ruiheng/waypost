@@ -58,6 +58,7 @@ type notificationManager struct {
 type agentDeckNotifier struct {
 	runner   Runner
 	sessions *sessionManager
+	now      func() time.Time
 }
 
 type thurboxNotifier struct {
@@ -65,6 +66,15 @@ type thurboxNotifier struct {
 }
 
 func newNotificationManager(runner Runner, sessions *sessionManager) *notificationManager {
+	return newNotificationManagerWithClock(runner, sessions, nil)
+}
+
+func newNotificationManagerWithClock(runner Runner, sessions *sessionManager, now func() time.Time) *notificationManager {
+	if now == nil {
+		now = func() time.Time {
+			return time.Now().UTC()
+		}
+	}
 	manager := &notificationManager{
 		notifiers:              map[string]managerNotifier{},
 		sessions:               sessions,
@@ -75,6 +85,7 @@ func newNotificationManager(runner Runner, sessions *sessionManager) *notificati
 	manager.notifiers["agent-deck"] = agentDeckNotifier{
 		runner:   runner,
 		sessions: sessions,
+		now:      now,
 	}
 	manager.notifiers["thurbox"] = thurboxNotifier{runner: runner}
 	return manager
@@ -506,13 +517,17 @@ func (n agentDeckNotifier) Probe(ctx context.Context, route notificationRoute) n
 		}
 	}
 	if activeSessionStatuses[status] {
-		queueKnown := targetSession.Queue != nil
+		entries, queueKnown := parseSessionQueue(targetSession.Queue)
+		now := time.Now().UTC()
+		if n.now != nil {
+			now = n.now().UTC()
+		}
 		return notificationProbe{
 			Status:       "wakeable",
 			Scheme:       n.Name(),
 			Wakeable:     true,
 			QueueKnown:   queueKnown,
-			PendingNudge: queueKnown && hasPendingWaypostNudge(*targetSession.Queue),
+			PendingNudge: queueKnown && hasPendingWaypostNudge(entries, now),
 		}
 	}
 	return notificationProbe{
@@ -561,6 +576,7 @@ type agentDeckNudgeResult struct {
 	SendID    string `json:"send_id"`
 	State     string `json:"state"`
 	Deadline  string `json:"deadline"`
+	Reason    string `json:"reason"`
 	Error     string `json:"error"`
 	Code      string `json:"code"`
 }
@@ -624,6 +640,7 @@ func parseAgentDeckNudgeResult(stdout string) (agentDeckNudgeResult, bool) {
 		strings.TrimSpace(payload.Delivery) != "" ||
 		strings.TrimSpace(payload.SendID) != "" ||
 		strings.TrimSpace(payload.State) != "" ||
+		strings.TrimSpace(payload.Reason) != "" ||
 		strings.TrimSpace(payload.Error) != "" ||
 		strings.TrimSpace(payload.Code) != ""
 	return payload, structured
@@ -649,6 +666,13 @@ func classifyAgentDeckNudgeResult(scheme string, result RunResult, payload agent
 			Detail: "nudge was sent but agent-deck could not verify whether the target accepted it",
 		}
 	case "queued":
+		if payload.Success != nil && !*payload.Success {
+			return notificationOutcome{
+				Status: "failed",
+				Scheme: scheme,
+				Err:    agentDeckNudgeError(result, payload),
+			}
+		}
 		return queuedAgentDeckOutcome(scheme, payload.Deadline)
 	case "no_evidence":
 		return notificationOutcome{
@@ -664,17 +688,17 @@ func classifyAgentDeckNudgeResult(scheme string, result RunResult, payload agent
 		}
 	case "":
 		state := strings.ToLower(strings.TrimSpace(payload.State))
-		if state == "queued" {
-			return queuedAgentDeckOutcome(scheme, payload.Deadline)
-		}
 		if state == "failed" {
 			return notificationOutcome{Status: "failed", Scheme: scheme, Err: agentDeckNudgeError(result, payload)}
 		}
-		if payload.Success != nil && *payload.Success && result.ExitCode == 0 {
-			return notificationOutcome{Status: "sent", Scheme: scheme}
-		}
 		if payload.Success != nil && !*payload.Success {
 			return notificationOutcome{Status: "failed", Scheme: scheme, Err: agentDeckNudgeError(result, payload)}
+		}
+		if state == "queued" {
+			return queuedAgentDeckOutcome(scheme, payload.Deadline)
+		}
+		if payload.Success != nil && *payload.Success && result.ExitCode == 0 {
+			return notificationOutcome{Status: "sent", Scheme: scheme}
 		}
 		if result.ExitCode == 0 {
 			return notificationOutcome{
@@ -714,6 +738,9 @@ func agentDeckNudgeError(result RunResult, payload agentDeckNudgeResult) error {
 	detail := strings.TrimSpace(payload.Error)
 	if detail == "" {
 		detail = strings.TrimSpace(result.Stderr)
+	}
+	if detail == "" {
+		detail = strings.TrimSpace(payload.Reason)
 	}
 	if detail == "" && strings.TrimSpace(payload.Delivery) != "" {
 		detail = "agent-deck delivery result: " + strings.TrimSpace(payload.Delivery)

@@ -43,9 +43,8 @@ type visibleWaypostState struct {
 }
 
 type queuedWakeState struct {
-	QueuedAt   string
-	Until      string
-	QueueKnown bool
+	QueuedAt string
+	Until    string
 }
 
 type wakeRuntime struct {
@@ -442,7 +441,7 @@ func allowWakeAttempt(snapshot wakeSnapshot, runtime wakeRuntime, now time.Time,
 
 func hasUnprobedQueuedWake(snapshot wakeSnapshot, runtime wakeRuntime, now time.Time, channel WakeChannelName) bool {
 	queued, ok := runtime.QueuedByChannel[channel]
-	if !ok || queued.QueueKnown {
+	if !ok {
 		return false
 	}
 	pendingSince, err := time.Parse(time.RFC3339Nano, snapshot.PendingSince)
@@ -550,11 +549,10 @@ func (s *wakeSchedulerState) markAttemptedOutcome(scopeID string, channel WakeCh
 	timestamp := now.Format(time.RFC3339Nano)
 	runtime.LastAnyWakeAt = timestamp
 	runtime.LastWakeByChannel[channel] = timestamp
-	if outcome.Queued {
+	if outcome.Queued && !queueKnown {
 		runtime.QueuedByChannel[channel] = queuedWakeState{
-			QueuedAt:   timestamp,
-			Until:      resolveQueuedWakeUntil(outcome.QueuedDeadline, now),
-			QueueKnown: queueKnown,
+			QueuedAt: timestamp,
+			Until:    resolveQueuedWakeUntil(outcome.QueuedDeadline, now),
 		}
 	} else {
 		delete(runtime.QueuedByChannel, channel)
@@ -566,13 +564,8 @@ func (s *wakeSchedulerState) markQueuedPending(scopeID string, channel WakeChann
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	runtime := s.ensureRuntimeLocked(scopeID, pendingSince)
-	timestamp := now.Format(time.RFC3339Nano)
-	runtime.LastWakeByChannel[channel] = timestamp
-	runtime.QueuedByChannel[channel] = queuedWakeState{
-		QueuedAt:   timestamp,
-		Until:      now.Add(defaultAgentDeckQueueBudget).Format(time.RFC3339Nano),
-		QueueKnown: true,
-	}
+	runtime.LastWakeByChannel[channel] = now.Format(time.RFC3339Nano)
+	delete(runtime.QueuedByChannel, channel)
 	s.runtimes[scopeID] = runtime
 }
 
@@ -588,12 +581,16 @@ func (s *wakeSchedulerState) clearQueued(scopeID string, channel WakeChannelName
 }
 
 func resolveQueuedWakeUntil(rawDeadline string, now time.Time) string {
+	maxUntil := now.Add(defaultAgentDeckQueueBudget)
 	if trimmed := strings.TrimSpace(rawDeadline); trimmed != "" {
-		if deadline, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
+		if deadline, err := time.Parse(time.RFC3339Nano, trimmed); err == nil && deadline.After(now) {
+			if deadline.After(maxUntil) {
+				deadline = maxUntil
+			}
 			return deadline.UTC().Format(time.RFC3339Nano)
 		}
 	}
-	return now.Add(defaultAgentDeckQueueBudget).Format(time.RFC3339Nano)
+	return maxUntil.UTC().Format(time.RFC3339Nano)
 }
 
 func (s *wakeSchedulerState) reset() {

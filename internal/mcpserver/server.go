@@ -334,7 +334,7 @@ func newService(opts Options) *Service {
 	if service.notifyDelay < 0 {
 		service.notifyDelay = 0
 	}
-	service.notifications = newNotificationManager(service.commandRunner, service.sessions)
+	service.notifications = newNotificationManagerWithClock(service.commandRunner, service.sessions, service.now)
 	service.activeLeases = newActiveLeaseManager()
 	service.waypostRecvGuard = newWaypostRecvGuard()
 	service.wakeSchedulerState = newWakeSchedulerState()

@@ -34,15 +34,23 @@ var (
 	toolSessionIDPattern    = regexp.MustCompile(`^[0-9a-fA-F][0-9a-fA-F-]*[0-9a-fA-F]$|^[0-9a-fA-F]$`)
 )
 
+type bindingMode string
+
+const (
+	bindingModeUnbound          bindingMode = "unbound"
+	bindingModeAutoEmpty        bindingMode = "auto_empty"
+	bindingModeAutoToolFallback bindingMode = "auto_tool_fallback"
+	bindingModeAutoHostBound    bindingMode = "auto_host_bound"
+	bindingModeManual           bindingMode = "manual"
+	bindingModeCLISuppressed    bindingMode = "cli_suppressed"
+)
+
 type serverState struct {
 	mu                       sync.Mutex
 	boundAddresses           []string
 	defaultSender            string
 	defaultWorkdir           string
-	manualBinding            bool
-	autoBindAttempted        bool
-	autoBindEmptyResult      bool
-	autoBoundToolFallback    bool
+	mode                     bindingMode
 	autoBindWarnings         []string
 	detectedAgentDeckSession string
 	detectedThurboxSession   string
@@ -50,7 +58,45 @@ type serverState struct {
 	statusToolCalled         bool
 }
 
+func (s *serverState) effectiveMode() bindingMode {
+	if s.mode == "" {
+		return bindingModeUnbound
+	}
+	return s.mode
+}
+
+func (s *serverState) setManualBinding(addresses []string, defaultSender, defaultWorkdir string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.boundAddresses = append([]string(nil), addresses...)
+	s.defaultSender = defaultSender
+	s.defaultWorkdir = defaultWorkdir
+	s.mode = bindingModeManual
+	s.autoBindWarnings = nil
+	s.detectedAgentDeckSession = ""
+	s.detectedThurboxSession = ""
+	s.detectedToolSessions = nil
+}
+
+func (s *serverState) setCLISuppressed(fromAddress string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mode = bindingModeCLISuppressed
+	s.boundAddresses = nil
+	s.defaultSender = ""
+	s.defaultWorkdir = ""
+	s.autoBindWarnings = nil
+	s.detectedAgentDeckSession = ""
+	s.detectedThurboxSession = ""
+	s.detectedToolSessions = nil
+	if trimmed := strings.TrimSpace(fromAddress); trimmed != "" {
+		s.boundAddresses = []string{trimmed}
+		s.defaultSender = trimmed
+	}
+}
+
 type stateSnapshot struct {
+	BindingMode              bindingMode
 	BoundAddresses           []string
 	DefaultSender            string
 	DefaultWorkdir           string
@@ -227,19 +273,7 @@ func (m *sessionManager) bind(ctx context.Context, input waypostBindInput) (boun
 		}
 	}
 
-	m.state.mu.Lock()
-	m.state.boundAddresses = boundAddresses
-	m.state.defaultSender = defaultSender
-	m.state.defaultWorkdir = strings.TrimSpace(input.DefaultWorkdir)
-	m.state.manualBinding = true
-	m.state.autoBindAttempted = true
-	m.state.autoBindEmptyResult = false
-	m.state.autoBoundToolFallback = false
-	m.state.autoBindWarnings = nil
-	m.state.detectedAgentDeckSession = ""
-	m.state.detectedThurboxSession = ""
-	m.state.detectedToolSessions = nil
-	m.state.mu.Unlock()
+	m.state.setManualBinding(boundAddresses, defaultSender, strings.TrimSpace(input.DefaultWorkdir))
 
 	return m.boundState(ctx)
 }
@@ -291,14 +325,16 @@ func (m *sessionManager) boundState(ctx context.Context) (boundState, error) {
 func (m *sessionManager) snapshotState() stateSnapshot {
 	m.state.mu.Lock()
 	defer m.state.mu.Unlock()
+	mode := m.state.effectiveMode()
 	return stateSnapshot{
+		BindingMode:              mode,
 		BoundAddresses:           append([]string(nil), m.state.boundAddresses...),
 		DefaultSender:            m.state.defaultSender,
 		DefaultWorkdir:           m.state.defaultWorkdir,
-		ManualBinding:            m.state.manualBinding,
-		AutoBindAttempted:        m.state.autoBindAttempted,
-		AutoBindEmptyResult:      m.state.autoBindEmptyResult,
-		AutoBoundToolFallback:    m.state.autoBoundToolFallback,
+		ManualBinding:            mode == bindingModeManual,
+		AutoBindAttempted:        mode != bindingModeUnbound,
+		AutoBindEmptyResult:      mode == bindingModeAutoEmpty,
+		AutoBoundToolFallback:    mode == bindingModeAutoToolFallback,
 		AutoBindWarnings:         append([]string(nil), m.state.autoBindWarnings...),
 		DetectedAgentDeckSession: m.state.detectedAgentDeckSession,
 		DetectedThurboxSession:   m.state.detectedThurboxSession,
@@ -309,9 +345,9 @@ func (m *sessionManager) snapshotState() stateSnapshot {
 
 func (m *sessionManager) tryAutoBindCurrentSession(ctx context.Context) error {
 	snapshot := m.snapshotState()
-	// waypost_bind is an explicit operator choice. Discovery must never append
-	// Agent Deck or Thurbox addresses to that user-supplied binding later.
-	if snapshot.ManualBinding {
+	// waypost_bind is an explicit operator choice, and cli_suppressed marks a
+	// standalone CLI notification harness. Discovery must never mutate either.
+	if snapshot.BindingMode == bindingModeManual || snapshot.BindingMode == bindingModeCLISuppressed {
 		return nil
 	}
 
@@ -319,31 +355,41 @@ func (m *sessionManager) tryAutoBindCurrentSession(ctx context.Context) error {
 	if len(snapshot.BoundAddresses) > 0 {
 		if len(thurboxWarnings) > 0 {
 			m.state.mu.Lock()
-			if !m.state.manualBinding {
+			if mode := m.state.effectiveMode(); mode != bindingModeManual && mode != bindingModeCLISuppressed {
 				m.state.autoBindWarnings = dedupe(append(m.state.autoBindWarnings, thurboxWarnings...))
 			}
 			m.state.mu.Unlock()
 		}
 		if thurboxSessionID != "" && snapshot.DetectedThurboxSession != thurboxSessionID {
 			m.state.mu.Lock()
-			if !m.state.manualBinding && len(m.state.boundAddresses) > 0 {
-				m.state.boundAddresses = dedupe(append([]string{thurboxAddress(thurboxSessionID)}, m.state.boundAddresses...))
+			if mode := m.state.effectiveMode(); mode != bindingModeManual && mode != bindingModeCLISuppressed && len(m.state.boundAddresses) > 0 {
+				previousThurbox := m.state.detectedThurboxSession
+				updated := make([]string, 0, len(m.state.boundAddresses)+1)
+				updated = append(updated, thurboxAddress(thurboxSessionID))
+				for _, address := range m.state.boundAddresses {
+					if previousThurbox != "" && address == thurboxAddress(previousThurbox) {
+						continue
+					}
+					updated = append(updated, address)
+				}
+				m.state.boundAddresses = dedupe(updated)
 				m.state.detectedThurboxSession = thurboxSessionID
 				m.state.defaultSender = thurboxAddress(thurboxSessionID)
+				m.state.mode = bindingModeAutoHostBound
 				m.state.autoBindWarnings = dedupe(append(m.state.autoBindWarnings, thurboxWarnings...))
 			}
 			m.state.mu.Unlock()
 			snapshot = m.snapshotState()
 		}
-		if snapshot.AutoBoundToolFallback && snapshot.DetectedAgentDeckSession == "" && len(detectedToolSessionAddresses(snapshot)) > 0 {
+		if snapshot.BindingMode == bindingModeAutoToolFallback && snapshot.DetectedAgentDeckSession == "" && len(detectedToolSessionAddresses(snapshot)) > 0 {
 			return m.tryUpgradeAgentDeckBinding(ctx, snapshot)
 		}
-		if snapshot.DetectedAgentDeckSession != "" && snapshot.DetectedToolSessions["codex"] == "" {
+		if snapshot.DetectedAgentDeckSession != "" && len(snapshot.DetectedToolSessions) == 0 {
 			return m.tryCompleteCodexBindingFromAgentDeckDB(ctx, snapshot)
 		}
 		return nil
 	}
-	if snapshot.AutoBindAttempted && !snapshot.AutoBindEmptyResult {
+	if snapshot.BindingMode != bindingModeUnbound && snapshot.BindingMode != bindingModeAutoEmpty {
 		return nil
 	}
 
@@ -354,25 +400,21 @@ func (m *sessionManager) tryAutoBindCurrentSession(ctx context.Context) error {
 	defaultWorkdir := snapshot.DefaultWorkdir
 	agentDeckSessionID, defaultWorkdir, probeCompleted, agentDeckWarnings, err := m.detectCurrentAgentDeckSessionID(ctx, codexSessionID, defaultWorkdir)
 	if err != nil {
-		// A nested Thurbox session is usable even when an outer Agent Deck probe
-		// is broken. Preserve that probe only as a diagnostic warning.
-		if thurboxSessionID == "" {
-			return err
-		}
-		autoBindWarnings = append(autoBindWarnings, fmt.Sprintf("agent-deck auto-bind probe failed while Thurbox was detected: %v", err))
-		agentDeckSessionID = ""
-		probeCompleted = false
+		return err
 	}
 	autoBindWarnings = append(autoBindWarnings, agentDeckWarnings...)
 	if agentDeckSessionID != "" {
 		data, err := m.resolveSessionShowBestEffort(ctx, agentDeckSessionID)
 		if err != nil {
-			autoBindWarnings = append(autoBindWarnings, fmt.Sprintf("agent-deck session show returned invalid data during auto-bind: %v", err))
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			autoBindWarnings = append(autoBindWarnings, sessionShowWarningMessage(err))
 		} else if data != nil && strings.TrimSpace(data.Path) != "" {
 			defaultWorkdir = strings.TrimSpace(data.Path)
 		}
 	}
-	if codexSessionID == "" && agentDeckSessionID != "" {
+	if len(detectedToolSessions) == 0 && agentDeckSessionID != "" {
 		match, lookupWarnings := lookupAgentDeckSessionByWorkdir(ctx, firstNonEmpty(defaultWorkdir, currentWorkingDir()), agentDeckSessionID)
 		autoBindWarnings = append(autoBindWarnings, lookupWarnings...)
 		if match != nil {
@@ -405,7 +447,7 @@ func (m *sessionManager) tryAutoBindCurrentSession(ctx context.Context) error {
 
 	m.state.mu.Lock()
 	defer m.state.mu.Unlock()
-	if len(m.state.boundAddresses) > 0 {
+	if mode := m.state.effectiveMode(); mode == bindingModeManual || mode == bindingModeCLISuppressed || len(m.state.boundAddresses) > 0 {
 		return nil
 	}
 	m.state.boundAddresses = dedupe(addresses)
@@ -413,9 +455,14 @@ func (m *sessionManager) tryAutoBindCurrentSession(ctx context.Context) error {
 	m.state.detectedThurboxSession = thurboxSessionID
 	m.state.detectedToolSessions = detectedToolSessions.clone()
 	m.state.defaultWorkdir = defaultWorkdir
-	m.state.manualBinding = false
-	m.state.autoBoundToolFallback = detectedAgentDeckSession == "" && thurboxSessionID == "" && len(addresses) > 0
-	m.state.autoBindEmptyResult = len(addresses) == 0
+	switch {
+	case len(addresses) == 0:
+		m.state.mode = bindingModeAutoEmpty
+	case detectedAgentDeckSession == "" && thurboxSessionID == "":
+		m.state.mode = bindingModeAutoToolFallback
+	default:
+		m.state.mode = bindingModeAutoHostBound
+	}
 	m.state.autoBindWarnings = append([]string(nil), autoBindWarnings...)
 	if thurboxSessionID != "" {
 		m.state.defaultSender = thurboxAddress(thurboxSessionID)
@@ -424,7 +471,6 @@ func (m *sessionManager) tryAutoBindCurrentSession(ctx context.Context) error {
 	} else if len(addresses) > 0 {
 		m.state.defaultSender = addresses[0]
 	}
-	m.state.autoBindAttempted = true
 	return nil
 }
 
@@ -433,8 +479,9 @@ func (m *sessionManager) tryCompleteCodexBindingFromAgentDeckDB(ctx context.Cont
 	if match == nil || strings.TrimSpace(match.CodexSessionID) == "" {
 		if len(lookupWarnings) > 0 {
 			m.state.mu.Lock()
-			if m.state.detectedAgentDeckSession == snapshot.DetectedAgentDeckSession &&
-				m.state.detectedToolSessions["codex"] == "" &&
+			if m.state.effectiveMode() == bindingModeAutoHostBound &&
+				m.state.detectedAgentDeckSession == snapshot.DetectedAgentDeckSession &&
+				len(m.state.detectedToolSessions) == 0 &&
 				slices.Contains(m.state.boundAddresses, agentDeckAddress(snapshot.DetectedAgentDeckSession)) {
 				m.state.autoBindWarnings = dedupe(append(m.state.autoBindWarnings, lookupWarnings...))
 			}
@@ -445,8 +492,9 @@ func (m *sessionManager) tryCompleteCodexBindingFromAgentDeckDB(ctx context.Cont
 
 	m.state.mu.Lock()
 	defer m.state.mu.Unlock()
-	if m.state.detectedAgentDeckSession != snapshot.DetectedAgentDeckSession ||
-		m.state.detectedToolSessions["codex"] != "" ||
+	if m.state.effectiveMode() != bindingModeAutoHostBound ||
+		m.state.detectedAgentDeckSession != snapshot.DetectedAgentDeckSession ||
+		len(m.state.detectedToolSessions) > 0 ||
 		!slices.Contains(m.state.boundAddresses, agentDeckAddress(snapshot.DetectedAgentDeckSession)) {
 		return nil
 	}
@@ -455,12 +503,22 @@ func (m *sessionManager) tryCompleteCodexBindingFromAgentDeckDB(ctx context.Cont
 		m.state.detectedToolSessions = toolSessionIDs{}
 	}
 	m.state.detectedToolSessions["codex"] = match.CodexSessionID
-	m.state.autoBindEmptyResult = false
 	m.state.autoBindWarnings = dedupe(append(append(toolSessionEnvWarnings(), lookupWarnings...), m.state.autoBindWarnings...))
 	if strings.TrimSpace(match.ProjectPath) != "" && m.state.defaultWorkdir == "" {
 		m.state.defaultWorkdir = strings.TrimSpace(match.ProjectPath)
 	}
 	return nil
+}
+
+func mergeNonAgentDeckWarnings(existing, current []string) []string {
+	merged := make([]string, 0, len(existing)+len(current))
+	for _, warning := range existing {
+		if !strings.HasPrefix(warning, "agent-deck ") {
+			merged = append(merged, warning)
+		}
+	}
+	merged = append(merged, current...)
+	return dedupe(merged)
 }
 
 func (m *sessionManager) tryUpgradeAgentDeckBinding(ctx context.Context, snapshot stateSnapshot) error {
@@ -469,10 +527,10 @@ func (m *sessionManager) tryUpgradeAgentDeckBinding(ctx context.Context, snapsho
 	if err != nil {
 		return err
 	}
-	autoBindWarnings = append(toolSessionEnvWarnings(), autoBindWarnings...)
+	autoBindWarnings = mergeNonAgentDeckWarnings(snapshot.AutoBindWarnings, append(toolSessionEnvWarnings(), autoBindWarnings...))
 	if agentDeckSessionID == "" {
 		m.state.mu.Lock()
-		if m.state.autoBoundToolFallback && m.state.detectedAgentDeckSession == "" && currentToolFallbackMatchesSnapshot(m.state, snapshot) {
+		if m.state.effectiveMode() == bindingModeAutoToolFallback && m.state.detectedAgentDeckSession == "" && currentToolFallbackMatchesSnapshot(m.state, snapshot) {
 			m.state.autoBindWarnings = append([]string(nil), autoBindWarnings...)
 		}
 		m.state.mu.Unlock()
@@ -480,14 +538,17 @@ func (m *sessionManager) tryUpgradeAgentDeckBinding(ctx context.Context, snapsho
 	}
 
 	if data, err := m.resolveSessionShowBestEffort(ctx, agentDeckSessionID); err != nil {
-		autoBindWarnings = append(autoBindWarnings, fmt.Sprintf("agent-deck session show returned invalid data during auto-bind: %v", err))
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		autoBindWarnings = append(autoBindWarnings, sessionShowWarningMessage(err))
 	} else if data != nil && strings.TrimSpace(data.Path) != "" {
 		defaultWorkdir = strings.TrimSpace(data.Path)
 	}
 
 	m.state.mu.Lock()
 	defer m.state.mu.Unlock()
-	if !m.state.autoBoundToolFallback ||
+	if m.state.effectiveMode() != bindingModeAutoToolFallback ||
 		m.state.detectedAgentDeckSession != "" ||
 		!currentToolFallbackMatchesSnapshot(m.state, snapshot) {
 		return nil
@@ -496,14 +557,20 @@ func (m *sessionManager) tryUpgradeAgentDeckBinding(ctx context.Context, snapsho
 	m.state.boundAddresses = dedupe(addresses)
 	m.state.detectedAgentDeckSession = agentDeckSessionID
 	m.state.defaultWorkdir = defaultWorkdir
-	m.state.autoBoundToolFallback = false
-	m.state.autoBindEmptyResult = false
-	m.state.autoBindWarnings = append([]string(nil), autoBindWarnings...)
+	m.state.mode = bindingModeAutoHostBound
+	m.state.autoBindWarnings = dedupe(autoBindWarnings)
 	if m.state.defaultSender == "" || slices.Contains(detectedToolSessionAddresses(snapshot), m.state.defaultSender) {
 		m.state.defaultSender = agentDeckAddress(agentDeckSessionID)
 	}
-	m.state.autoBindAttempted = true
 	return nil
+}
+
+func sessionShowWarningMessage(err error) string {
+	var cmdTimeout *commandTimeoutError
+	if errors.As(err, &cmdTimeout) {
+		return fmt.Sprintf("agent-deck session show timed out during auto-bind: %v", err)
+	}
+	return fmt.Sprintf("agent-deck session show returned invalid data during auto-bind: %v", err)
 }
 
 func (m *sessionManager) detectCurrentAgentDeckSessionID(ctx context.Context, codexSessionID, defaultWorkdir string) (string, string, bool, []string, error) {
@@ -515,7 +582,12 @@ func (m *sessionManager) detectCurrentAgentDeckSessionID(ctx context.Context, co
 	if agentDeckSessionID == "" {
 		result, err := runProbe(ctx, m.runner, []string{"agent-deck", "session", "current", "--json"}, runOptions{timeout: syncCmdTimeout}, false)
 		if err != nil {
-			return "", defaultWorkdir, probeCompleted, warnings, err
+			var cmdTimeout *commandTimeoutError
+			if errors.As(err, &cmdTimeout) {
+				warnings = append(warnings, fmt.Sprintf("agent-deck session current timed out during auto-bind: %v", err))
+			} else {
+				return "", defaultWorkdir, probeCompleted, warnings, err
+			}
 		}
 		if result != nil {
 			probeCompleted = true
@@ -938,6 +1010,31 @@ func (m *sessionManager) waypostReceiveAddresses(ctx context.Context, addresses 
 }
 
 func (m *sessionManager) senderAddress(ctx context.Context, override string) (string, error) {
+	if err := validateOptionalSenderAddress(override); err != nil {
+		return "", err
+	}
+	bound, err := m.boundState(ctx)
+	if err != nil {
+		return "", err
+	}
+	return resolveSenderAddressFromBound(bound, override)
+}
+
+func validateOptionalSenderAddress(override string) error {
+	if strings.TrimSpace(override) == "" {
+		return nil
+	}
+	address, err := waypost.NormalizeAddress(override)
+	if err != nil {
+		return err
+	}
+	if waypost.IsGroupAddress(address) {
+		return fmt.Errorf("sender address %q uses reserved group/ prefix", address)
+	}
+	return nil
+}
+
+func resolveSenderAddressFromBound(bound boundState, override string) (string, error) {
 	if strings.TrimSpace(override) != "" {
 		address, err := waypost.NormalizeAddress(override)
 		if err != nil {
@@ -946,18 +1043,10 @@ func (m *sessionManager) senderAddress(ctx context.Context, override string) (st
 		if waypost.IsGroupAddress(address) {
 			return "", fmt.Errorf("sender address %q uses reserved group/ prefix", address)
 		}
-		bound, err := m.boundState(ctx)
-		if err != nil {
-			return "", err
-		}
 		if !slices.Contains(bound.BoundAddresses, address) {
 			return "", fmt.Errorf("from_address %q is not bound to this MCP server", address)
 		}
 		return address, nil
-	}
-	bound, err := m.boundState(ctx)
-	if err != nil {
-		return "", err
 	}
 	switch {
 	case bound.DefaultSender != "":
@@ -980,6 +1069,14 @@ func (m *sessionManager) isLocalAddress(ctx context.Context, address string) boo
 		}
 	}
 	return false
+}
+
+func (m *sessionManager) isBoundLocalAddress(address string) bool {
+	trimmed := strings.TrimSpace(address)
+	if trimmed == "" {
+		return false
+	}
+	return slices.Contains(m.snapshotState().BoundAddresses, trimmed)
 }
 
 func (m *sessionManager) resolveSessionShow(ctx context.Context, identifier string, timeout time.Duration) (*sessionData, error) {

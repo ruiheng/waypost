@@ -61,37 +61,8 @@ type waypostSender interface {
 	Send(context.Context, waypost.SendParams) (waypost.SendResult, error)
 }
 
-type waypostLister interface {
-	List(context.Context, waypost.ListParams) ([]waypost.ListedDelivery, error)
-}
-
-type waypostGroupMessageLister interface {
-	ListGroupMessages(context.Context, waypost.GroupListParams) ([]waypost.GroupListedMessage, error)
-}
-
-type waypostGroupMessageWaiter interface {
-	WaitGroupMessage(context.Context, waypost.GroupWaitParams) (waypost.GroupListedMessage, error)
-}
-
 type waypostGroupMessageReceiver interface {
 	ReceiveGroupMessage(context.Context, waypost.GroupReceiveParams) (waypost.GroupReceivedMessage, error)
-}
-
-type waypostGroupManager interface {
-	CreateGroup(context.Context, string) (waypost.GroupRecord, error)
-	AddGroupMember(context.Context, string, string) (waypost.GroupMembershipRecord, error)
-	RemoveGroupMember(context.Context, string, string) (waypost.GroupMembershipRecord, error)
-	ListGroupMembers(context.Context, string) ([]waypost.GroupMembershipRecord, error)
-}
-
-type waypostGroupSubscriberManager interface {
-	AddGroupNotificationSubscriber(context.Context, string, string, string) (waypost.GroupNotificationSubscriberRecord, error)
-	RemoveGroupNotificationSubscriber(context.Context, string, string) (waypost.GroupNotificationSubscriberRecord, error)
-	ListGroupNotificationSubscribers(context.Context, string) ([]waypost.GroupNotificationSubscriberRecord, error)
-}
-
-type waypostAddressInspector interface {
-	InspectAddress(context.Context, string) (waypost.AddressInspection, error)
 }
 
 type waypostClaimableLister interface {
@@ -102,28 +73,14 @@ type waypostBatchReceiver interface {
 	ReceiveBatchWithLeaseTTL(context.Context, waypost.ReceiveBatchParams, time.Duration) (waypost.ReceiveResult, error)
 }
 
-type waypostWaiter interface {
-	Wait(context.Context, waypost.WaitParams) (waypost.ListedDelivery, error)
-}
-
 type waypostDeliveryReader interface {
 	ReadDeliveries(context.Context, []string) ([]waypost.ReadDelivery, error)
-}
-
-type waypostMessageReader interface {
-	ReadMessages(context.Context, []string) ([]waypost.ReadMessage, error)
-}
-
-type waypostLatestDeliveryReader interface {
-	ReadLatestDeliveries(context.Context, []string, string, int) ([]waypost.ReadDelivery, bool, error)
 }
 
 type waypostDeliveryTransitioner interface {
 	Ack(context.Context, string, string) (waypost.DeliveryTransitionResult, error)
 	Release(context.Context, string, string) (waypost.DeliveryTransitionResult, error)
 	Defer(context.Context, string, string, time.Time) (waypost.DeliveryTransitionResult, error)
-	Undefer(context.Context, string) (waypost.DeliveryTransitionResult, error)
-	Fail(context.Context, string, string, string) (waypost.DeliveryTransitionResult, error)
 }
 
 type waypostLeaseRenewer interface {
@@ -422,6 +379,12 @@ func (s *Service) Server() *mcp.Server {
 	return server
 }
 
+func (s *Service) existingServer() *mcp.Server {
+	s.serverMu.Lock()
+	defer s.serverMu.Unlock()
+	return s.server
+}
+
 func serverInstructions(includeDebugTool bool) string {
 	statusGate := "Once after this MCP server starts, call waypost_status before the first waypost_* tool."
 	if includeDebugTool {
@@ -489,7 +452,15 @@ func withWaypostService[T any, S any](ctx context.Context, factory waypostServic
 	return fn(service)
 }
 
-func runCommand(ctx context.Context, runner Runner, args []string, opts runOptions) (RunResult, error) {
+type commandTimeoutError struct {
+	timeout time.Duration
+}
+
+func (e *commandTimeoutError) Error() string {
+	return fmt.Sprintf("timed out after %dms", e.timeout.Milliseconds())
+}
+
+func execSubprocess(ctx context.Context, runner Runner, args []string, opts runOptions) (RunResult, error) {
 	runCtx := ctx
 	var cancel context.CancelFunc
 	if opts.timeout > 0 {
@@ -499,14 +470,37 @@ func runCommand(ctx context.Context, runner Runner, args []string, opts runOptio
 
 	result, err := runner.Run(runCtx, args, opts.input)
 	if err != nil {
-		detail := err.Error()
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			return RunResult{}, fmt.Errorf("command failed: %s :: timed out after %dms: %w", strings.Join(args, " "), opts.timeout.Milliseconds(), context.DeadlineExceeded)
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return RunResult{}, context.Canceled
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return RunResult{}, context.DeadlineExceeded
+		}
+		if opts.timeout > 0 && (errors.Is(err, context.DeadlineExceeded) || errors.Is(runCtx.Err(), context.DeadlineExceeded)) {
+			return RunResult{}, &commandTimeoutError{timeout: opts.timeout}
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(runCtx.Err(), context.Canceled) {
-			return RunResult{}, fmt.Errorf("command failed: %s :: canceled: %w", strings.Join(args, " "), context.Canceled)
+			return RunResult{}, context.Canceled
 		}
-		return RunResult{}, fmt.Errorf("command failed: %s :: %s", strings.Join(args, " "), detail)
+		return RunResult{}, err
+	}
+	return result, nil
+}
+
+func runCommand(ctx context.Context, runner Runner, args []string, opts runOptions) (RunResult, error) {
+	result, err := execSubprocess(ctx, runner, args, opts)
+	if err != nil {
+		var timeoutErr *commandTimeoutError
+		switch {
+		case errors.Is(err, context.Canceled):
+			return RunResult{}, fmt.Errorf("command failed: %s :: canceled: %w", strings.Join(args, " "), err)
+		case errors.Is(err, context.DeadlineExceeded):
+			return RunResult{}, fmt.Errorf("command failed: %s :: %w", strings.Join(args, " "), err)
+		case errors.As(err, &timeoutErr):
+			return RunResult{}, fmt.Errorf("command failed: %s :: %w", strings.Join(args, " "), timeoutErr)
+		default:
+			return RunResult{}, fmt.Errorf("command failed: %s :: %s", strings.Join(args, " "), err.Error())
+		}
 	}
 
 	okCodes := opts.okCodes
@@ -532,19 +526,17 @@ func runCommand(ctx context.Context, runner Runner, args []string, opts runOptio
 // stderr, or runner error because any of them can echo that value. Callers
 // must pass a fixed, public operation label.
 func runRedactedCommand(ctx context.Context, runner Runner, args []string, opts runOptions, operation string) (RunResult, error) {
-	runCtx := ctx
-	var cancel context.CancelFunc
-	if opts.timeout > 0 {
-		runCtx, cancel = context.WithTimeout(ctx, opts.timeout)
-		defer cancel()
-	}
-
-	result, err := runner.Run(runCtx, args, opts.input)
+	result, err := execSubprocess(ctx, runner, args, opts)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			return RunResult{}, fmt.Errorf("%s failed: timed out after %dms", operation, opts.timeout.Milliseconds())
+		var timeoutErr *commandTimeoutError
+		switch {
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			return RunResult{}, fmt.Errorf("%s failed: %w", operation, err)
+		case errors.As(err, &timeoutErr):
+			return RunResult{}, fmt.Errorf("%s failed: %w", operation, timeoutErr)
+		default:
+			return RunResult{}, fmt.Errorf("%s failed", operation)
 		}
-		return RunResult{}, fmt.Errorf("%s failed", operation)
 	}
 
 	okCodes := opts.okCodes
@@ -558,23 +550,29 @@ func runRedactedCommand(ctx context.Context, runner Runner, args []string, opts 
 }
 
 func runProbe(ctx context.Context, runner Runner, args []string, opts runOptions, failOnError bool) (*RunResult, error) {
-	runCtx := ctx
-	var cancel context.CancelFunc
-	if opts.timeout > 0 {
-		runCtx, cancel = context.WithTimeout(ctx, opts.timeout)
-		defer cancel()
-	}
-
-	result, err := runner.Run(runCtx, args, opts.input)
+	result, err := execSubprocess(ctx, runner, args, opts)
 	if err != nil {
+		var timeoutErr *commandTimeoutError
 		if !failOnError {
-			return nil, nil
+			switch {
+			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+				return nil, err
+			case errors.As(err, &timeoutErr):
+				return nil, fmt.Errorf("command failed: %s :: %w", strings.Join(args, " "), timeoutErr)
+			default:
+				return nil, nil
+			}
 		}
-		detail := err.Error()
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			detail = fmt.Sprintf("timed out after %dms", opts.timeout.Milliseconds())
+		switch {
+		case errors.Is(err, context.Canceled):
+			return nil, fmt.Errorf("command failed: %s :: canceled: %w", strings.Join(args, " "), err)
+		case errors.Is(err, context.DeadlineExceeded):
+			return nil, fmt.Errorf("command failed: %s :: %w", strings.Join(args, " "), err)
+		case errors.As(err, &timeoutErr):
+			return nil, fmt.Errorf("command failed: %s :: %w", strings.Join(args, " "), timeoutErr)
+		default:
+			return nil, fmt.Errorf("command failed: %s :: %s", strings.Join(args, " "), err.Error())
 		}
-		return nil, fmt.Errorf("command failed: %s :: %s", strings.Join(args, " "), detail)
 	}
 	return &result, nil
 }

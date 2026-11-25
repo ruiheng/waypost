@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/ruiheng/waypost/internal/waypost"
@@ -36,20 +37,64 @@ func (e *leaseRenewalFailure) Unwrap() error {
 	return e.Cause
 }
 
+type trackedLeaseEntry struct {
+	lease   activeLease
+	active  bool
+	failure *leaseRenewalFailure
+}
+
 type activeLeaseManager struct {
 	mu        sync.Mutex
-	leases    map[string]activeLease
-	history   map[string]activeLease
-	failures  map[string]leaseRenewalFailure
+	entries   map[string]trackedLeaseEntry
+	activeIDs map[string]struct{}
 	lastError error
 }
 
 func newActiveLeaseManager() *activeLeaseManager {
 	return &activeLeaseManager{
-		leases:   map[string]activeLease{},
-		history:  map[string]activeLease{},
-		failures: map[string]leaseRenewalFailure{},
+		entries:   map[string]trackedLeaseEntry{},
+		activeIDs: map[string]struct{}{},
 	}
+}
+
+func (m *activeLeaseManager) setActiveIDLocked(deliveryID string, active bool) {
+	if active {
+		if m.activeIDs == nil {
+			m.activeIDs = map[string]struct{}{}
+		}
+		m.activeIDs[deliveryID] = struct{}{}
+		return
+	}
+	delete(m.activeIDs, deliveryID)
+}
+
+func (m *activeLeaseManager) recomputeLastErrorLocked() {
+	deliveryIDs := make([]string, 0, len(m.activeIDs))
+	for deliveryID := range m.activeIDs {
+		entry, ok := m.entries[deliveryID]
+		if ok && entry.active && entry.failure != nil {
+			deliveryIDs = append(deliveryIDs, deliveryID)
+		}
+	}
+	if len(deliveryIDs) == 0 {
+		m.lastError = nil
+		return
+	}
+	sort.Strings(deliveryIDs)
+	var firstFailure *leaseRenewalFailure
+	for _, deliveryID := range deliveryIDs {
+		failure := m.entries[deliveryID].failure
+		if firstFailure == nil {
+			firstFailure = failure
+		}
+		if failure.Definitive {
+			copied := *failure
+			m.lastError = &copied
+			return
+		}
+	}
+	copied := *firstFailure
+	m.lastError = &copied
 }
 
 func (m *activeLeaseManager) trackReceive(result waypost.ReceiveResult, claimedAt string) {
@@ -57,57 +102,75 @@ func (m *activeLeaseManager) trackReceive(result waypost.ReceiveResult, claimedA
 	defer m.mu.Unlock()
 
 	for _, message := range result.Messages {
+		deliveryID := strings.TrimSpace(message.DeliveryID)
+		leaseToken := strings.TrimSpace(message.LeaseToken)
+		if deliveryID == "" {
+			continue
+		}
 		lease := activeLease{
-			DeliveryID:       message.DeliveryID,
+			DeliveryID:       deliveryID,
 			RecipientAddress: message.RecipientAddress,
-			LeaseToken:       message.LeaseToken,
+			LeaseToken:       leaseToken,
 			LeaseExpiresAt:   message.LeaseExpiresAt,
 			Subject:          message.Subject,
 			ContentType:      message.ContentType,
 			ClaimedAt:        claimedAt,
 			Status:           "active",
 		}
-		m.leases[message.DeliveryID] = lease
-		m.history[message.DeliveryID] = lease
-		delete(m.failures, message.DeliveryID)
+		m.entries[deliveryID] = trackedLeaseEntry{
+			lease:  lease,
+			active: true,
+		}
+		m.setActiveIDLocked(deliveryID, true)
 	}
+	m.recomputeLastErrorLocked()
 }
 
-func (m *activeLeaseManager) updateRenewed(result waypost.LeaseRenewResult, renewedAt string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	lease, ok := m.leases[result.DeliveryID]
-	if !ok {
+func (m *activeLeaseManager) updateRenewed(expectedToken string, result waypost.LeaseRenewResult, renewedAt string) {
+	deliveryID := strings.TrimSpace(result.DeliveryID)
+	expectedToken = strings.TrimSpace(expectedToken)
+	newToken := strings.TrimSpace(result.LeaseToken)
+	if deliveryID == "" || expectedToken == "" || newToken == "" {
 		return
 	}
-	lease.LeaseToken = result.LeaseToken
-	lease.LeaseExpiresAt = result.LeaseExpiresAt
-	lease.LastRenewedAt = renewedAt
-	m.leases[result.DeliveryID] = lease
-	if history, ok := m.history[result.DeliveryID]; ok {
-		history.LeaseToken = result.LeaseToken
-		history.LeaseExpiresAt = result.LeaseExpiresAt
-		history.LastRenewedAt = renewedAt
-		m.history[result.DeliveryID] = history
-	}
-	delete(m.failures, result.DeliveryID)
-	if len(m.failures) == 0 {
-		m.lastError = nil
-	}
-}
 
-func (m *activeLeaseManager) markTerminal(deliveryID, status, terminalAt string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.leases, deliveryID)
-	delete(m.failures, deliveryID)
-	if history, ok := m.history[deliveryID]; ok {
-		history.Status = status
-		history.TerminalAt = terminalAt
-		history.LeaseToken = ""
-		m.history[deliveryID] = history
+
+	entry, ok := m.entries[deliveryID]
+	if !ok || !entry.active || entry.lease.LeaseToken != expectedToken {
+		return
 	}
+	entry.lease.LeaseToken = newToken
+	entry.lease.LeaseExpiresAt = result.LeaseExpiresAt
+	entry.lease.LastRenewedAt = renewedAt
+	entry.failure = nil
+	m.entries[deliveryID] = entry
+	m.recomputeLastErrorLocked()
+}
+
+func (m *activeLeaseManager) markTerminal(deliveryID, expectedToken, status, terminalAt string) {
+	deliveryID = strings.TrimSpace(deliveryID)
+	expectedToken = strings.TrimSpace(expectedToken)
+	if deliveryID == "" || expectedToken == "" {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.entries[deliveryID]
+	if !ok || !entry.active || entry.lease.LeaseToken != expectedToken {
+		return
+	}
+	entry.active = false
+	entry.failure = nil
+	entry.lease.Status = status
+	entry.lease.TerminalAt = terminalAt
+	entry.lease.LeaseToken = ""
+	m.entries[deliveryID] = entry
+	m.setActiveIDLocked(deliveryID, false)
+	m.recomputeLastErrorLocked()
 }
 
 // reconcileTrackedLeases makes durable delivery state the single authority for
@@ -115,53 +178,72 @@ func (m *activeLeaseManager) markTerminal(deliveryID, status, terminalAt string)
 // cache stays independent of any particular runtime implementation.
 func (m *activeLeaseManager) reconcileTrackedLeases(ctx context.Context, observedAt string, inspect func(context.Context, string) (waypost.DeliveryLeaseState, error)) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	deliveryIDs := make([]string, 0, len(m.leases))
-	for deliveryID := range m.leases {
-		deliveryIDs = append(deliveryIDs, deliveryID)
-	}
-	sort.Strings(deliveryIDs)
-	for _, deliveryID := range deliveryIDs {
-		lease, ok := m.leases[deliveryID]
-		if !ok {
-			continue
+	snaps := make([]activeLease, 0, len(m.activeIDs))
+	for deliveryID := range m.activeIDs {
+		if entry, ok := m.entries[deliveryID]; ok && entry.active {
+			snaps = append(snaps, entry.lease)
 		}
-		durable, err := inspect(ctx, deliveryID)
+	}
+	if len(snaps) == 0 {
+		m.recomputeLastErrorLocked()
+		m.mu.Unlock()
+		return nil
+	}
+	m.mu.Unlock()
+
+	sort.Slice(snaps, func(i, j int) bool {
+		return snaps[i].DeliveryID < snaps[j].DeliveryID
+	})
+
+	type reconciledLease struct {
+		snap    activeLease
+		durable waypost.DeliveryLeaseState
+	}
+	results := make([]reconciledLease, 0, len(snaps))
+	for _, snap := range snaps {
+		durable, err := inspect(ctx, snap.DeliveryID)
 		if err != nil {
-			// Keep this entry for a later retry. Presenting cached state as
-			// authoritative after an inspection error would be worse.
+			// Keep existing entries intact for a later retry without partial
+			// mutation. Presenting cached state as authoritative after an
+			// inspection error would be worse.
 			return err
 		}
-		if durable.Found && durable.State == "leased" && durable.LeaseToken == lease.LeaseToken {
+		results = append(results, reconciledLease{snap: snap, durable: durable})
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, item := range results {
+		entry, ok := m.entries[item.snap.DeliveryID]
+		if !ok || !entry.active || entry.lease.LeaseToken != item.snap.LeaseToken {
+			continue
+		}
+		if item.durable.Found && item.durable.State == "leased" && item.durable.LeaseToken == item.snap.LeaseToken {
 			continue
 		}
 
 		status := "missing"
 		terminalAt := observedAt
-		if durable.Found {
-			if durable.State == "leased" {
+		if item.durable.Found {
+			if item.durable.State == "leased" {
 				status = "lease_replaced"
 			} else {
-				status = durable.State
+				status = item.durable.State
 			}
-			if durable.TransitionAt != "" {
-				terminalAt = durable.TransitionAt
+			if item.durable.TransitionAt != "" {
+				terminalAt = item.durable.TransitionAt
 			}
 		}
 
-		delete(m.leases, deliveryID)
-		delete(m.failures, deliveryID)
-		if history, ok := m.history[deliveryID]; ok {
-			history.Status = status
-			history.TerminalAt = terminalAt
-			history.LeaseToken = ""
-			m.history[deliveryID] = history
-		}
+		entry.active = false
+		entry.failure = nil
+		entry.lease.Status = status
+		entry.lease.TerminalAt = terminalAt
+		entry.lease.LeaseToken = ""
+		m.entries[item.snap.DeliveryID] = entry
+		m.setActiveIDLocked(item.snap.DeliveryID, false)
 	}
-	if len(m.failures) == 0 {
-		m.lastError = nil
-	}
+	m.recomputeLastErrorLocked()
 	return nil
 }
 
@@ -169,9 +251,11 @@ func (m *activeLeaseManager) snapshot() []activeLease {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	leases := make([]activeLease, 0, len(m.leases))
-	for _, lease := range m.leases {
-		leases = append(leases, lease)
+	leases := make([]activeLease, 0, len(m.activeIDs))
+	for deliveryID := range m.activeIDs {
+		if entry, ok := m.entries[deliveryID]; ok && entry.active {
+			leases = append(leases, entry.lease)
+		}
 	}
 	return leases
 }
@@ -180,12 +264,18 @@ func (m *activeLeaseManager) historySnapshot(includeTerminal bool) []activeLease
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	leases := make([]activeLease, 0, len(m.history))
-	for _, lease := range m.history {
-		if !includeTerminal && lease.Status != "active" {
-			continue
+	if !includeTerminal {
+		leases := make([]activeLease, 0, len(m.activeIDs))
+		for deliveryID := range m.activeIDs {
+			if entry, ok := m.entries[deliveryID]; ok && entry.active {
+				leases = append(leases, entry.lease)
+			}
 		}
-		leases = append(leases, lease)
+		return leases
+	}
+	leases := make([]activeLease, 0, len(m.entries))
+	for _, entry := range m.entries {
+		leases = append(leases, entry.lease)
 	}
 	return leases
 }
@@ -193,42 +283,66 @@ func (m *activeLeaseManager) historySnapshot(includeTerminal bool) []activeLease
 func (m *activeLeaseManager) hasTrackedLeases() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return len(m.leases) > 0
+	return len(m.activeIDs) > 0
+}
+
+func (m *activeLeaseManager) isActive(deliveryID, leaseToken string) bool {
+	deliveryID = strings.TrimSpace(deliveryID)
+	leaseToken = strings.TrimSpace(leaseToken)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, ok := m.entries[deliveryID]
+	return ok && entry.active && entry.lease.LeaseToken == leaseToken
 }
 
 func (m *activeLeaseManager) markRenewalFailure(lease activeLease, cause error) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	return m.markRenewalFailureWithSeverity(lease, cause, renewalFailureDefinitive(cause))
+}
 
-	definitive := renewalFailureDefinitive(cause)
+func (m *activeLeaseManager) markRenewalFailureWithSeverity(lease activeLease, cause error, definitive bool) error {
+	deliveryID := strings.TrimSpace(lease.DeliveryID)
+	leaseToken := strings.TrimSpace(lease.LeaseToken)
 	failure := &leaseRenewalFailure{
-		DeliveryID: lease.DeliveryID,
+		DeliveryID: deliveryID,
 		Cause:      cause,
 		Definitive: definitive,
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	// A definitive renewal response is reconciled against durable state by the
-	// caller before this method runs. Do not overwrite that exact terminal
-	// history with a cache-only "renewal_failed" label.
-	if _, tracked := m.leases[lease.DeliveryID]; !tracked {
+	// caller before this method runs, and an ABA token mismatch means the
+	// tracked entry has already moved on.
+	entry, ok := m.entries[deliveryID]
+	if !ok || !entry.active || entry.lease.LeaseToken != leaseToken {
 		return failure
 	}
-	m.failures[lease.DeliveryID] = *failure
-	m.lastError = failure
+	// Preserve monotonic severity: never downgrade a definitive failure to a
+	// transient one while the lease is still waiting to settle.
+	if entry.failure == nil || definitive || !entry.failure.Definitive {
+		copied := *failure
+		entry.failure = &copied
+		m.entries[deliveryID] = entry
+	}
+	m.recomputeLastErrorLocked()
+	if entry.failure != nil {
+		copied := *entry.failure
+		return &copied
+	}
 	return failure
 }
 
 func (m *activeLeaseManager) terminalMutationAllowed(deliveryID string) error {
+	deliveryID = strings.TrimSpace(deliveryID)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	failure, ok := m.failures[deliveryID]
-	if !ok {
+	entry, ok := m.entries[deliveryID]
+	if !ok || !entry.active || entry.failure == nil || !entry.failure.Definitive {
 		return nil
 	}
-	if failure.Definitive {
-		return &failure
-	}
-	return nil
+	copied := *entry.failure
+	return &copied
 }
 
 func (m *activeLeaseManager) lastRenewalError() error {

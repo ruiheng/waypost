@@ -122,6 +122,7 @@ func (s *Service) processWakeScheduler(ctx context.Context) error {
 
 	now := s.now().UTC()
 	runtime := s.wakeSchedulerState.runtimeForScope(scope.ScopeID, snapshot.PendingSince)
+	s.wakeSchedulerState.pruneExcept([]string{scope.ScopeID})
 	if s.tryWakeChannel(ctx, snapshot, runtime, now, WakeHintMCPResourceUpdated) {
 		return nil
 	}
@@ -132,7 +133,6 @@ func (s *Service) processWakeScheduler(ctx context.Context) error {
 		return nil
 	}
 
-	s.wakeSchedulerState.pruneExcept([]string{scope.ScopeID})
 	return nil
 }
 
@@ -145,7 +145,7 @@ func (s *Service) tryWakeChannel(ctx context.Context, snapshot wakeSnapshot, run
 
 	switch channel {
 	case WakeHintMCPResourceUpdated:
-		if !s.overviewSubscriptions.hasLiveSubscribers(s.Server()) {
+		if !s.overviewSubscriptions.hasLiveSubscribers(s.existingServer()) {
 			logWakeSuppressed(snapshot, runtime, now, channel, config.Category, waypostOverviewURI, "unavailable:no_subscribers")
 			return false
 		}
@@ -359,12 +359,25 @@ func (s *Service) visibleWaypostSnapshot(ctx context.Context, addresses []string
 		}
 		for _, address := range claimable {
 			state.QueuedVisibleCount += address.ClaimableCount
-			if state.OldestEligibleAt == "" || address.OldestEligibleAt < state.OldestEligibleAt {
+			if state.OldestEligibleAt == "" || isEarlierRFC3339(address.OldestEligibleAt, state.OldestEligibleAt) {
 				state.OldestEligibleAt = address.OldestEligibleAt
 			}
 		}
 		return state, nil
 	})
+}
+
+func isEarlierRFC3339(candidate, current string) bool {
+	candidateTime, candidateErr := time.Parse(time.RFC3339Nano, candidate)
+	currentTime, currentErr := time.Parse(time.RFC3339Nano, current)
+	switch {
+	case candidateErr == nil && currentErr == nil:
+		return candidateTime.Before(currentTime)
+	case candidateErr == nil:
+		return true
+	default:
+		return false
+	}
 }
 
 func snapshotTargetsForChannel(snapshot wakeSnapshot, channel WakeChannelName) []WakeTarget {

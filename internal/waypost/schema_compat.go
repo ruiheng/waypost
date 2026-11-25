@@ -3,10 +3,18 @@ package waypost
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"strings"
 )
 
-func migrateLegacyGroupMessageSchema(ctx context.Context, db *sql.DB) error {
+type schemaExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func migrateLegacyGroupMessageSchema(ctx context.Context, db schemaExecutor) error {
 	hasLegacyKey, err := tableHasColumn(ctx, db, "group_messages", "group_message_id")
 	if err != nil {
 		return fmt.Errorf("inspect legacy group_messages schema: %w", err)
@@ -14,12 +22,6 @@ func migrateLegacyGroupMessageSchema(ctx context.Context, db *sql.DB) error {
 	if !hasLegacyKey {
 		return nil
 	}
-
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin legacy group schema migration: %w", err)
-	}
-	defer tx.Rollback()
 
 	// Legacy group-message data came from the pre-v1 experimental schema and is
 	// intentionally discarded instead of migrated.
@@ -32,18 +34,14 @@ func migrateLegacyGroupMessageSchema(ctx context.Context, db *sql.DB) error {
 		`DROP TABLE IF EXISTS group_messages`,
 	}
 	for _, statement := range statements {
-		if _, err := tx.ExecContext(ctx, statement); err != nil {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("apply legacy group schema migration: %w", err)
 		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit legacy group schema migration: %w", err)
 	}
 	return nil
 }
 
-func migrateForwardedMessageSchema(ctx context.Context, db *sql.DB) error {
+func migrateForwardedMessageSchema(ctx context.Context, db schemaExecutor) error {
 	hasMessageIDColumn, err := tableHasColumn(ctx, db, "messages", "forwarded_message_id")
 	if err != nil {
 		return fmt.Errorf("inspect messages schema for forwarded_message_id: %w", err)
@@ -68,7 +66,7 @@ func migrateForwardedMessageSchema(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-func backfillForwardedFromAddress(ctx context.Context, db *sql.DB) error {
+func backfillForwardedFromAddress(ctx context.Context, db schemaExecutor) error {
 	if _, err := db.ExecContext(ctx, `
 UPDATE messages AS forwarded
 SET forwarded_from_address = (
@@ -93,7 +91,42 @@ WHERE forwarded.forwarded_message_id IS NOT NULL
 	return nil
 }
 
-func tableHasColumn(ctx context.Context, db *sql.DB, tableName, columnName string) (bool, error) {
+func ensureDeliveriesCheckConstraints(ctx context.Context, db schemaExecutor) error {
+	var createSQL sql.NullString
+	err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'deliveries'`).Scan(&createSQL)
+	if err != nil {
+		return fmt.Errorf("inspect deliveries schema: %w", err)
+	}
+	if !createSQL.Valid {
+		return errors.New("inspect deliveries schema: missing CREATE TABLE statement")
+	}
+	if strings.Contains(createSQL.String, "CHECK (state IN") {
+		return nil
+	}
+
+	statements := []string{
+		deliveriesTableSQL(false, "deliveries_v2"),
+		`INSERT INTO deliveries_v2 (
+  delivery_id, message_id, recipient_endpoint_id, state, visible_at,
+  lease_token, lease_expires_at, acked_at, attempt_count, last_error_code, last_error_text
+)
+SELECT
+  delivery_id, message_id, recipient_endpoint_id, state, visible_at,
+  lease_token, lease_expires_at, acked_at, attempt_count, last_error_code, last_error_text
+FROM deliveries`,
+		`DROP TABLE deliveries`,
+		`ALTER TABLE deliveries_v2 RENAME TO deliveries`,
+	}
+	statements = append(statements, deliveriesIndexesSQL...)
+	for _, stmt := range statements {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("upgrade deliveries constraints: %w", err)
+		}
+	}
+	return nil
+}
+
+func tableHasColumn(ctx context.Context, db schemaExecutor, tableName, columnName string) (bool, error) {
 	rows, err := db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", tableName))
 	if err != nil {
 		return false, err

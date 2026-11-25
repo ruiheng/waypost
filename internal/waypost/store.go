@@ -1309,7 +1309,10 @@ func (s *Store) ReadLatestDeliveriesPage(ctx context.Context, params ReadLatestP
 	if err != nil {
 		return Page[ReadDelivery]{}, err
 	}
-	state := strings.TrimSpace(params.State)
+	state, err := normalizeDeliveryStateFilter(params.State)
+	if err != nil {
+		return Page[ReadDelivery]{}, err
+	}
 	senderAddress, err := normalizeSenderAddress(params.FromAddress)
 	if err != nil {
 		return Page[ReadDelivery]{}, err

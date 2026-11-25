@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -117,7 +118,7 @@ func TestPrepareWaypostSendBodyValidation(t *testing.T) {
 	t.Run("both body and body_file rejected", func(t *testing.T) {
 		var input waypostSendInput
 		req := sendToolRequest(t, `{"body":"x","body_file":"f.txt"}`)
-		if err := service.prepareWaypostSendBody(req, &input); err == nil {
+		if err := service.prepareWaypostSendBody(context.Background(), req, &input); err == nil {
 			t.Fatal("prepareWaypostSendBody() error = nil, want mutual-exclusion rejection")
 		}
 	})
@@ -125,7 +126,7 @@ func TestPrepareWaypostSendBodyValidation(t *testing.T) {
 	t.Run("neither body nor body_file rejected", func(t *testing.T) {
 		var input waypostSendInput
 		req := sendToolRequest(t, `{"subject":"s"}`)
-		if err := service.prepareWaypostSendBody(req, &input); err == nil {
+		if err := service.prepareWaypostSendBody(context.Background(), req, &input); err == nil {
 			t.Fatal("prepareWaypostSendBody() error = nil, want missing-body rejection")
 		}
 	})
@@ -133,7 +134,7 @@ func TestPrepareWaypostSendBodyValidation(t *testing.T) {
 	t.Run("empty body rejected as empty body", func(t *testing.T) {
 		var input waypostSendInput
 		req := sendToolRequest(t, `{"body":""}`)
-		err := service.prepareWaypostSendBody(req, &input)
+		err := service.prepareWaypostSendBody(context.Background(), req, &input)
 		if !errors.Is(err, waypost.ErrEmptyBody) {
 			t.Fatalf("prepareWaypostSendBody() error = %v, want ErrEmptyBody", err)
 		}
@@ -142,7 +143,7 @@ func TestPrepareWaypostSendBodyValidation(t *testing.T) {
 	t.Run("body passes through", func(t *testing.T) {
 		input := waypostSendInput{Body: "hello"}
 		req := sendToolRequest(t, `{"body":"hello"}`)
-		if err := service.prepareWaypostSendBody(req, &input); err != nil {
+		if err := service.prepareWaypostSendBody(context.Background(), req, &input); err != nil {
 			t.Fatalf("prepareWaypostSendBody() error = %v", err)
 		}
 	})

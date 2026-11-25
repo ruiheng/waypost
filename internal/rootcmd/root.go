@@ -63,7 +63,7 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	}
 	if versionRequested {
 		_, err := fmt.Fprintf(a.stdout, "waypost %s\n", version.Version)
-		return err
+		return waypost.WithCLIJSONError(err, false)
 	}
 	if len(rest) == 0 {
 		return errors.New("expected a command: mcp, codex-hook, devin-hook, claude-hook, install, doctor, migrate, doc, send, forward, recv, wait, watch, read, show, ack, renew, release, defer, undefer, fail, dead-letter, list, stale, group, or address")
@@ -468,13 +468,9 @@ func (a *App) runMigrateCommand(stateDir string, args []string) error {
 }
 
 func (a *App) runGroupWebCommand(ctx context.Context, stateDir string, args []string) error {
-	fs := flag.NewFlagSet("waypost group web", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-
 	var listen string
 	var group string
-	fs.StringVar(&listen, "listen", "127.0.0.1:0", "HTTP listen address")
-	fs.StringVar(&group, "group", "", "initial group address")
+	fs := waypost.NewGroupWebFlagSet(&listen, &group)
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -484,7 +480,7 @@ func (a *App) runGroupWebCommand(ctx context.Context, stateDir string, args []st
 		return waypost.MarkInvalidArgument(err)
 	}
 	if fs.NArg() != 0 {
-		return fmt.Errorf("group web does not accept positional arguments")
+		return waypost.MarkInvalidArgument(fmt.Errorf("group web does not accept positional arguments"))
 	}
 	return a.runWeb(ctx, webui.Options{
 		StateDir:    stateDir,

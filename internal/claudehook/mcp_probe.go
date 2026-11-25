@@ -37,7 +37,7 @@ func probeWaypostMCPWithTimeout(ctx context.Context, timeout time.Duration) (boo
 // `No MCP server named "waypost".` anchored on both the phrase and the
 // server name so unrelated stderr is not mistaken for an absent entry.
 func isMissingWaypostMCPError(detail string) bool {
-	detail = strings.ToLower(detail)
+	detail = strings.ToLower(hookcore.StripANSI(detail))
 	return strings.Contains(detail, "no mcp server") && strings.Contains(detail, waypostMCPServerName)
 }
 
@@ -54,12 +54,23 @@ func isMissingWaypostMCPError(detail string) bool {
 // approval, rejection, missing authentication, or a failed tool listing. A
 // missing Status line means the entry is configured and counts as usable.
 func parseWaypostMCPAvailable(output []byte) (bool, error) {
+	clean := hookcore.StripANSI(string(output))
 	found := false
+	inWaypostSection := false
 	available := true
-	for _, line := range strings.Split(string(output), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == waypostMCPServerName+":" {
+	for _, line := range strings.Split(clean, "\n") {
+		lineWithoutCR := strings.TrimSuffix(line, "\r")
+		trimmed := strings.TrimSpace(lineWithoutCR)
+		isUnindented := lineWithoutCR != "" && lineWithoutCR[0] != ' ' && lineWithoutCR[0] != '\t'
+		if isUnindented && strings.TrimRight(lineWithoutCR, " \t") == waypostMCPServerName+":" {
 			found = true
+			inWaypostSection = true
+			continue
+		}
+		if inWaypostSection && isUnindented {
+			inWaypostSection = false
+		}
+		if !inWaypostSection {
 			continue
 		}
 		key, value, ok := strings.Cut(trimmed, ":")
@@ -69,7 +80,7 @@ func parseWaypostMCPAvailable(output []byte) (bool, error) {
 		available = claudeMCPStatusUsable(value)
 	}
 	if !found {
-		if isMissingWaypostMCPError(string(output)) {
+		if isMissingWaypostMCPError(clean) {
 			return false, nil
 		}
 		return false, fmt.Errorf("parse `claude mcp get waypost`: unexpected output")

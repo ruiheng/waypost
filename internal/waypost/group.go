@@ -1087,46 +1087,58 @@ func (s *Store) ReceiveGroupMessage(ctx context.Context, params GroupReceivePara
 
 func (s *Store) receiveGroupMessageOnce(ctx context.Context, params GroupReceiveParams) (GroupReceivedMessage, error) {
 	for {
-		tx, err := s.writeDB.BeginTx(ctx, nil)
+		readTx, err := s.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 		if err != nil {
-			return GroupReceivedMessage{}, fmt.Errorf("begin group receive transaction: %w", err)
+			return GroupReceivedMessage{}, fmt.Errorf("begin group receive read snapshot: %w", err)
 		}
-
-		scope, err := s.resolveGroup(ctx, tx, params.Address, params.Person)
+		scope, err := s.resolveGroup(ctx, readTx, params.Address, params.Person)
 		if err != nil {
-			_ = tx.Rollback()
+			_ = readTx.Rollback()
 			return GroupReceivedMessage{}, err
 		}
 		if scope.viewer.PersonID == "" {
-			_ = tx.Rollback()
+			_ = readTx.Rollback()
 			return GroupReceivedMessage{}, ErrNoMessage
 		}
 
-		records, err := s.listGroupMessages(ctx, tx, scope, true, 1)
+		records, err := s.listGroupMessages(ctx, readTx, scope, true, 1)
+		_ = readTx.Rollback()
 		if err != nil {
-			_ = tx.Rollback()
 			return GroupReceivedMessage{}, err
 		}
 		if len(records) == 0 {
-			_ = tx.Rollback()
 			return GroupReceivedMessage{}, ErrNoMessage
 		}
 		record := records[0]
 
 		body, err := s.readBlob(record.BodyBlobRef, record.BodySize, record.BodySHA256)
 		if err != nil {
+			return GroupReceivedMessage{}, err
+		}
+
+		tx, err := s.writeDB.BeginTx(ctx, nil)
+		if err != nil {
+			return GroupReceivedMessage{}, fmt.Errorf("begin group receive transaction: %w", err)
+		}
+
+		txScope, err := s.resolveGroup(ctx, tx, params.Address, params.Person)
+		if err != nil {
 			_ = tx.Rollback()
 			return GroupReceivedMessage{}, err
+		}
+		if txScope.viewer.PersonID == "" || (txScope.viewer.VisibilityCutoff != nil && record.MessageCreatedAt > *txScope.viewer.VisibilityCutoff) {
+			_ = tx.Rollback()
+			continue
 		}
 
 		firstReadAt := formatTimestamp(s.now())
 		result, err := tx.ExecContext(ctx, `
 INSERT OR IGNORE INTO group_reads (message_id, person_id, first_read_at)
 VALUES (?, ?, ?)
-`, record.MessageID, scope.viewer.PersonID, firstReadAt)
+`, record.MessageID, txScope.viewer.PersonID, firstReadAt)
 		if err != nil {
 			_ = tx.Rollback()
-			return GroupReceivedMessage{}, fmt.Errorf("mark group message read %q for %q: %w", record.MessageID, scope.viewer.Person, err)
+			return GroupReceivedMessage{}, fmt.Errorf("mark group message read %q for %q: %w", record.MessageID, txScope.viewer.Person, err)
 		}
 		rowsAffected, err := result.RowsAffected()
 		if err != nil {
@@ -1138,16 +1150,27 @@ VALUES (?, ?, ?)
 			continue
 		}
 
+		var readCount int
+		if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM group_message_eligibility AS ge
+JOIN group_reads AS gr
+  ON gr.message_id = ge.message_id
+ AND gr.person_id = ge.person_id
+WHERE ge.message_id = ?
+`, record.MessageID).Scan(&readCount); err != nil {
+			_ = tx.Rollback()
+			return GroupReceivedMessage{}, fmt.Errorf("query group read count %q: %w", record.MessageID, err)
+		}
+
 		if err := tx.Commit(); err != nil {
 			_ = tx.Rollback()
 			return GroupReceivedMessage{}, fmt.Errorf("commit group receive transaction: %w", err)
 		}
 
 		record.FirstReadAt = sql.NullString{String: firstReadAt, Valid: true}
-		if record.ViewerEligible != 0 {
-			record.ReadCount++
-		}
-		return buildGroupReceivedMessage(scope.viewer, record, string(body)), nil
+		record.ReadCount = readCount
+		return buildGroupReceivedMessage(txScope.viewer, record, string(body)), nil
 	}
 }
 
@@ -1228,7 +1251,7 @@ JOIN persons AS p ON p.person_id = gm.person_id
 JOIN groups AS g ON g.group_id = gm.group_id
 WHERE gm.group_id = ?
   AND p.person = ?
-ORDER BY gm.joined_at DESC, gm.membership_id DESC
+ORDER BY (gm.left_at IS NULL) DESC, gm.left_at DESC, gm.joined_at DESC, gm.membership_id DESC
 LIMIT 1
 `, groupID, person).Scan(
 		&membership.MembershipID,

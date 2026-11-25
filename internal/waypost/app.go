@@ -3,6 +3,7 @@ package waypost
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 )
@@ -10,10 +11,11 @@ import (
 var ErrHelpRequested = errors.New("help requested")
 
 type App struct {
-	stdin        io.Reader
-	stdout       io.Writer
-	stderr       io.Writer
-	sendNotifier SendNotifier
+	stdin          io.Reader
+	stdout         io.Writer
+	stderr         io.Writer
+	sendNotifier   SendNotifier
+	inspectFlagSet func(*flag.FlagSet)
 }
 
 // SendNotificationRequest contains the durable send details needed by an

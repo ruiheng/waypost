@@ -45,6 +45,8 @@ func debugSessionState(snapshot stateSnapshot) map[string]any {
 		"bound_addresses":                  snapshot.BoundAddresses,
 		"default_sender":                   snapshot.DefaultSender,
 		"default_workdir":                  snapshot.DefaultWorkdir,
+		"binding_mode":                     string(snapshot.BindingMode),
+		"manual_binding":                   snapshot.ManualBinding,
 		"status_tool_called":               snapshot.StatusToolCalled,
 		"auto_bind_attempted":              snapshot.AutoBindAttempted,
 		"auto_bind_empty_result":           snapshot.AutoBindEmptyResult,

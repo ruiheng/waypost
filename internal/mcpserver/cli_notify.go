@@ -2,7 +2,6 @@ package mcpserver
 
 import (
 	"context"
-	"strings"
 
 	"github.com/ruiheng/waypost/internal/waypost"
 )
@@ -19,10 +18,7 @@ func notifyWaypostSendWithOptions(ctx context.Context, service any, request wayp
 
 	// A standalone CLI invocation has no persistent MCP binding state. Treat an
 	// explicit sender as local and suppress auto-binding probes during notify.
-	notifier.state.autoBindAttempted = true
-	if fromAddress := strings.TrimSpace(request.Params.FromAddress); fromAddress != "" {
-		notifier.state.boundAddresses = []string{fromAddress}
-	}
+	notifier.state.setCLISuppressed(request.Params.FromAddress)
 
 	outcome := notifier.notifyWaypostSend(ctx, waypostSendInput{
 		ToAddress:   request.Params.ToAddress,

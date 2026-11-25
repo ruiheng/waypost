@@ -69,8 +69,7 @@ type waypostSendInput struct {
 	Diagnostics          bool              `json:"diagnostics,omitempty"`
 	ToAddress            string            `json:"-"`
 	ToAddresses          []string          `json:"-"`
-	forwardedMessageID   string
-	forwardedFromAddress string
+	resolvedBound        *boundState
 }
 
 func waypostSendInputSchema() *jsonschema.Schema {
@@ -106,22 +105,6 @@ func waypostSendInputSchema() *jsonschema.Schema {
 	}
 	bodyFile.Description = "Message body file inside the bound default_workdir. Relative paths resolve from default_workdir. Supply exactly one of body or body_file. Files outside that workspace, non-regular files, and files larger than 10 MiB are rejected."
 	return schema
-}
-
-type waypostForwardInput struct {
-	MessageID            string `json:"message_id,omitempty"`
-	DeliveryID           string `json:"delivery_id,omitempty"`
-	ToAddress            string `json:"to_address"`
-	FromAddress          string `json:"from_address,omitempty"`
-	Subject              string `json:"subject,omitempty"`
-	Group                bool   `json:"group,omitempty"`
-	DisableNotifyMessage *bool  `json:"disable_notify_message,omitempty"`
-}
-
-type waypostWaitInput struct {
-	Addresses []string `json:"addresses,omitempty"`
-	AsPerson  string   `json:"as_person,omitempty"`
-	Timeout   string   `json:"timeout,omitempty"`
 }
 
 type waypostRecvInput struct {
@@ -172,45 +155,6 @@ func waypostClaimHistoryInputSchema() *jsonschema.Schema {
 	return schema
 }
 
-type waypostListInput struct {
-	Address  string `json:"address,omitempty"`
-	AsPerson string `json:"as_person,omitempty"`
-	State    string `json:"state,omitempty"`
-}
-
-type waypostReadInput struct {
-	MessageIDs  []string `json:"message_ids,omitempty"`
-	DeliveryIDs []string `json:"delivery_ids,omitempty"`
-	Latest      bool     `json:"latest,omitempty"`
-	Addresses   []string `json:"addresses,omitempty"`
-	State       string   `json:"state,omitempty"`
-	Limit       *int     `json:"limit,omitempty"`
-}
-
-type waypostGroupInput struct {
-	GroupAddress string `json:"group_address"`
-}
-
-type waypostGroupMemberInput struct {
-	GroupAddress string `json:"group_address"`
-	Person       string `json:"person"`
-}
-
-type waypostGroupSubscriberInput struct {
-	GroupAddress  string `json:"group_address"`
-	NotifyAddress string `json:"notify_address"`
-	Person        string `json:"person"`
-}
-
-type waypostGroupSubscriberRemoveInput struct {
-	GroupAddress  string `json:"group_address"`
-	NotifyAddress string `json:"notify_address"`
-}
-
-type waypostAddressInspectInput struct {
-	Address string `json:"address"`
-}
-
 type waypostAckInput struct {
 	DeliveryID string `json:"delivery_id"`
 	LeaseToken string `json:"lease_token"`
@@ -220,21 +164,6 @@ type waypostDeferInput struct {
 	DeliveryID string `json:"delivery_id"`
 	LeaseToken string `json:"lease_token"`
 	Until      string `json:"until"`
-}
-
-type waypostUndeferInput struct {
-	DeliveryID string `json:"delivery_id"`
-}
-
-type waypostFailInput struct {
-	DeliveryID string `json:"delivery_id"`
-	LeaseToken string `json:"lease_token"`
-	Reason     string `json:"reason"`
-}
-
-type readLatestResult struct {
-	Items   []waypost.ReadDelivery
-	HasMore bool
 }
 
 func (s *Service) registerWaypostTools(server *mcp.Server) {
@@ -402,6 +331,13 @@ func (s *Service) sendWaypostMessage(ctx context.Context, input waypostSendInput
 	})
 }
 
+func (s *Service) resolveSendSenderAddress(ctx context.Context, input waypostSendInput) (string, error) {
+	if input.resolvedBound != nil {
+		return resolveSenderAddressFromBound(*input.resolvedBound, input.FromAddress)
+	}
+	return s.sessions.senderAddress(ctx, input.FromAddress)
+}
+
 func (s *Service) sendWaypostMessageWithService(ctx context.Context, input waypostSendInput, service waypostSender) (map[string]any, error) {
 	toAddress, err := waypost.NormalizeAddress(input.ToAddress)
 	if err != nil {
@@ -412,23 +348,21 @@ func (s *Service) sendWaypostMessageWithService(ctx context.Context, input waypo
 	}
 	input.ToAddress = toAddress
 
-	fromAddress, err := s.sessions.senderAddress(ctx, input.FromAddress)
+	fromAddress, err := s.resolveSendSenderAddress(ctx, input)
 	if err != nil {
 		return nil, err
 	}
 	input.FromAddress = fromAddress
 
 	sendResult, err := service.Send(ctx, waypost.SendParams{
-		ToAddress:            input.ToAddress,
-		FromAddress:          fromAddress,
-		AsPerson:             strings.TrimSpace(input.AsPerson),
-		Subject:              input.Subject,
-		ContentType:          strings.TrimSpace(input.ContentType),
-		SchemaVersion:        strings.TrimSpace(input.SchemaVersion),
-		ForwardedMessageID:   strings.TrimSpace(input.forwardedMessageID),
-		ForwardedFromAddress: strings.TrimSpace(input.forwardedFromAddress),
-		Body:                 []byte(input.Body),
-		Group:                input.Group,
+		ToAddress:     input.ToAddress,
+		FromAddress:   fromAddress,
+		AsPerson:      strings.TrimSpace(input.AsPerson),
+		Subject:       input.Subject,
+		ContentType:   strings.TrimSpace(input.ContentType),
+		SchemaVersion: strings.TrimSpace(input.SchemaVersion),
+		Body:          []byte(input.Body),
+		Group:         input.Group,
 	})
 	if err != nil {
 		return nil, err
@@ -490,7 +424,7 @@ func prepareWaypostSendTarget(req *mcp.CallToolRequest, input *waypostSendInput)
 	return false, nil
 }
 
-func (s *Service) prepareWaypostSendBody(req *mcp.CallToolRequest, input *waypostSendInput) error {
+func (s *Service) prepareWaypostSendBody(ctx context.Context, req *mcp.CallToolRequest, input *waypostSendInput) error {
 	if req == nil || req.Params == nil || len(req.Params.Arguments) == 0 {
 		return errors.New("waypost_send requires body or body_file")
 	}
@@ -518,7 +452,16 @@ func (s *Service) prepareWaypostSendBody(req *mcp.CallToolRequest, input *waypos
 	if strings.TrimSpace(bodyFile) == "" {
 		return errors.New("waypost_send body_file must not be empty")
 	}
-	body, resolvedBodyFile, err := readWaypostSendBodyFile(bodyFile, s.sessions.snapshotState().DefaultWorkdir)
+	defaultWorkdir := s.sessions.snapshotState().DefaultWorkdir
+	if defaultWorkdir == "" {
+		bound, err := s.sessions.boundState(ctx)
+		if err != nil {
+			return err
+		}
+		defaultWorkdir = bound.DefaultWorkdir
+		input.resolvedBound = &bound
+	}
+	body, resolvedBodyFile, err := readWaypostSendBodyFile(bodyFile, defaultWorkdir)
 	if err != nil {
 		return err
 	}
@@ -539,8 +482,6 @@ func (s *Service) sendWaypostBatchMessage(ctx context.Context, input waypostSend
 	input.Subject = strings.TrimSpace(input.Subject)
 	input.ContentType = strings.TrimSpace(input.ContentType)
 	input.SchemaVersion = strings.TrimSpace(input.SchemaVersion)
-	input.forwardedMessageID = strings.TrimSpace(input.forwardedMessageID)
-	input.forwardedFromAddress = strings.TrimSpace(input.forwardedFromAddress)
 	if input.AsPerson != "" && !input.Group {
 		return nil, errors.New("as_person requires group send")
 	}
@@ -548,7 +489,7 @@ func (s *Service) sendWaypostBatchMessage(ctx context.Context, input waypostSend
 		return nil, waypost.ErrEmptyBody
 	}
 
-	fromAddress, err := s.sessions.senderAddress(ctx, input.FromAddress)
+	fromAddress, err := s.resolveSendSenderAddress(ctx, input)
 	if err != nil {
 		return nil, err
 	}
@@ -557,15 +498,13 @@ func (s *Service) sendWaypostBatchMessage(ctx context.Context, input waypostSend
 	}
 	input.FromAddress = fromAddress
 	base := waypost.SendParams{
-		FromAddress:          fromAddress,
-		AsPerson:             input.AsPerson,
-		Subject:              input.Subject,
-		ContentType:          input.ContentType,
-		SchemaVersion:        input.SchemaVersion,
-		ForwardedMessageID:   input.forwardedMessageID,
-		ForwardedFromAddress: input.forwardedFromAddress,
-		Body:                 []byte(input.Body),
-		Group:                input.Group,
+		FromAddress:   fromAddress,
+		AsPerson:      input.AsPerson,
+		Subject:       input.Subject,
+		ContentType:   input.ContentType,
+		SchemaVersion: input.SchemaVersion,
+		Body:          []byte(input.Body),
+		Group:         input.Group,
 	}
 
 	return withWaypostService(ctx, s.waypostServices, func(service waypostSender) (map[string]any, error) {
@@ -698,7 +637,7 @@ func (s *Service) waypostSend(ctx context.Context, req *mcp.CallToolRequest, inp
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := s.prepareWaypostSendBody(req, &input); err != nil {
+	if err := s.prepareWaypostSendBody(ctx, req, &input); err != nil {
 		return nil, nil, err
 	}
 	var out map[string]any
@@ -738,127 +677,6 @@ func compactWaypostSendResult(out map[string]any, includeDetails bool) map[strin
 	return compact
 }
 
-func (s *Service) waypostForward(ctx context.Context, _ *mcp.CallToolRequest, input waypostForwardInput) (*mcp.CallToolResult, map[string]any, error) {
-	out, err := withWaypostService(ctx, s.waypostServices, func(service interface {
-		waypost.ForwardSourceReader
-		waypostSender
-	}) (map[string]any, error) {
-		prepared, err := waypost.PrepareForward(ctx, service, "waypost_forward", waypost.ForwardParams{
-			MessageID:   input.MessageID,
-			DeliveryID:  input.DeliveryID,
-			ToAddress:   input.ToAddress,
-			FromAddress: input.FromAddress,
-			Subject:     input.Subject,
-			Group:       input.Group,
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		sendInput := waypostSendInput{
-			ToAddress:            prepared.SendParams.ToAddress,
-			FromAddress:          prepared.SendParams.FromAddress,
-			Subject:              prepared.SendParams.Subject,
-			Body:                 string(prepared.SendParams.Body),
-			ContentType:          prepared.SendParams.ContentType,
-			SchemaVersion:        prepared.SendParams.SchemaVersion,
-			DisableNotifyMessage: input.DisableNotifyMessage,
-			forwardedMessageID:   prepared.SendParams.ForwardedMessageID,
-			forwardedFromAddress: prepared.SendParams.ForwardedFromAddress,
-			Group:                prepared.SendParams.Group,
-		}
-
-		out, err := s.sendWaypostMessageWithService(ctx, sendInput, service)
-		if err != nil {
-			return nil, err
-		}
-		out["status"] = "forwarded"
-		out["source_message_id"] = prepared.SourceMessageID
-		out["source_delivery_id"] = nilIfEmpty(prepared.SourceDeliveryID)
-		return out, nil
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	return s.waypostMutationToolResult(ctx, out)
-}
-
-func (s *Service) waypostWait(ctx context.Context, _ *mcp.CallToolRequest, input waypostWaitInput) (*mcp.CallToolResult, map[string]any, error) {
-	if err := validateMCPItems("addresses", len(input.Addresses)); err != nil {
-		return nil, nil, err
-	}
-	addresses, err := s.sessions.waypostAddresses(ctx, input.Addresses)
-	if err != nil {
-		return nil, nil, err
-	}
-	warnings := s.waypostReceiveWarnings(ctx, len(input.Addresses) > 0)
-
-	timeoutText := strings.TrimSpace(input.Timeout)
-	timeout := time.Duration(0)
-	if timeoutText != "" {
-		timeout, err = time.ParseDuration(timeoutText)
-		if err != nil {
-			return nil, nil, fmt.Errorf("parse timeout: %w", err)
-		}
-	}
-	if person := strings.TrimSpace(input.AsPerson); person != "" {
-		return s.waypostWaitGroup(ctx, addresses, person, timeout)
-	}
-
-	delivery, err := withWaypostService(ctx, s.waypostServices, func(service waypostWaiter) (waypost.ListedDelivery, error) {
-		return service.Wait(ctx, waypost.WaitParams{
-			Addresses: addresses,
-			Timeout:   timeout,
-		})
-	})
-	if errors.Is(err, waypost.ErrNoMessage) {
-		return s.waypostToolResult(ctx, map[string]any{
-			"status":    "no_message",
-			"addresses": addresses,
-			"warnings":  warnings,
-		})
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-	return s.waypostToolResult(ctx, map[string]any{
-		"status":    "message_available",
-		"addresses": addresses,
-		"delivery":  waypost.CompactListedDelivery(delivery),
-		"warnings":  warnings,
-	})
-}
-
-func (s *Service) waypostWaitGroup(ctx context.Context, addresses []string, person string, timeout time.Duration) (*mcp.CallToolResult, map[string]any, error) {
-	address, err := singleGroupAddress(addresses, "waypost_wait")
-	if err != nil {
-		return nil, nil, err
-	}
-	message, err := withWaypostService(ctx, s.waypostServices, func(service waypostGroupMessageWaiter) (waypost.GroupListedMessage, error) {
-		return service.WaitGroupMessage(ctx, waypost.GroupWaitParams{
-			Address: address,
-			Person:  person,
-			Timeout: timeout,
-		})
-	})
-	if errors.Is(err, waypost.ErrNoMessage) {
-		return s.waypostToolResult(ctx, map[string]any{
-			"status":    "no_message",
-			"addresses": []string{address},
-			"as_person": person,
-		})
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-	return s.waypostToolResult(ctx, map[string]any{
-		"status":    "message_available",
-		"addresses": []string{address},
-		"as_person": person,
-		"message":   waypost.CompactGroupListedMessage(message),
-	})
-}
-
 func (s *Service) waypostRecv(ctx context.Context, req *mcp.CallToolRequest, input waypostRecvInput) (*mcp.CallToolResult, map[string]any, error) {
 	if err := validateMCPItems("addresses", len(input.Addresses)); err != nil {
 		return nil, nil, err
@@ -882,7 +700,7 @@ func (s *Service) waypostRecv(ctx context.Context, req *mcp.CallToolRequest, inp
 	if person != "" {
 		return s.waypostRecvGroup(ctx, req, addresses, person, input.Diagnostics)
 	}
-	recvGuard, err := s.waypostRecvGuard.begin(req, s.now, s.waypostRecvActiveSessions())
+	recvGuard, err := s.waypostRecvGuard.begin(req, s.now)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -928,7 +746,7 @@ func (s *Service) waypostRecv(ctx context.Context, req *mcp.CallToolRequest, inp
 		if input.Diagnostics && len(remainingByState) > 0 {
 			out["remaining_by_state"] = remainingByState
 		}
-		finishRecv("active_leases")
+		finishRecv("")
 		return s.waypostToolResult(ctx, out)
 	}
 
@@ -979,7 +797,9 @@ func (s *Service) waypostRecv(ctx context.Context, req *mcp.CallToolRequest, inp
 		}
 		if input.Diagnostics {
 			out["addresses"] = addresses
-			out["remaining_by_state_status"] = "unavailable"
+			if recovery.Phase == "" || recovery.Phase == waypost.ReceiveRecoveryPhaseRemainingState {
+				out["remaining_by_state_status"] = "unavailable"
+			}
 		}
 		finishRecv("receive_recovery_required")
 		return s.waypostMutationToolResult(ctx, out)
@@ -987,8 +807,10 @@ func (s *Service) waypostRecv(ctx context.Context, req *mcp.CallToolRequest, inp
 	if err != nil {
 		return nil, nil, err
 	}
-	s.activeLeases.trackReceive(delivery, s.now().Format(time.RFC3339Nano))
-	s.startLeaseRenewLoop()
+	if len(delivery.Messages) > 0 {
+		s.activeLeases.trackReceive(delivery, s.now().Format(time.RFC3339Nano))
+		s.startLeaseRenewLoop()
+	}
 	if len(delivery.Messages) != 1 {
 		return nil, nil, errors.New("receive returned an unexpected delivery count")
 	}
@@ -1184,7 +1006,7 @@ func (s *Service) waypostRecvGroup(ctx context.Context, req *mcp.CallToolRequest
 	if err != nil {
 		return nil, nil, err
 	}
-	recvGuard, err := s.waypostRecvGuard.begin(req, s.now, s.waypostRecvActiveSessions())
+	recvGuard, err := s.waypostRecvGuard.begin(req, s.now)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1310,169 +1132,11 @@ func (s *Service) waypostReceiveWarnings(ctx context.Context, explicitAddresses 
 	}
 	toolSessionBound := len(bound.DetectedToolSessionAddresses) > 0 || len(boundToolSessionAddresses(bound.BoundAddresses)) > 0
 	agentDeckBound := bound.DetectedAgentDeckSession != "" || len(boundAddressesByScheme(bound.BoundAddresses, "agent-deck")) > 0
-	if !toolSessionBound || agentDeckBound {
+	thurboxBound := bound.DetectedThurboxSession != "" || len(boundAddressesByScheme(bound.BoundAddresses, "thurbox")) > 0
+	if !toolSessionBound || agentDeckBound || thurboxBound {
 		return nil
 	}
 	return []string{agentDeckBindRecoveryHint}
-}
-
-func (s *Service) waypostList(ctx context.Context, _ *mcp.CallToolRequest, input waypostListInput) (*mcp.CallToolResult, map[string]any, error) {
-	var address string
-	if strings.TrimSpace(input.Address) != "" {
-		address = strings.TrimSpace(input.Address)
-	} else {
-		boundAddresses, err := s.sessions.waypostAddresses(ctx, nil)
-		if err != nil {
-			return nil, nil, err
-		}
-		if len(boundAddresses) != 1 {
-			return nil, nil, errors.New("waypost_list requires address when multiple waypost addresses are bound")
-		}
-		address = boundAddresses[0]
-	}
-	if input.AsPerson != "" && input.State != "" {
-		return nil, nil, errors.New("waypost_list does not support state together with as_person")
-	}
-
-	deliveries, err := withWaypostService(ctx, s.waypostServices, func(service interface {
-		waypostLister
-		waypostGroupMessageLister
-	}) (any, error) {
-		if input.AsPerson != "" {
-			messages, err := service.ListGroupMessages(ctx, waypost.GroupListParams{
-				Address: address,
-				Person:  input.AsPerson,
-			})
-			if err != nil {
-				return nil, err
-			}
-			summaries := make([]waypost.GroupListedMessageCompact, 0, len(messages))
-			for _, message := range messages {
-				summaries = append(summaries, waypost.CompactGroupListedMessage(message))
-			}
-			return summaries, nil
-		}
-		return service.List(ctx, waypost.ListParams{
-			Address: address,
-			State:   input.State,
-		})
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	return s.waypostToolResult(ctx, map[string]any{
-		"status":     "listed",
-		"address":    address,
-		"as_person":  nilIfEmpty(input.AsPerson),
-		"state":      nilIfEmpty(input.State),
-		"deliveries": deliveries,
-	})
-}
-
-func (s *Service) waypostRead(ctx context.Context, _ *mcp.CallToolRequest, input waypostReadInput) (*mcp.CallToolResult, map[string]any, error) {
-	if err := validateMCPItems("message_ids", len(input.MessageIDs)); err != nil {
-		return nil, nil, err
-	}
-	if err := validateMCPItems("delivery_ids", len(input.DeliveryIDs)); err != nil {
-		return nil, nil, err
-	}
-	if err := validateMCPItems("addresses", len(input.Addresses)); err != nil {
-		return nil, nil, err
-	}
-	if input.Limit != nil && (*input.Limit < 1 || *input.Limit > waypost.MaxPageSize) {
-		return nil, nil, fmt.Errorf("limit must be between 1 and %d", waypost.MaxPageSize)
-	}
-	hasMessageIDs := len(input.MessageIDs) > 0
-	hasDeliveryIDs := len(input.DeliveryIDs) > 0
-	wantsLatest := input.Latest
-	modeCount := 0
-	if hasMessageIDs {
-		modeCount++
-	}
-	if hasDeliveryIDs {
-		modeCount++
-	}
-	if wantsLatest {
-		modeCount++
-	}
-	if modeCount != 1 {
-		return nil, nil, errors.New("waypost_read requires exactly one mode: message_ids, delivery_ids, or latest=true")
-	}
-
-	result := map[string]any{
-		"status": "read",
-		"mode":   "unknown",
-	}
-
-	switch {
-	case wantsLatest:
-		addresses, err := s.sessions.waypostAddresses(ctx, input.Addresses)
-		if err != nil {
-			return nil, nil, err
-		}
-		result["mode"] = "latest"
-		result["addresses"] = addresses
-		if input.State == "" {
-			result["state"] = "any"
-		} else {
-			result["state"] = input.State
-		}
-		if input.Limit == nil {
-			result["limit"] = nil
-		} else {
-			result["limit"] = *input.Limit
-		}
-	case hasMessageIDs:
-		if len(input.Addresses) > 0 || input.State != "" || input.Limit != nil {
-			return nil, nil, errors.New("waypost_read message_ids mode does not support addresses, state, or limit")
-		}
-		messageIDs := dedupe(input.MessageIDs)
-		result["mode"] = "message_ids"
-		result["message_ids"] = messageIDs
-		messages, err := withWaypostService(ctx, s.waypostServices, func(service waypostMessageReader) ([]waypost.ReadMessage, error) {
-			return service.ReadMessages(ctx, messageIDs)
-		})
-		if err != nil {
-			return nil, nil, err
-		}
-		result["items"] = messages
-		return s.waypostToolResult(ctx, result)
-	default:
-		if len(input.Addresses) > 0 || input.State != "" || input.Limit != nil {
-			return nil, nil, errors.New("waypost_read delivery_ids mode does not support addresses, state, or limit")
-		}
-		deliveryIDs := dedupe(input.DeliveryIDs)
-		result["mode"] = "delivery_ids"
-		result["delivery_ids"] = deliveryIDs
-		deliveries, err := withWaypostService(ctx, s.waypostServices, func(service waypostDeliveryReader) ([]waypost.ReadDelivery, error) {
-			return service.ReadDeliveries(ctx, deliveryIDs)
-		})
-		if err != nil {
-			return nil, nil, err
-		}
-		result["items"] = deliveries
-		return s.waypostToolResult(ctx, result)
-	}
-
-	latest, err := withWaypostService(ctx, s.waypostServices, func(service waypostLatestDeliveryReader) (readLatestResult, error) {
-		limit := 1
-		if input.Limit != nil {
-			limit = *input.Limit
-		}
-		items, hasMore, err := service.ReadLatestDeliveries(ctx, result["addresses"].([]string), input.State, limit)
-		if err != nil {
-			return readLatestResult{}, err
-		}
-		return readLatestResult{Items: items, HasMore: hasMore}, nil
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	result["items"] = latest.Items
-	if latest.HasMore {
-		result["has_more"] = true
-	}
-	return s.waypostToolResult(ctx, result)
 }
 
 func (s *Service) waypostAck(ctx context.Context, _ *mcp.CallToolRequest, input waypostAckInput) (*mcp.CallToolResult, map[string]any, error) {
@@ -1485,7 +1149,7 @@ func (s *Service) waypostAck(ctx context.Context, _ *mcp.CallToolRequest, input 
 	if err != nil {
 		return nil, nil, err
 	}
-	s.activeLeases.markTerminal(input.DeliveryID, result.State, s.now().Format(time.RFC3339Nano))
+	s.activeLeases.markTerminal(input.DeliveryID, input.LeaseToken, result.State, s.now().Format(time.RFC3339Nano))
 	return s.waypostMutationToolResult(ctx, map[string]any{"status": "acked", "delivery_id": input.DeliveryID})
 }
 
@@ -1499,7 +1163,7 @@ func (s *Service) waypostRelease(ctx context.Context, _ *mcp.CallToolRequest, in
 	if err != nil {
 		return nil, nil, err
 	}
-	s.activeLeases.markTerminal(input.DeliveryID, result.State, s.now().Format(time.RFC3339Nano))
+	s.activeLeases.markTerminal(input.DeliveryID, input.LeaseToken, result.State, s.now().Format(time.RFC3339Nano))
 	return s.waypostMutationToolResult(ctx, map[string]any{"status": "released", "delivery_id": input.DeliveryID})
 }
 
@@ -1517,142 +1181,8 @@ func (s *Service) waypostDefer(ctx context.Context, _ *mcp.CallToolRequest, inpu
 	if err != nil {
 		return nil, nil, err
 	}
-	s.activeLeases.markTerminal(input.DeliveryID, result.State, s.now().Format(time.RFC3339Nano))
+	s.activeLeases.markTerminal(input.DeliveryID, input.LeaseToken, result.State, s.now().Format(time.RFC3339Nano))
 	return s.waypostMutationToolResult(ctx, map[string]any{"status": "deferred", "delivery_id": input.DeliveryID, "until": input.Until})
-}
-
-func (s *Service) waypostUndefer(ctx context.Context, _ *mcp.CallToolRequest, input waypostUndeferInput) (*mcp.CallToolResult, map[string]any, error) {
-	result, err := withWaypostService(ctx, s.waypostServices, func(service waypostDeliveryTransitioner) (waypost.DeliveryTransitionResult, error) {
-		return service.Undefer(ctx, input.DeliveryID)
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	return s.waypostMutationToolResult(ctx, map[string]any{
-		"status":      "undeferred",
-		"delivery_id": result.DeliveryID,
-		"visible_at":  result.VisibleAt,
-	})
-}
-
-func (s *Service) waypostFail(ctx context.Context, _ *mcp.CallToolRequest, input waypostFailInput) (*mcp.CallToolResult, map[string]any, error) {
-	if err := s.activeLeases.terminalMutationAllowed(input.DeliveryID); err != nil {
-		return nil, nil, err
-	}
-	_, err := withWaypostService(ctx, s.waypostServices, func(service waypostDeliveryTransitioner) (waypost.DeliveryTransitionResult, error) {
-		return service.Fail(ctx, input.DeliveryID, input.LeaseToken, input.Reason)
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	s.activeLeases.markTerminal(input.DeliveryID, "failed", s.now().Format(time.RFC3339Nano))
-	return s.waypostMutationToolResult(ctx, map[string]any{"status": "failed", "delivery_id": input.DeliveryID, "reason": input.Reason})
-}
-
-func (s *Service) waypostGroupCreate(ctx context.Context, _ *mcp.CallToolRequest, input waypostGroupInput) (*mcp.CallToolResult, map[string]any, error) {
-	group, err := withWaypostService(ctx, s.waypostServices, func(service waypostGroupManager) (waypost.GroupRecord, error) {
-		return service.CreateGroup(ctx, input.GroupAddress)
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	return s.waypostMutationToolResult(ctx, map[string]any{
-		"status": "created",
-		"group":  group,
-	})
-}
-
-func (s *Service) waypostGroupAddMember(ctx context.Context, _ *mcp.CallToolRequest, input waypostGroupMemberInput) (*mcp.CallToolResult, map[string]any, error) {
-	membership, err := withWaypostService(ctx, s.waypostServices, func(service waypostGroupManager) (waypost.GroupMembershipRecord, error) {
-		return service.AddGroupMember(ctx, input.GroupAddress, input.Person)
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	return s.waypostMutationToolResult(ctx, map[string]any{
-		"status":     "added",
-		"membership": membership,
-	})
-}
-
-func (s *Service) waypostGroupRemoveMember(ctx context.Context, _ *mcp.CallToolRequest, input waypostGroupMemberInput) (*mcp.CallToolResult, map[string]any, error) {
-	membership, err := withWaypostService(ctx, s.waypostServices, func(service waypostGroupManager) (waypost.GroupMembershipRecord, error) {
-		return service.RemoveGroupMember(ctx, input.GroupAddress, input.Person)
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	return s.waypostMutationToolResult(ctx, map[string]any{
-		"status":     "removed",
-		"membership": membership,
-	})
-}
-
-func (s *Service) waypostGroupMembers(ctx context.Context, _ *mcp.CallToolRequest, input waypostGroupInput) (*mcp.CallToolResult, map[string]any, error) {
-	memberships, err := withWaypostService(ctx, s.waypostServices, func(service waypostGroupManager) ([]waypost.GroupMembershipRecord, error) {
-		return service.ListGroupMembers(ctx, input.GroupAddress)
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	return s.waypostToolResult(ctx, map[string]any{
-		"status":      "listed",
-		"group":       input.GroupAddress,
-		"memberships": memberships,
-	})
-}
-
-func (s *Service) waypostGroupAddSubscriber(ctx context.Context, _ *mcp.CallToolRequest, input waypostGroupSubscriberInput) (*mcp.CallToolResult, map[string]any, error) {
-	subscriber, err := withWaypostService(ctx, s.waypostServices, func(service waypostGroupSubscriberManager) (waypost.GroupNotificationSubscriberRecord, error) {
-		return service.AddGroupNotificationSubscriber(ctx, input.GroupAddress, input.NotifyAddress, input.Person)
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	return s.waypostMutationToolResult(ctx, map[string]any{
-		"status":     "added",
-		"subscriber": subscriber,
-	})
-}
-
-func (s *Service) waypostGroupRemoveSubscriber(ctx context.Context, _ *mcp.CallToolRequest, input waypostGroupSubscriberRemoveInput) (*mcp.CallToolResult, map[string]any, error) {
-	subscriber, err := withWaypostService(ctx, s.waypostServices, func(service waypostGroupSubscriberManager) (waypost.GroupNotificationSubscriberRecord, error) {
-		return service.RemoveGroupNotificationSubscriber(ctx, input.GroupAddress, input.NotifyAddress)
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	return s.waypostMutationToolResult(ctx, map[string]any{
-		"status":     "removed",
-		"subscriber": subscriber,
-	})
-}
-
-func (s *Service) waypostGroupSubscribers(ctx context.Context, _ *mcp.CallToolRequest, input waypostGroupInput) (*mcp.CallToolResult, map[string]any, error) {
-	subscribers, err := withWaypostService(ctx, s.waypostServices, func(service waypostGroupSubscriberManager) ([]waypost.GroupNotificationSubscriberRecord, error) {
-		return service.ListGroupNotificationSubscribers(ctx, input.GroupAddress)
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	return s.waypostToolResult(ctx, map[string]any{
-		"status":      "listed",
-		"group":       input.GroupAddress,
-		"subscribers": subscribers,
-	})
-}
-
-func (s *Service) waypostAddressInspect(ctx context.Context, _ *mcp.CallToolRequest, input waypostAddressInspectInput) (*mcp.CallToolResult, map[string]any, error) {
-	inspection, err := withWaypostService(ctx, s.waypostServices, func(service waypostAddressInspector) (waypost.AddressInspection, error) {
-		return service.InspectAddress(ctx, input.Address)
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	return s.waypostToolResult(ctx, map[string]any{
-		"status":     "inspected",
-		"inspection": inspection,
-	})
 }
 
 func (s *Service) waypostToolResult(ctx context.Context, result map[string]any) (*mcp.CallToolResult, map[string]any, error) {

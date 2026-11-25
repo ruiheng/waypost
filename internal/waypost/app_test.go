@@ -11,6 +11,7 @@ import (
 	"reflect"
 	goruntime "runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -280,6 +281,346 @@ WHERE message_id = 'msg_forwarded'
 	if !forwardedFromAddress.Valid || forwardedFromAddress.String != "agent/source" {
 		t.Fatalf("forwarded_from_address = %v, want agent/source", forwardedFromAddress)
 	}
+
+	version, err := schemaUserVersion(context.Background(), runtime.DB())
+	if err != nil {
+		t.Fatalf("schemaUserVersion() error = %v", err)
+	}
+	if version != currentSchemaVersion {
+		t.Fatalf("PRAGMA user_version = %d, want %d", version, currentSchemaVersion)
+	}
+}
+
+func TestOpenRuntimeBackfillScopeAndSchemaMigrations(t *testing.T) {
+	t.Parallel()
+
+	t.Run("anonymous group notification stays NULL while non-anonymous notification backfills", func(t *testing.T) {
+		t.Parallel()
+
+		runtime, err := OpenRuntime(context.Background(), filepath.Join(t.TempDir(), "waypost-state"))
+		if err != nil {
+			t.Fatalf("OpenRuntime() error = %v", err)
+		}
+		defer runtime.Close()
+
+		group, err := runtime.Store().CreateGroup(context.Background(), "group/notify-backfill")
+		if err != nil {
+			t.Fatalf("CreateGroup() error = %v", err)
+		}
+		if _, err := runtime.Store().AddGroupMember(context.Background(), group.Address, "alice"); err != nil {
+			t.Fatalf("AddGroupMember() error = %v", err)
+		}
+		if _, err := runtime.Store().AddGroupNotificationSubscriber(context.Background(), group.Address, "agent/subscriber", "alice"); err != nil {
+			t.Fatalf("AddGroupNotificationSubscriber() error = %v", err)
+		}
+
+		anonSent, err := runtime.Store().Send(context.Background(), SendParams{
+			ToAddress:     group.Address,
+			FromAddress:   "",
+			Subject:       "anon group subject",
+			ContentType:   "text/plain",
+			SchemaVersion: "v1",
+			Body:          []byte("hello anon"),
+			Group:         true,
+		})
+		if err != nil {
+			t.Fatalf("Send(anon group) error = %v", err)
+		}
+
+		// Drain the coalesced queued subscriber notification before sending the
+		// second message so namedSent also creates a notification row.
+		anonNotify, err := runtime.Store().Receive(context.Background(), ReceiveParams{Address: "agent/subscriber"})
+		if err != nil {
+			t.Fatalf("Receive(anon subscriber notify) error = %v", err)
+		}
+		if _, err := runtime.Store().Ack(context.Background(), anonNotify.DeliveryID, anonNotify.LeaseToken); err != nil {
+			t.Fatalf("Ack(anon subscriber notify) error = %v", err)
+		}
+
+		namedSent, err := runtime.Store().Send(context.Background(), SendParams{
+			ToAddress:     group.Address,
+			FromAddress:   "agent/sender",
+			Subject:       "named group subject",
+			ContentType:   "text/plain",
+			SchemaVersion: "v1",
+			Body:          []byte("hello named"),
+			Group:         true,
+		})
+		if err != nil {
+			t.Fatalf("Send(named group) error = %v", err)
+		}
+
+		// Simulate a legacy row whose forwarded_from_address was not yet backfilled.
+		if _, err := runtime.DB().Exec(`
+UPDATE messages
+SET forwarded_from_address = NULL
+WHERE forwarded_message_id = ?
+  AND schema_version = 'group-notification/v1'
+`, namedSent.MessageID); err != nil {
+			t.Fatalf("clear named notification forwarded_from_address: %v", err)
+		}
+
+		if err := backfillForwardedFromAddress(context.Background(), runtime.DB()); err != nil {
+			t.Fatalf("backfillForwardedFromAddress() error = %v", err)
+		}
+
+		var anonForwardedFrom sql.NullString
+		if err := runtime.DB().QueryRow(`
+SELECT forwarded_from_address
+FROM messages
+WHERE forwarded_message_id = ?
+  AND schema_version = 'group-notification/v1'
+`, anonSent.MessageID).Scan(&anonForwardedFrom); err != nil {
+			t.Fatalf("query anonymous notification forwarded_from_address: %v", err)
+		}
+		if anonForwardedFrom.Valid {
+			t.Fatalf("anonymous notification forwarded_from_address = %q, want NULL", anonForwardedFrom.String)
+		}
+
+		var namedForwardedFrom sql.NullString
+		if err := runtime.DB().QueryRow(`
+SELECT forwarded_from_address
+FROM messages
+WHERE forwarded_message_id = ?
+  AND schema_version = 'group-notification/v1'
+`, namedSent.MessageID).Scan(&namedForwardedFrom); err != nil {
+			t.Fatalf("query named notification forwarded_from_address: %v", err)
+		}
+		if !namedForwardedFrom.Valid || namedForwardedFrom.String != "agent/sender" {
+			t.Fatalf("named notification forwarded_from_address = %+v, want %q", namedForwardedFrom, "agent/sender")
+		}
+	})
+
+	t.Run("upgrades v0 deliveries without CHECK constraints to v2 and preserves rows", func(t *testing.T) {
+		t.Parallel()
+
+		stateDir := filepath.Join(t.TempDir(), "waypost-v0")
+		runtime, err := OpenRuntime(context.Background(), stateDir)
+		if err != nil {
+			t.Fatalf("OpenRuntime(seed) error = %v", err)
+		}
+		sent, err := runtime.Store().Send(context.Background(), SendParams{
+			ToAddress:     "agent/recipient",
+			FromAddress:   "agent/sender",
+			Subject:       "legacy row",
+			ContentType:   "text/plain",
+			SchemaVersion: "v1",
+			Body:          []byte("payload"),
+		})
+		if err != nil {
+			t.Fatalf("Send(seed) error = %v", err)
+		}
+		if sent.DeliveryID == "" {
+			t.Fatal("sent.DeliveryID = empty, want non-empty delivery ID")
+		}
+		deliveryID := sent.DeliveryID
+		if err := runtime.Close(); err != nil {
+			t.Fatalf("Close(seed) error = %v", err)
+		}
+
+		// Downgrade deliveries table to pre-CHECK v0 shape while keeping real rows + FK events.
+		rawDB, err := openDatabase(context.Background(), filepath.Join(stateDir, databaseFilename), "immediate", 5000)
+		if err != nil {
+			t.Fatalf("openDatabase(raw) error = %v", err)
+		}
+		for _, stmt := range []string{
+			`PRAGMA foreign_keys = OFF`,
+			`CREATE TABLE deliveries_v0 (
+  delivery_id TEXT PRIMARY KEY,
+  message_id TEXT NOT NULL,
+  recipient_endpoint_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  visible_at TEXT NOT NULL,
+  lease_token TEXT,
+  lease_expires_at TEXT,
+  acked_at TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_error_code TEXT,
+  last_error_text TEXT,
+  FOREIGN KEY (message_id) REFERENCES messages(message_id),
+  FOREIGN KEY (recipient_endpoint_id) REFERENCES endpoints(endpoint_id)
+)`,
+			`INSERT INTO deliveries_v0 SELECT delivery_id, message_id, recipient_endpoint_id, state, visible_at, lease_token, lease_expires_at, acked_at, attempt_count, last_error_code, last_error_text FROM deliveries`,
+			`DROP TABLE deliveries`,
+			`ALTER TABLE deliveries_v0 RENAME TO deliveries`,
+			`PRAGMA user_version = 0`,
+		} {
+			if _, err := rawDB.Exec(stmt); err != nil {
+				_ = rawDB.Close()
+				t.Fatalf("prepare v0 db (%s): %v", stmt, err)
+			}
+		}
+		_ = rawDB.Close()
+
+		upgraded, err := OpenRuntime(context.Background(), stateDir)
+		if err != nil {
+			t.Fatalf("OpenRuntime(upgrade v0->v2) error = %v", err)
+		}
+		defer upgraded.Close()
+
+		version, err := schemaUserVersion(context.Background(), upgraded.DB())
+		if err != nil || version != currentSchemaVersion {
+			t.Fatalf("upgraded schema version = (%d, %v), want %d", version, err, currentSchemaVersion)
+		}
+		var deliveryCount, eventCount int
+		if err := upgraded.DB().QueryRow(`SELECT COUNT(*) FROM deliveries WHERE delivery_id = ?`, deliveryID).Scan(&deliveryCount); err != nil {
+			t.Fatalf("count deliveries: %v", err)
+		}
+		if err := upgraded.DB().QueryRow(`SELECT COUNT(*) FROM events WHERE delivery_id = ?`, deliveryID).Scan(&eventCount); err != nil {
+			t.Fatalf("count events: %v", err)
+		}
+		if deliveryCount != 1 || eventCount == 0 {
+			t.Fatalf("preserved counts = (deliveries=%d, events=%d), want (1, >0)", deliveryCount, eventCount)
+		}
+
+		// Verify all four v2 CHECK constraints are enforced on the rebuilt table.
+		for _, invalidInsert := range []string{
+			`INSERT INTO deliveries (delivery_id, message_id, recipient_endpoint_id, state, visible_at, attempt_count) SELECT 'bad_state', message_id, recipient_endpoint_id, 'bogus', visible_at, 0 FROM deliveries LIMIT 1`,
+			`INSERT INTO deliveries (delivery_id, message_id, recipient_endpoint_id, state, visible_at, attempt_count) SELECT 'bad_attempt', message_id, recipient_endpoint_id, 'queued', visible_at, -1 FROM deliveries LIMIT 1`,
+			`INSERT INTO deliveries (delivery_id, message_id, recipient_endpoint_id, state, visible_at, attempt_count) SELECT 'bad_leased', message_id, recipient_endpoint_id, 'leased', visible_at, 0 FROM deliveries LIMIT 1`,
+			`INSERT INTO deliveries (delivery_id, message_id, recipient_endpoint_id, state, visible_at, attempt_count) SELECT 'bad_acked', message_id, recipient_endpoint_id, 'acked', visible_at, 0 FROM deliveries LIMIT 1`,
+		} {
+			if _, err := upgraded.DB().Exec(invalidInsert); err == nil {
+				t.Fatalf("CHECK constraint did not reject %s", invalidInsert)
+			}
+		}
+	})
+
+	t.Run("rejects future schema user_version above supported maximum", func(t *testing.T) {
+		t.Parallel()
+
+		stateDir := filepath.Join(t.TempDir(), "waypost-future")
+		runtime, err := OpenRuntime(context.Background(), stateDir)
+		if err != nil {
+			t.Fatalf("OpenRuntime(seed) error = %v", err)
+		}
+		if err := runtime.Close(); err != nil {
+			t.Fatalf("Close(seed) error = %v", err)
+		}
+
+		rawDB, err := openDatabase(context.Background(), filepath.Join(stateDir, databaseFilename), "immediate", 5000)
+		if err != nil {
+			t.Fatalf("openDatabase(raw) error = %v", err)
+		}
+		if _, err := rawDB.Exec(`PRAGMA user_version = 99`); err != nil {
+			_ = rawDB.Close()
+			t.Fatalf("set PRAGMA user_version = 99: %v", err)
+		}
+		_ = rawDB.Close()
+
+		if rt, err := OpenRuntime(context.Background(), stateDir); err == nil || !strings.Contains(err.Error(), "unsupported database schema version 99") {
+			if rt != nil {
+				_ = rt.Close()
+			}
+			t.Fatalf("OpenRuntime(version=99) error = %v, want unsupported schema version 99", err)
+		}
+	})
+
+	t.Run("rejects negative schema user_version and restores WAL on v2 DB", func(t *testing.T) {
+		t.Parallel()
+
+		stateDir := filepath.Join(t.TempDir(), "waypost-v2-wal-negative")
+		rt, err := OpenRuntime(context.Background(), stateDir)
+		if err != nil {
+			t.Fatalf("OpenRuntime(seed) error = %v", err)
+		}
+		if err := rt.Close(); err != nil {
+			t.Fatalf("Close(seed) error = %v", err)
+		}
+
+		rawDB, err := openDatabase(context.Background(), filepath.Join(stateDir, databaseFilename), "immediate", 5000)
+		if err != nil {
+			t.Fatalf("openDatabase(raw) error = %v", err)
+		}
+		if _, err := rawDB.Exec(`PRAGMA journal_mode = DELETE`); err != nil {
+			_ = rawDB.Close()
+			t.Fatalf("set PRAGMA journal_mode = DELETE: %v", err)
+		}
+		_ = rawDB.Close()
+
+		reopened, err := OpenRuntime(context.Background(), stateDir)
+		if err != nil {
+			t.Fatalf("OpenRuntime(v2 restore WAL) error = %v", err)
+		}
+		var mode string
+		if err := reopened.DB().QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
+			_ = reopened.Close()
+			t.Fatalf("read journal_mode: %v", err)
+		}
+		_ = reopened.Close()
+		if !strings.EqualFold(mode, "wal") {
+			t.Fatalf("journal_mode = %q, want wal restored on v2", mode)
+		}
+
+		rawDB2, err := openDatabase(context.Background(), filepath.Join(stateDir, databaseFilename), "immediate", 5000)
+		if err != nil {
+			t.Fatalf("openDatabase(raw2) error = %v", err)
+		}
+		if _, err := rawDB2.Exec(`PRAGMA user_version = -1`); err != nil {
+			_ = rawDB2.Close()
+			t.Fatalf("set PRAGMA user_version = -1: %v", err)
+		}
+		_ = rawDB2.Close()
+
+		if rt, err := OpenRuntime(context.Background(), stateDir); err == nil || !strings.Contains(err.Error(), "unsupported database schema version -1") {
+			if rt != nil {
+				_ = rt.Close()
+			}
+			t.Fatalf("OpenRuntime(version=-1) error = %v, want unsupported schema version -1", err)
+		}
+	})
+
+	t.Run("concurrent OpenRuntime on uninitialized database succeeds", func(t *testing.T) {
+		t.Parallel()
+
+		stateDir := filepath.Join(t.TempDir(), "waypost-concurrent-open")
+		const workers = 4
+		errs := make(chan error, workers)
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				rt, err := OpenRuntime(context.Background(), stateDir)
+				if err != nil {
+					errs <- err
+					return
+				}
+				errs <- rt.Close()
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("concurrent OpenRuntime() error = %v", err)
+			}
+		}
+	})
+
+	t.Run("ensureWALJournalMode fails when sqlite refuses WAL", func(t *testing.T) {
+		t.Parallel()
+
+		memDB, err := sql.Open("sqlite3", ":memory:")
+		if err != nil {
+			t.Fatalf("sql.Open(:memory:) error = %v", err)
+		}
+		defer memDB.Close()
+
+		conn, err := memDB.Conn(context.Background())
+		if err != nil {
+			t.Fatalf("memDB.Conn() error = %v", err)
+		}
+		defer conn.Close()
+
+		err = ensureWALJournalMode(context.Background(), conn)
+		if err == nil || !strings.Contains(err.Error(), `sqlite remained in "memory" mode`) {
+			t.Fatalf("ensureWALJournalMode(:memory:) error = %v, want sqlite remained in \"memory\" mode", err)
+		}
+	})
 }
 
 func TestSendImplicitlyCreatesAddressesOnce(t *testing.T) {

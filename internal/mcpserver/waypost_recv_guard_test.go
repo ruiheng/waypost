@@ -31,7 +31,7 @@ func TestWaypostRecvEnforcesNoMessageIntervalPerConnection(t *testing.T) {
 	})
 	defer service.Close()
 	service.state.boundAddresses = []string{"agent-deck/self"}
-	service.state.autoBindAttempted = true
+	service.state.mode = bindingModeAutoHostBound
 
 	req := &mcp.CallToolRequest{Session: &mcp.ServerSession{}}
 	_, firstOutput, err := service.waypostRecv(context.Background(), req, waypostRecvInput{Addresses: []string{"agent-deck/self"}})
@@ -73,12 +73,11 @@ func TestWaypostRecvNoMessageWarningUsesThreeMinuteWindow(t *testing.T) {
 	guard := newWaypostRecvGuard()
 	session := &mcp.ServerSession{}
 	req := &mcp.CallToolRequest{Session: session}
-	active := map[*mcp.ServerSession]struct{}{session: {}}
 	current := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
 
 	finishNoMessage := func() bool {
 		t.Helper()
-		lease, err := guard.begin(req, func() time.Time { return current }, active)
+		lease, err := guard.begin(req, func() time.Time { return current })
 		if err != nil {
 			t.Fatalf("begin at %s: %v", current, err)
 		}
@@ -102,24 +101,23 @@ func TestWaypostRecvSuccessfulResultClearsNoMessageSequence(t *testing.T) {
 	guard := newWaypostRecvGuard()
 	session := &mcp.ServerSession{}
 	req := &mcp.CallToolRequest{Session: session}
-	active := map[*mcp.ServerSession]struct{}{session: {}}
 	current := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
 
-	first, err := guard.begin(req, func() time.Time { return current }, active)
+	first, err := guard.begin(req, func() time.Time { return current })
 	if err != nil {
 		t.Fatalf("first begin: %v", err)
 	}
 	first.finish("no_message", current)
 
 	current = current.Add(waypostRecvNoMessageMinInterval)
-	success, err := guard.begin(req, func() time.Time { return current }, active)
+	success, err := guard.begin(req, func() time.Time { return current })
 	if err != nil {
 		t.Fatalf("successful begin: %v", err)
 	}
 	success.finish("received", current)
 
 	current = current.Add(time.Second)
-	afterSuccess, err := guard.begin(req, func() time.Time { return current }, active)
+	afterSuccess, err := guard.begin(req, func() time.Time { return current })
 	if err != nil {
 		t.Fatalf("begin after successful result: %v", err)
 	}
@@ -132,11 +130,10 @@ func TestWaypostRecvConcurrentBeginIgnoresLaterNoMessage(t *testing.T) {
 	guard := newWaypostRecvGuard()
 	session := &mcp.ServerSession{}
 	req := &mcp.CallToolRequest{Session: session}
-	active := map[*mcp.ServerSession]struct{}{session: {}}
 	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
 
 	// Seed the state map without an outstanding no_message result.
-	seed, err := guard.begin(req, func() time.Time { return now }, active)
+	seed, err := guard.begin(req, func() time.Time { return now })
 	if err != nil {
 		t.Fatalf("seed begin: %v", err)
 	}
@@ -159,7 +156,7 @@ func TestWaypostRecvConcurrentBeginIgnoresLaterNoMessage(t *testing.T) {
 	}()
 	done := make(chan error, 1)
 	go func() {
-		lease, err := guard.begin(req, func() time.Time { return now }, active)
+		lease, err := guard.begin(req, func() time.Time { return now })
 		if err == nil {
 			lease.finish("received", now)
 		}
@@ -209,7 +206,7 @@ func TestWaypostRecvNoMessageGuardDoesNotCrossConnections(t *testing.T) {
 	})
 	defer service.Close()
 	service.state.boundAddresses = []string{"agent-deck/self"}
-	service.state.autoBindAttempted = true
+	service.state.mode = bindingModeAutoHostBound
 
 	firstReq := &mcp.CallToolRequest{Session: &mcp.ServerSession{}}
 	secondReq := &mcp.CallToolRequest{Session: &mcp.ServerSession{}}
@@ -241,7 +238,7 @@ func TestWaypostRecvGroupEnforcesNoMessageIntervalPerConnection(t *testing.T) {
 		DisableLeaseRenewLoop: true,
 	})
 	defer service.Close()
-	service.state.autoBindAttempted = true
+	service.state.mode = bindingModeAutoHostBound
 
 	req := &mcp.CallToolRequest{Session: &mcp.ServerSession{}}
 	input := waypostRecvInput{Addresses: []string{"group/review"}, AsPerson: "alice"}
@@ -278,14 +275,13 @@ func TestWaypostRecvGroupEnforcesNoMessageIntervalPerConnection(t *testing.T) {
 	}
 }
 
-func TestWaypostRecvGuardPrunesInactiveSessions(t *testing.T) {
+func TestWaypostRecvGuardPrunesExpiredIdleSessions(t *testing.T) {
 	guard := newWaypostRecvGuard()
 	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
 	firstSession := &mcp.ServerSession{}
 	firstReq := &mcp.CallToolRequest{Session: firstSession}
-	activeFirst := map[*mcp.ServerSession]struct{}{firstSession: {}}
 
-	firstLease, err := guard.begin(firstReq, func() time.Time { return now }, activeFirst)
+	firstLease, err := guard.begin(firstReq, func() time.Time { return now })
 	if err != nil {
 		t.Fatalf("first begin error = %v", err)
 	}
@@ -293,18 +289,31 @@ func TestWaypostRecvGuardPrunesInactiveSessions(t *testing.T) {
 
 	secondSession := &mcp.ServerSession{}
 	secondReq := &mcp.CallToolRequest{Session: secondSession}
-	activeSecond := map[*mcp.ServerSession]struct{}{secondSession: {}}
-	secondLease, err := guard.begin(secondReq, func() time.Time { return now }, activeSecond)
+	// Just inside TTL: first session must still be retained alongside second.
+	now = now.Add(waypostRecvGuardTTL - time.Second)
+	secondLease, err := guard.begin(secondReq, func() time.Time { return now })
 	if err != nil {
 		t.Fatalf("second begin error = %v", err)
 	}
 	secondLease.finish("received", now)
+	if got := len(guard.sessions); got != 2 {
+		t.Fatalf("guard session entries before TTL = %d, want 2 retained sessions", got)
+	}
+
+	// Past firstSession's TTL (but before secondSession's TTL): firstSession is evicted,
+	// secondSession stays.
+	now = now.Add(2 * time.Second)
+	thirdLease, err := guard.begin(secondReq, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("third begin error = %v", err)
+	}
+	thirdLease.finish("received", now)
 
 	if got := len(guard.sessions); got != 1 {
-		t.Fatalf("guard session entries = %d, want one active session entry", got)
+		t.Fatalf("guard session entries after TTL = %d, want 1 active session entry", got)
 	}
 	if _, ok := guard.sessions[weak.Make(firstSession)]; ok {
-		t.Fatal("guard retained inactive session entry")
+		t.Fatal("guard retained expired idle session entry")
 	}
 }
 
@@ -335,7 +344,7 @@ func TestWaypostRecvConcurrentCallsSameConnectionDoNotBlock(t *testing.T) {
 	})
 	defer service.Close()
 	service.state.boundAddresses = []string{"agent-deck/self"}
-	service.state.autoBindAttempted = true
+	service.state.mode = bindingModeAutoHostBound
 
 	session := &mcp.ServerSession{}
 	req := &mcp.CallToolRequest{Session: session}
@@ -388,7 +397,7 @@ func TestWaypostRecvSlowConnectionDoesNotBlockAnotherConnection(t *testing.T) {
 	})
 	defer service.Close()
 	service.state.boundAddresses = []string{"agent-deck/self"}
-	service.state.autoBindAttempted = true
+	service.state.mode = bindingModeAutoHostBound
 
 	firstReq := &mcp.CallToolRequest{Session: &mcp.ServerSession{}}
 	secondReq := &mcp.CallToolRequest{Session: &mcp.ServerSession{}}

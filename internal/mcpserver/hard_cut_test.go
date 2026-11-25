@@ -27,7 +27,7 @@ func TestWaypostStatusReportsAuthoritativeCLIContext(t *testing.T) {
 		DisableWakeScheduler:  true,
 		DisableLeaseRenewLoop: true,
 	})
-	service.state.autoBindAttempted = true
+	service.state.mode = bindingModeAutoHostBound
 	service.state.boundAddresses = []string{"agent-deck/self", "codex/self"}
 	service.state.defaultSender = "agent-deck/self"
 
@@ -107,7 +107,7 @@ func TestWaypostStatusReportsActiveLeaseTokens(t *testing.T) {
 	defer service.Close()
 	service.state.boundAddresses = []string{"agent-deck/self"}
 	service.state.defaultSender = "agent-deck/self"
-	service.state.autoBindAttempted = true
+	service.state.mode = bindingModeAutoHostBound
 
 	sent := callServiceTool(t, service, "waypost_send", map[string]any{
 		"to":      "agent-deck/self",
@@ -161,7 +161,7 @@ func TestWaypostStatusPaginatesActiveLeaseDetailsWhenRequested(t *testing.T) {
 	defer service.Close()
 	service.state.boundAddresses = []string{"agent-deck/self"}
 	service.state.defaultSender = "agent-deck/self"
-	service.state.autoBindAttempted = true
+	service.state.mode = bindingModeAutoHostBound
 
 	messages := []waypost.ReceivedMessage{
 		{DeliveryID: "dlv_status_one", LeaseToken: "lease_status_one", RecipientAddress: "agent-deck/self"},
@@ -308,7 +308,7 @@ func TestExternalDurableFailReconcilesMCPLeaseHistoryAndStatus(t *testing.T) {
 	defer service.Close()
 	service.state.boundAddresses = []string{"agent-deck/self"}
 	service.state.defaultSender = "agent-deck/self"
-	service.state.autoBindAttempted = true
+	service.state.mode = bindingModeAutoHostBound
 
 	sent := callServiceTool(t, service, "waypost_send", map[string]any{
 		"to":      "agent-deck/self",
@@ -384,7 +384,7 @@ func TestTrackedLeaseInspectionErrorDoesNotReturnCachedHint(t *testing.T) {
 	})
 	service.state.boundAddresses = []string{"agent-deck/self"}
 	service.state.defaultSender = "agent-deck/self"
-	service.state.autoBindAttempted = true
+	service.state.mode = bindingModeAutoHostBound
 	service.activeLeases.trackReceive(waypost.ReceiveResult{Messages: []waypost.ReceivedMessage{{
 		DeliveryID:       "dlv_inspect",
 		LeaseToken:       "lease_inspect",
@@ -502,7 +502,7 @@ func TestReceiveRecoveryTracksAndRenewsEveryUnreleasedClaim(t *testing.T) {
 		DisableLeaseRenewLoop: true,
 	})
 	defer service.Close()
-	service.state.autoBindAttempted = true
+	service.state.mode = bindingModeAutoHostBound
 	service.state.boundAddresses = []string{"agent-deck/one", "agent-deck/two"}
 
 	output := callServiceTool(t, service, "waypost_recv", map[string]any{

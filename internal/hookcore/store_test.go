@@ -152,3 +152,14 @@ func TestNormalizeSessionID(t *testing.T) {
 		t.Fatalf("NormalizeSessionID(blank) error = %v, want labeled error", err)
 	}
 }
+
+func TestMemoryNudgeStoreRejectsInvalidState(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemoryNudgeStore()
+	for _, invalid := range []NudgeState{NudgeNone, NudgeState("bogus")} {
+		if err := store.Save("s1", invalid); err == nil || !strings.Contains(err.Error(), "invalid state") {
+			t.Fatalf("Save(%q) error = %v, want invalid state rejection", invalid, err)
+		}
+	}
+}

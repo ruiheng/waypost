@@ -292,6 +292,9 @@ func (store *MemoryNudgeStore) Load(sessionID string) (NudgeState, error) {
 }
 
 func (store *MemoryNudgeStore) Save(sessionID string, state NudgeState) error {
+	if state != NudgePending && state != NudgeConsumed && state != NudgeGuardPending {
+		return fmt.Errorf("save %s Waypost nudge state: invalid state %q", store.Label, state)
+	}
 	sessionID, err := NormalizeSessionID(sessionID, store.Label)
 	if err != nil {
 		return err

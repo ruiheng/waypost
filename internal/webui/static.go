@@ -127,6 +127,12 @@ const indexHTML = `<!doctype html>
       max-width: 560px;
     }
     .error { color: var(--warn); }
+    .inline-error {
+      color: var(--warn);
+      font-size: 13px;
+      margin-top: 8px;
+      overflow-wrap: anywhere;
+    }
     .message {
       max-width: 920px;
       padding: 14px 0;
@@ -238,6 +244,7 @@ const indexHTML = `<!doctype html>
       <div class="brand">waypost</div>
       <div id="groups" class="group-list"></div>
       <button id="more-groups" class="load-more" type="button" hidden>More groups</button>
+      <div id="groups-error" class="inline-error" role="alert" hidden></div>
     </aside>
     <main>
       <header>
@@ -250,6 +257,7 @@ const indexHTML = `<!doctype html>
       <section id="timeline" class="timeline">
         <div id="history-messages"></div>
         <button id="more-messages" class="load-more" type="button" hidden>More messages</button>
+        <div id="messages-error" class="inline-error" role="alert" hidden></div>
         <div id="live-messages"></div>
       </section>
     </main>
@@ -265,6 +273,8 @@ const indexHTML = `<!doctype html>
     const liveMessagesEl = document.querySelector("#live-messages");
     const moreGroupsEl = document.querySelector("#more-groups");
     const moreMessagesEl = document.querySelector("#more-messages");
+    const groupsErrorEl = document.querySelector("#groups-error");
+    const messagesErrorEl = document.querySelector("#messages-error");
     let selectedGroup = defaultGroup || "";
     let source = null;
     const rendered = new Set();
@@ -282,6 +292,28 @@ const indexHTML = `<!doctype html>
       statusEl.classList.toggle("live", Boolean(live));
     }
 
+    function showInlineError(el, message) {
+      if (!el) return;
+      el.textContent = message;
+      el.hidden = false;
+    }
+
+    function clearInlineError(el) {
+      if (!el) return;
+      el.textContent = "";
+      el.hidden = true;
+    }
+
+    async function responseErrorMessage(response, fallback) {
+      const text = await response.text();
+      if (!text) return fallback;
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed.error === "string" && parsed.error) return parsed.error;
+      } catch (_) {}
+      return text.trim() || fallback;
+    }
+
     function groupURL(group, suffix) {
       return "/api/groups/" + encodeURIComponent(group) + "/" + suffix;
     }
@@ -290,10 +322,11 @@ const indexHTML = `<!doctype html>
       if (groupsPageLoading) return;
       groupsPageLoading = true;
       moreGroupsEl.disabled = true;
+      clearInlineError(groupsErrorEl);
       const initialLoad = !cursor;
       try {
         const response = await fetch("/api/groups" + (cursor ? "?cursor=" + encodeURIComponent(cursor) : ""));
-        if (!response.ok) throw new Error(await response.text());
+        if (!response.ok) throw new Error(await responseErrorMessage(response, "Unable to load groups."));
         const payload = await response.json();
         groups.push(...(payload.items || []));
         groupsCursor = payload.next_cursor || "";
@@ -336,6 +369,8 @@ const indexHTML = `<!doctype html>
       transcriptRequestController = controller;
       closeSource();
       rendered.clear();
+      transcriptCursor = "";
+      latestMessageID = "";
       titleEl.textContent = group;
       metaEl.textContent = "";
       resetTimeline();
@@ -344,8 +379,10 @@ const indexHTML = `<!doctype html>
         const response = await fetch(groupURL(group, "transcript"), {signal: controller.signal});
         if (!isCurrentTranscript(group, generation)) return;
         if (!response.ok) {
+          const detail = await responseErrorMessage(response, "Unable to load transcript.");
+          if (!isCurrentTranscript(group, generation)) return;
           setStatus("Error", false);
-          showTimelineNotice("error", "Unable to load transcript.");
+          showTimelineNotice("error", detail);
           return;
         }
         const payload = await response.json();
@@ -361,7 +398,7 @@ const indexHTML = `<!doctype html>
       } catch (error) {
         if (error.name !== "AbortError" && isCurrentTranscript(group, generation)) {
           setStatus("Error", false);
-          showTimelineNotice("error", "Unable to load transcript.");
+          showTimelineNotice("error", error.message || "Unable to load transcript.");
         }
       } finally {
         if (transcriptRequestController === controller) transcriptRequestController = null;
@@ -376,10 +413,11 @@ const indexHTML = `<!doctype html>
       const controller = new AbortController();
       moreMessagesController = controller;
       moreMessagesEl.disabled = true;
+      clearInlineError(messagesErrorEl);
       try {
         const response = await fetch(groupURL(group, "transcript") + "?cursor=" + encodeURIComponent(cursor), {signal: controller.signal});
         if (!isCurrentTranscript(group, generation)) return;
-        if (!response.ok) throw new Error(await response.text());
+        if (!response.ok) throw new Error(await responseErrorMessage(response, "Unable to load more messages."));
         const payload = await response.json();
         if (!isCurrentTranscript(group, generation)) return;
         transcriptCursor = payload.next_cursor || "";
@@ -387,7 +425,12 @@ const indexHTML = `<!doctype html>
         moreMessagesEl.hidden = !transcriptCursor;
         metaEl.textContent = rendered.size + " messages loaded";
       } catch (error) {
-        if (error.name !== "AbortError" && isCurrentTranscript(group, generation)) setStatus("Error", false);
+        if (error.name !== "AbortError" && isCurrentTranscript(group, generation)) {
+          showInlineError(messagesErrorEl, error.message || "Unable to load more messages.");
+          if (!source) {
+            setStatus("Error", false);
+          }
+        }
       } finally {
         if (moreMessagesController === controller) {
           moreMessagesController = null;
@@ -422,10 +465,24 @@ const indexHTML = `<!doctype html>
         const message = JSON.parse(event.data);
         removeTimelineNotice();
         appendMessage(message, liveMessagesEl, true);
-        metaEl.textContent = rendered.size + " messages";
+        metaEl.textContent = rendered.size + " messages loaded";
       });
-      eventSource.addEventListener("error", () => {
-        if (source === eventSource && isCurrentTranscript(group, generation)) setStatus("Reconnecting", false);
+      eventSource.addEventListener("error", (event) => {
+        if (source !== eventSource || !isCurrentTranscript(group, generation)) return;
+        if ((event && event.data) || eventSource.readyState === EventSource.CLOSED) {
+          if (event && event.data) {
+            let detail = String(event.data);
+            try {
+              const parsed = JSON.parse(event.data);
+              if (parsed && typeof parsed.error === "string" && parsed.error) detail = parsed.error;
+            } catch (_) {}
+            showInlineError(messagesErrorEl, detail);
+          }
+          closeSource();
+          setStatus("Error", false);
+          return;
+        }
+        setStatus("Reconnecting", false);
       });
     }
 
@@ -439,6 +496,7 @@ const indexHTML = `<!doctype html>
       liveMessagesEl.innerHTML = "";
       moreMessagesEl.hidden = true;
       moreMessagesEl.disabled = false;
+      clearInlineError(messagesErrorEl);
       removeTimelineNotice();
     }
 
@@ -550,14 +608,19 @@ const indexHTML = `<!doctype html>
     }
 
     function flashCopyButton(button, label) {
-      const previous = button.textContent;
+      if (!button.dataset.defaultLabel) button.dataset.defaultLabel = button.textContent;
+      if (button._copyResetTimer) window.clearTimeout(button._copyResetTimer);
       button.textContent = label;
-      window.setTimeout(() => {
-        button.textContent = previous;
+      button._copyResetTimer = window.setTimeout(() => {
+        button.textContent = button.dataset.defaultLabel;
+        button._copyResetTimer = 0;
       }, 1100);
     }
 
-    moreGroupsEl.addEventListener("click", () => loadGroups(groupsCursor).catch((error) => setStatus(error.message, false)));
+    moreGroupsEl.addEventListener("click", () => loadGroups(groupsCursor).catch((error) => {
+      showInlineError(groupsErrorEl, error.message || "Unable to load more groups.");
+      if (!source) setStatus("Error", false);
+    }));
     moreMessagesEl.addEventListener("click", () => loadMoreMessages());
 
     loadGroups().catch((error) => {

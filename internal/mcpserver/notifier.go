@@ -165,7 +165,8 @@ type groupSubscriberNotificationResult struct {
 
 func (m *notificationManager) notifyGroupSubscriber(ctx context.Context, input waypostSendInput, notifyAddress string) groupSubscriberNotificationResult {
 	result := groupSubscriberNotificationResult{}
-	if strings.TrimSpace(notifyAddress) == strings.TrimSpace(input.FromAddress) {
+	trimmedAddress := strings.TrimSpace(notifyAddress)
+	if trimmedAddress == strings.TrimSpace(input.FromAddress) || (m.sessions != nil && m.sessions.isBoundLocalAddress(trimmedAddress)) {
 		return result
 	}
 	result.attempted = true
@@ -206,8 +207,9 @@ func aggregateGroupSubscriberNotifications(results []groupSubscriberNotification
 	attemptedCount := 0
 	sentCount := 0
 	unconfirmedCount := 0
+	otherCount := 0
 	schemes := map[string]bool{}
-	statuses := map[string]bool{}
+	otherStatuses := map[string]bool{}
 	var failures []error
 	var details []string
 	for _, result := range results {
@@ -220,43 +222,49 @@ func aggregateGroupSubscriberNotifications(results []groupSubscriberNotification
 				schemes[scheme] = true
 			}
 		}
-		if result.status != "" {
-			statuses[result.status] = true
-		}
-		if result.status == "unconfirmed" {
-			unconfirmedCount++
-		}
-		if result.delivered {
-			sentCount++
-		} else if result.err != nil {
-			failures = append(failures, result.err)
-		}
 		if detail := strings.TrimSpace(result.detail); detail != "" {
 			details = append(details, detail)
+		}
+		switch {
+		case result.delivered:
+			sentCount++
+		case result.status == "unconfirmed":
+			unconfirmedCount++
+		case result.err != nil || result.status == "failed":
+			failure := result.err
+			if failure == nil {
+				failure = errors.New(firstNonEmpty(strings.TrimSpace(result.detail), "notification failed"))
+			}
+			failures = append(failures, failure)
+		default:
+			otherCount++
+			if result.status != "" {
+				otherStatuses[result.status] = true
+			}
 		}
 	}
 	aggregateScheme := notificationSchemeFromSet(schemes)
 	aggregateDetail := strings.Join(dedupe(details), "; ")
-	if attemptedCount > 0 && sentCount == attemptedCount {
+
+	switch {
+	case attemptedCount == 0:
+		return notificationOutcome{Status: "skipped_sender", Scheme: aggregateScheme, Detail: aggregateDetail}
+	case sentCount == attemptedCount:
 		return notificationOutcome{Status: "sent", Scheme: aggregateScheme}
-	}
-	if sentCount > 0 {
-		if sentCount+unconfirmedCount == attemptedCount {
-			return notificationOutcome{
-				Status: "unconfirmed",
-				Scheme: aggregateScheme,
-				Detail: aggregateDetail,
-			}
-		}
+	case sentCount > 0 && len(failures) == 0 && otherCount == 0:
+		return notificationOutcome{Status: "unconfirmed", Scheme: aggregateScheme, Detail: aggregateDetail}
+	case sentCount > 0:
 		return notificationOutcome{Status: "partial_failed", Scheme: aggregateScheme, Detail: aggregateDetail, Err: errors.Join(failures...)}
-	}
-	if len(failures) > 0 {
+	case len(failures) > 0:
 		return notificationOutcome{Status: "failed", Scheme: aggregateScheme, Detail: aggregateDetail, Err: errors.Join(failures...)}
-	}
-	return notificationOutcome{
-		Status: notificationStatusFromSet(statuses),
-		Scheme: aggregateScheme,
-		Detail: aggregateDetail,
+	case unconfirmedCount > 0:
+		return notificationOutcome{Status: "unconfirmed", Scheme: aggregateScheme, Detail: aggregateDetail}
+	default:
+		return notificationOutcome{
+			Status: notificationStatusFromSet(otherStatuses),
+			Scheme: aggregateScheme,
+			Detail: aggregateDetail,
+		}
 	}
 }
 
@@ -435,7 +443,10 @@ func notificationProbeRetryable(probe notificationProbe) bool {
 	case "target_stopped", "target_error":
 		return true
 	case "failed":
-		return !errors.Is(probe.Err, context.Canceled) && !errors.Is(probe.Err, context.DeadlineExceeded)
+		var cmdTimeout *commandTimeoutError
+		return !errors.Is(probe.Err, context.Canceled) &&
+			!errors.Is(probe.Err, context.DeadlineExceeded) &&
+			!errors.As(probe.Err, &cmdTimeout)
 	default:
 		return false
 	}
@@ -582,9 +593,7 @@ type agentDeckNudgeResult struct {
 }
 
 func (n agentDeckNotifier) runNudge(ctx context.Context, args []string) notificationOutcome {
-	runCtx, cancel := context.WithTimeout(ctx, syncCmdTimeout)
-	defer cancel()
-	if err := runCtx.Err(); err != nil {
+	if err := ctx.Err(); err != nil {
 		return notificationOutcome{
 			Status: "failed",
 			Scheme: n.Name(),
@@ -592,32 +601,33 @@ func (n agentDeckNotifier) runNudge(ctx context.Context, args []string) notifica
 		}
 	}
 
-	result, runErr := n.runner.Run(runCtx, args, "")
-	payload, structured := parseAgentDeckNudgeResult(result.Stdout)
-	if structured {
-		return classifyAgentDeckNudgeResult(n.Name(), result, payload)
-	}
-
-	if errors.Is(runErr, context.DeadlineExceeded) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-		return notificationOutcome{
-			Status: "unconfirmed",
-			Scheme: n.Name(),
-			Detail: "nudge command timed out after delivery may already have been attempted",
-		}
-	}
-	if errors.Is(runErr, context.Canceled) || errors.Is(runCtx.Err(), context.Canceled) {
-		return notificationOutcome{
-			Status: "unconfirmed",
-			Scheme: n.Name(),
-			Detail: "nudge command was canceled after delivery may already have been attempted",
-		}
-	}
+	result, runErr := execSubprocess(ctx, n.runner, args, runOptions{timeout: syncCmdTimeout})
 	if runErr != nil {
+		var timeoutErr *commandTimeoutError
+		if errors.As(runErr, &timeoutErr) || errors.Is(runErr, context.DeadlineExceeded) {
+			return notificationOutcome{
+				Status: "unconfirmed",
+				Scheme: n.Name(),
+				Detail: "nudge command timed out after delivery may already have been attempted",
+			}
+		}
+		if errors.Is(runErr, context.Canceled) {
+			return notificationOutcome{
+				Status: "unconfirmed",
+				Scheme: n.Name(),
+				Detail: "nudge command was canceled after delivery may already have been attempted",
+			}
+		}
 		return notificationOutcome{
 			Status: "failed",
 			Scheme: n.Name(),
 			Err:    fmt.Errorf("agent-deck nudge could not start or complete: %w", runErr),
 		}
+	}
+
+	payload, structured := parseAgentDeckNudgeResult(result.Stdout)
+	if structured {
+		return classifyAgentDeckNudgeResult(n.Name(), result, payload)
 	}
 	if result.ExitCode == 0 {
 		return notificationOutcome{Status: "sent", Scheme: n.Name()}
@@ -648,10 +658,22 @@ func parseAgentDeckNudgeResult(stdout string) (agentDeckNudgeResult, bool) {
 
 func classifyAgentDeckNudgeResult(scheme string, result RunResult, payload agentDeckNudgeResult) notificationOutcome {
 	delivery := strings.ToLower(strings.TrimSpace(payload.Delivery))
-	if payload.Submitted != nil && *payload.Submitted || delivery == "submitted" {
-		return notificationOutcome{Status: "sent", Scheme: scheme}
+	state := strings.ToLower(strings.TrimSpace(payload.State))
+	failedOutcome := func() notificationOutcome {
+		return notificationOutcome{
+			Status: "failed",
+			Scheme: scheme,
+			Err:    agentDeckNudgeError(result, payload),
+		}
 	}
 
+	// 1. Explicit failure delivery verdicts.
+	switch delivery {
+	case "typed_not_submitted", "line_too_long", "send_failed", "pane_gone":
+		return failedOutcome()
+	}
+
+	// 2. Explicit unconfirmed delivery verdicts stay unconfirmed even if success is false.
 	switch delivery {
 	case "typed":
 		return notificationOutcome{
@@ -665,34 +687,40 @@ func classifyAgentDeckNudgeResult(scheme string, result RunResult, payload agent
 			Scheme: scheme,
 			Detail: "nudge was sent but agent-deck could not verify whether the target accepted it",
 		}
-	case "queued":
-		if payload.Success != nil && !*payload.Success {
-			return notificationOutcome{
-				Status: "failed",
-				Scheme: scheme,
-				Err:    agentDeckNudgeError(result, payload),
-			}
-		}
-		return queuedAgentDeckOutcome(scheme, payload.Deadline)
 	case "no_evidence":
 		return notificationOutcome{
 			Status: "unconfirmed",
 			Scheme: scheme,
 			Detail: "nudge was attempted but no delivery evidence was observed",
 		}
-	case "typed_not_submitted", "line_too_long", "send_failed", "pane_gone":
-		return notificationOutcome{
-			Status: "failed",
-			Scheme: scheme,
-			Err:    agentDeckNudgeError(result, payload),
+	}
+
+	// 3. Remaining explicit failures via state or success flag.
+	if state == "failed" || (payload.Success != nil && !*payload.Success) {
+		return failedOutcome()
+	}
+
+	// 4. Submitted delivery verdict.
+	if delivery == "submitted" {
+		if payload.Submitted != nil && !*payload.Submitted {
+			return notificationOutcome{
+				Status: "unconfirmed",
+				Scheme: scheme,
+				Detail: "agent-deck returned contradictory submission verdict",
+			}
 		}
-	case "":
-		state := strings.ToLower(strings.TrimSpace(payload.State))
-		if state == "failed" {
-			return notificationOutcome{Status: "failed", Scheme: scheme, Err: agentDeckNudgeError(result, payload)}
-		}
-		if payload.Success != nil && !*payload.Success {
-			return notificationOutcome{Status: "failed", Scheme: scheme, Err: agentDeckNudgeError(result, payload)}
+		return notificationOutcome{Status: "sent", Scheme: scheme}
+	}
+
+	// 5. Queued delivery verdict.
+	if delivery == "queued" {
+		return queuedAgentDeckOutcome(scheme, payload.Deadline)
+	}
+
+	// 6. Empty delivery verdict.
+	if delivery == "" {
+		if payload.Submitted != nil && *payload.Submitted {
+			return notificationOutcome{Status: "sent", Scheme: scheme}
 		}
 		if state == "queued" {
 			return queuedAgentDeckOutcome(scheme, payload.Deadline)
@@ -707,20 +735,17 @@ func classifyAgentDeckNudgeResult(scheme string, result RunResult, payload agent
 				Detail: "agent-deck returned structured output without a delivery verdict",
 			}
 		}
-		return notificationOutcome{Status: "failed", Scheme: scheme, Err: agentDeckNudgeError(result, payload)}
-	default:
-		if strings.EqualFold(strings.TrimSpace(payload.State), "failed") {
-			return notificationOutcome{
-				Status: "failed",
-				Scheme: scheme,
-				Err:    agentDeckNudgeError(result, payload),
-			}
-		}
-		return notificationOutcome{
-			Status: "unconfirmed",
-			Scheme: scheme,
-			Detail: fmt.Sprintf("agent-deck returned an unknown delivery verdict %q", delivery),
-		}
+		return failedOutcome()
+	}
+
+	// 7. Unknown delivery verdict.
+	if payload.Submitted != nil && *payload.Submitted {
+		return notificationOutcome{Status: "sent", Scheme: scheme}
+	}
+	return notificationOutcome{
+		Status: "unconfirmed",
+		Scheme: scheme,
+		Detail: fmt.Sprintf("agent-deck returned an unknown delivery verdict %q", delivery),
 	}
 }
 
@@ -795,13 +820,50 @@ func (n thurboxNotifier) Notify(ctx context.Context, event notificationEvent) no
 			Scheme: n.Name(),
 		}
 	}
-	if _, err := runCommand(ctx, n.runner, []string{
-		"thurbox-cli", "session", "send", event.Route.Target, notifyMessage,
-	}, runOptions{timeout: syncCmdTimeout}); err != nil {
+	if err := ctx.Err(); err != nil {
 		return notificationOutcome{
 			Status: "failed",
 			Scheme: n.Name(),
-			Err:    err,
+			Err:    fmt.Errorf("thurbox nudge was not attempted: %w", err),
+		}
+	}
+	args := []string{"thurbox-cli", "session", "send", event.Route.Target, notifyMessage}
+	result, err := execSubprocess(ctx, n.runner, args, runOptions{timeout: syncCmdTimeout})
+	if err != nil {
+		var timeoutErr *commandTimeoutError
+		switch {
+		case errors.Is(err, context.DeadlineExceeded), errors.As(err, &timeoutErr):
+			return notificationOutcome{
+				Status: "unconfirmed",
+				Scheme: n.Name(),
+				Detail: "thurbox nudge timed out after delivery may already have been attempted",
+			}
+		case errors.Is(err, context.Canceled):
+			return notificationOutcome{
+				Status: "unconfirmed",
+				Scheme: n.Name(),
+				Detail: "thurbox nudge was canceled after delivery may already have been attempted",
+			}
+		default:
+			return notificationOutcome{
+				Status: "failed",
+				Scheme: n.Name(),
+				Err:    fmt.Errorf("command failed: %s :: %s", strings.Join(args, " "), err.Error()),
+			}
+		}
+	}
+	if result.ExitCode != 0 {
+		detail := strings.TrimSpace(result.Stderr)
+		if detail == "" {
+			detail = strings.TrimSpace(result.Stdout)
+		}
+		if detail == "" {
+			detail = fmt.Sprintf("exit code %d", result.ExitCode)
+		}
+		return notificationOutcome{
+			Status: "failed",
+			Scheme: n.Name(),
+			Err:    fmt.Errorf("command failed: %s :: %s", strings.Join(args, " "), detail),
 		}
 	}
 	return notificationOutcome{

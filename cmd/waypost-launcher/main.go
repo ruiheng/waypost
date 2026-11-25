@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/ruiheng/waypost/internal/hideconsole"
@@ -103,7 +104,15 @@ func readManifest(path string) (activeVersionManifest, error) {
 }
 
 func executableName() string {
-	if strings.EqualFold(filepath.Ext(os.Args[0]), ".exe") {
+	argv0 := ""
+	if len(os.Args) > 0 {
+		argv0 = os.Args[0]
+	}
+	return executableNameForOS(runtime.GOOS, argv0)
+}
+
+func executableNameForOS(goos, argv0 string) string {
+	if goos == "windows" || strings.EqualFold(filepath.Ext(argv0), ".exe") {
 		return "waypost.exe"
 	}
 	return "waypost"

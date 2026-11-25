@@ -26,6 +26,8 @@ const (
 	ssePollInterval      = time.Second
 )
 
+var errServerClosed = errors.New("web server is closed")
+
 type Options struct {
 	StateDir    string
 	Listen      string
@@ -38,10 +40,13 @@ type Options struct {
 }
 
 type Server struct {
-	stateDir string
-	group    string
-	mu       sync.Mutex
-	runtime  *waypost.Runtime
+	stateDir       string
+	group          string
+	mu             sync.Mutex
+	runtime        *waypost.Runtime
+	closed         bool
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
 }
 
 func Run(ctx context.Context, opts Options) error {
@@ -57,6 +62,7 @@ func Run(ctx context.Context, opts Options) error {
 		Addr:    listen,
 		Handler: handler,
 	}
+	server.RegisterOnShutdown(handler.CancelStreams)
 
 	listener, err := net.Listen("tcp", listen)
 	if err != nil {
@@ -78,9 +84,11 @@ func Run(ctx context.Context, opts Options) error {
 
 	select {
 	case <-ctx.Done():
+		handler.CancelStreams()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
+			_ = server.Close()
 			return fmt.Errorf("shutdown web server: %w", err)
 		}
 		return ctx.Err()
@@ -213,26 +221,40 @@ func listensBeyondLoopback(listen string) bool {
 }
 
 func NewServer(stateDir, group string) *Server {
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	return &Server{
-		stateDir: stateDir,
-		group:    strings.TrimSpace(group),
+		stateDir:       stateDir,
+		group:          strings.TrimSpace(group),
+		shutdownCtx:    shutdownCtx,
+		shutdownCancel: shutdownCancel,
+	}
+}
+
+func (s *Server) CancelStreams() {
+	if s.shutdownCancel != nil {
+		s.shutdownCancel()
 	}
 }
 
 func (s *Server) Close() error {
+	s.CancelStreams()
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.runtime == nil {
+	s.closed = true
+	runtime := s.runtime
+	s.runtime = nil
+	s.mu.Unlock()
+	if runtime == nil {
 		return nil
 	}
-	err := s.runtime.Close()
-	s.runtime = nil
-	return err
+	return runtime.Close()
 }
 
 func (s *Server) waypostRuntime(ctx context.Context) (*waypost.Runtime, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return nil, errServerClosed
+	}
 	if s.runtime != nil {
 		return s.runtime, nil
 	}
@@ -265,7 +287,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 	runtime, err := s.waypostRuntime(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		writeError(w, statusForWaypostError(err), err)
 		return
 	}
 
@@ -276,11 +298,7 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 	}
 	page, err := runtime.Store().ListGroupsPage(r.Context(), pageParams)
 	if err != nil {
-		status := http.StatusInternalServerError
-		if errors.Is(err, waypost.ErrInvalidPaginationCursor) {
-			status = http.StatusBadRequest
-		}
-		writeError(w, status, err)
+		writeError(w, statusForWaypostError(err), err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -309,7 +327,7 @@ func (s *Server) handleGroupPath(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request, groupAddress string) {
 	runtime, err := s.waypostRuntime(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		writeError(w, statusForWaypostError(err), err)
 		return
 	}
 
@@ -341,10 +359,68 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request, groupA
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request, groupAddress string) {
+	if s.shutdownCtx != nil && s.shutdownCtx.Err() != nil {
+		writeError(w, http.StatusServiceUnavailable, errServerClosed)
+		return
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, errors.New("streaming is not supported"))
 		return
+	}
+
+	streamCtx := r.Context()
+	if s.shutdownCtx != nil {
+		var streamCancel context.CancelFunc
+		streamCtx, streamCancel = context.WithCancel(r.Context())
+		stopShutdown := context.AfterFunc(s.shutdownCtx, streamCancel)
+		defer stopShutdown()
+		defer streamCancel()
+	}
+
+	afterProvided := false
+	after := ""
+	if lastEventID := strings.TrimSpace(r.Header.Get("Last-Event-ID")); lastEventID != "" {
+		after = lastEventID
+		afterProvided = true
+	} else {
+		afterValues, hasAfterQuery := r.URL.Query()["after"]
+		afterProvided = hasAfterQuery
+		if len(afterValues) > 0 {
+			after = strings.TrimSpace(afterValues[0])
+		}
+	}
+
+	runtime, err := s.waypostRuntime(streamCtx)
+	if err != nil {
+		if s.shutdownCtx != nil && s.shutdownCtx.Err() != nil {
+			writeError(w, http.StatusServiceUnavailable, errServerClosed)
+			return
+		}
+		if r.Context().Err() != nil {
+			return
+		}
+		writeError(w, statusForWaypostError(err), err)
+		return
+	}
+	latestID, err := runtime.Store().LatestGroupMessageID(streamCtx, groupAddress)
+	if err != nil {
+		if s.shutdownCtx != nil && s.shutdownCtx.Err() != nil {
+			writeError(w, http.StatusServiceUnavailable, errServerClosed)
+			return
+		}
+		if r.Context().Err() != nil {
+			return
+		}
+		writeError(w, statusForWaypostError(err), err)
+		return
+	}
+	if s.shutdownCtx != nil && s.shutdownCtx.Err() != nil {
+		writeError(w, http.StatusServiceUnavailable, errServerClosed)
+		return
+	}
+	if !afterProvided {
+		after = latestID
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -353,38 +429,28 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request, groupAddre
 	_, _ = io.WriteString(w, ": connected\n\n")
 	flusher.Flush()
 
-	afterValues, afterProvided := r.URL.Query()["after"]
-	after := ""
-	if len(afterValues) > 0 {
-		after = strings.TrimSpace(afterValues[0])
-	}
-	if !afterProvided {
-		runtime, err := s.waypostRuntime(r.Context())
-		if err != nil {
-			writeSSE(w, "error", map[string]string{"error": err.Error()})
-			flusher.Flush()
-			return
-		}
-		after, err = runtime.Store().LatestGroupMessageID(r.Context(), groupAddress)
-		if err != nil {
-			writeSSE(w, "error", map[string]string{"error": err.Error()})
-			flusher.Flush()
-			return
-		}
-	}
 	ticker := time.NewTicker(ssePollInterval)
 	defer ticker.Stop()
 
+	streamClosed := func() bool {
+		return streamCtx.Err() != nil || (s.shutdownCtx != nil && s.shutdownCtx.Err() != nil)
+	}
 	for {
-		page, err := s.transcript(r.Context(), groupAddress, after)
+		if streamClosed() {
+			return
+		}
+		page, err := s.transcript(streamCtx, groupAddress, after)
 		if err != nil {
-			writeSSE(w, "error", map[string]string{"error": err.Error()})
+			if streamClosed() || errors.Is(err, errServerClosed) {
+				return
+			}
+			writeSSE(w, "", "error", map[string]string{"error": err.Error()})
 			flusher.Flush()
 			return
 		}
 
 		for _, message := range page.Items {
-			writeSSE(w, "message", message)
+			writeSSE(w, message.MessageID, "message", message)
 			after = message.MessageID
 			flusher.Flush()
 		}
@@ -393,7 +459,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request, groupAddre
 			continue
 		}
 		select {
-		case <-r.Context().Done():
+		case <-streamCtx.Done():
 			return
 		case <-ticker.C:
 		}
@@ -455,23 +521,30 @@ func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
 
-func writeSSE(w io.Writer, event string, value any) {
+func writeSSE(w io.Writer, id, event string, value any) {
 	body, err := json.Marshal(value)
 	if err != nil {
 		body = []byte(`{"error":"encode event"}`)
 		event = "error"
+		id = ""
+	}
+	if strings.TrimSpace(id) != "" {
+		fmt.Fprintf(w, "id: %s\n", id)
 	}
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, body)
 }
 
 func statusForWaypostError(err error) int {
-	if errors.Is(err, waypost.ErrGroupNotFound) {
+	switch {
+	case errors.Is(err, errServerClosed):
+		return http.StatusServiceUnavailable
+	case errors.Is(err, waypost.ErrGroupNotFound):
 		return http.StatusNotFound
-	}
-	if errors.Is(err, waypost.ErrInvalidPaginationCursor) {
+	case errors.Is(err, waypost.ErrInvalidPaginationCursor), errors.Is(err, waypost.ErrInvalidArgument):
 		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
 	}
-	return http.StatusBadRequest
 }
 
 func nilIfEmpty(value string) any {

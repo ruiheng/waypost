@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/ruiheng/waypost/internal/waypost"
@@ -50,8 +51,34 @@ func (s *Service) processLeaseRenewals(ctx context.Context) error {
 		renewed, err := s.renewLeaseWithRetry(ctx, lease)
 		if err != nil {
 			if renewalFailureDefinitive(err) {
-				if reconcileErr := s.reconcileTrackedLeases(ctx); reconcileErr != nil && firstErr == nil {
+				reconcileErr := s.reconcileTrackedLeases(ctx)
+				if reconcileErr != nil && firstErr == nil {
 					firstErr = reconcileErr
+				}
+				if reconcileErr == nil && errors.Is(err, waypost.ErrLeaseRenewChanged) && s.activeLeases.isActive(lease.DeliveryID, lease.LeaseToken) {
+					retryRenewed, retryErr := s.renewLeaseWithRetry(ctx, lease)
+					if retryErr == nil {
+						s.activeLeases.updateRenewed(lease.LeaseToken, retryRenewed, s.now().Format(time.RFC3339Nano))
+						continue
+					}
+					if errors.Is(retryErr, waypost.ErrLeaseRenewChanged) {
+						retryReconcileErr := s.reconcileTrackedLeases(ctx)
+						if retryReconcileErr != nil && firstErr == nil {
+							firstErr = retryReconcileErr
+						}
+						if retryReconcileErr == nil && s.activeLeases.isActive(lease.DeliveryID, lease.LeaseToken) {
+							recorded := s.activeLeases.markRenewalFailureWithSeverity(lease, retryErr, false)
+							if firstErr == nil {
+								firstErr = recorded
+							}
+							continue
+						}
+					} else if renewalFailureDefinitive(retryErr) {
+						if retryReconcileErr := s.reconcileTrackedLeases(ctx); retryReconcileErr != nil && firstErr == nil {
+							firstErr = retryReconcileErr
+						}
+					}
+					err = retryErr
 				}
 			}
 			recorded := s.activeLeases.markRenewalFailure(lease, err)
@@ -60,7 +87,7 @@ func (s *Service) processLeaseRenewals(ctx context.Context) error {
 			}
 			continue
 		}
-		s.activeLeases.updateRenewed(renewed, s.now().Format(time.RFC3339Nano))
+		s.activeLeases.updateRenewed(lease.LeaseToken, renewed, s.now().Format(time.RFC3339Nano))
 	}
 	return firstErr
 }

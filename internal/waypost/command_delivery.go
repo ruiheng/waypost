@@ -318,6 +318,10 @@ func (a *App) prepareWatchCommand(args []string) (preparedCommand, error) {
 	if timeout < 0 {
 		return nil, errors.New("--timeout must be greater than or equal to 0")
 	}
+	normalizedState, err := normalizeDeliveryStateFilter(state)
+	if err != nil {
+		return nil, err
+	}
 	format, err := formats.resolve()
 	if err != nil {
 		return nil, err
@@ -325,7 +329,7 @@ func (a *App) prepareWatchCommand(args []string) (preparedCommand, error) {
 
 	params := WatchParams{
 		Addresses: normalizedAddresses,
-		State:     state,
+		State:     normalizedState,
 		Timeout:   timeout,
 	}
 
@@ -420,7 +424,7 @@ func (a *App) prepareReadCommand(args []string) (preparedCommand, error) {
 	fs.Var(&addresses, "for", "recipient address (repeatable)")
 	fs.StringVar(&fromAddress, "from", "", "sender address for --latest")
 	fs.BoolVar(&latest, "latest", false, "read the latest deliveries for one or more queues")
-	fs.StringVar(&state, "state", "", "delivery state for --latest (defaults to acked)")
+	fs.StringVar(&state, "state", "", "delivery state for --latest (defaults to any)")
 	fs.IntVar(&limit, "limit", 1, "maximum number of latest deliveries to read")
 	fs.StringVar(&cursor, "cursor", "", "pagination cursor for --latest")
 	formats.register(fs, "emit JSON", "emit YAML")
@@ -498,6 +502,12 @@ func (a *App) prepareReadCommand(args []string) (preparedCommand, error) {
 		return nil, err
 	}
 	state = strings.TrimSpace(state)
+	if latest {
+		state, err = normalizeDeliveryStateFilter(state)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	return func(ctx context.Context, store *Store) error {
 		if len(normalizedMessageIDs) > 0 {

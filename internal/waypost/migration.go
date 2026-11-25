@@ -39,11 +39,13 @@ type migrationMarker struct {
 	Source      string         `json:"source"`
 	Destination string         `json:"destination"`
 	Stage       migrationStage `json:"stage,omitempty"`
+	NoDatabase  bool           `json:"no_database,omitempty"`
 }
 
 type migrationOwnership struct {
 	Source      string `json:"source"`
 	Destination string `json:"destination"`
+	NoDatabase  bool   `json:"no_database,omitempty"`
 }
 
 type migrationStage string
@@ -112,6 +114,7 @@ func migrateLegacyState(destinationOverride, sourceOverride string, renameDirect
 			SourceRetained: sourceExists,
 		}, nil
 	}
+
 	ownership, ownershipExists, err := readMigrationOwnership(destination)
 	if err != nil {
 		return MigrationResult{}, err
@@ -120,7 +123,7 @@ func migrateLegacyState(destinationOverride, sourceOverride string, renameDirect
 		if ownership.Source != source || ownership.Destination != destination {
 			return MigrationResult{}, fmt.Errorf("migration ownership for current state directory %q does not match requested source %q and destination %q", destination, source, destination)
 		}
-		if result, recovered, err := resumeFinalizedRetainedOwnedDestination(source, destination, sourceExists, destinationExists); recovered {
+		if result, recovered, err := resumeFinalizedRetainedOwnedDestination(source, destination, sourceExists, destinationExists, ownership); recovered {
 			return result, err
 		}
 		if sourceExists && destinationExists {
@@ -203,15 +206,21 @@ func resumeFinalizedRetainedCopy(marker migrationMarker, source, destination str
 // migration. On Windows, cleanup can lose the primary marker even though the
 // copied destination has already been finalized and used. Recreate its marker
 // before returning it, so future retries retain the same recovery contract.
-func resumeFinalizedRetainedOwnedDestination(source, destination string, sourceExists, destinationExists bool) (MigrationResult, bool, error) {
-	return resumeFinalizedRetainedDestination(newMigrationMarker(source, destination), source, destination, sourceExists, destinationExists, writeMigrationMarker)
+func resumeFinalizedRetainedOwnedDestination(source, destination string, sourceExists, destinationExists bool, ownership migrationOwnership) (MigrationResult, bool, error) {
+	marker := newMigrationMarker(source, destination)
+	if ownership.NoDatabase {
+		marker.Stage = migrationStageCopyCommitted
+		marker.NoDatabase = true
+	}
+	return resumeFinalizedRetainedDestination(marker, source, destination, sourceExists, destinationExists, writeMigrationMarker)
 }
 
 func resumeFinalizedRetainedDestination(marker migrationMarker, source, destination string, sourceExists, destinationExists bool, persistMarker func(string, migrationMarker) error) (MigrationResult, bool, error) {
 	if !rebuildCopiedStateOnResume() || !sourceExists || !destinationExists {
 		return MigrationResult{}, false, nil
 	}
-	completed, err := databaseRenameCompleted(destination)
+	allowNoDatabase := marker.Stage == migrationStageCopyCommitted && marker.NoDatabase
+	completed, err := migrationDatabaseFinalized(destination, allowNoDatabase)
 	if err != nil {
 		return MigrationResult{}, true, err
 	}
@@ -332,6 +341,7 @@ func restartMigrationFromSource(source, destination string, renameDirectory func
 
 func restartCopiedMigrationFromSource(marker migrationMarker, source, destination string, destinationExists bool) (MigrationResult, error) {
 	marker.Stage = migrationStageCopying
+	marker.NoDatabase = false
 	if err := replaceMigrationMarker(destination, marker); err != nil {
 		return MigrationResult{}, err
 	}
@@ -379,6 +389,9 @@ func finishMigration(source, destination string, sourceRetained bool) (Migration
 		if err := removeLegacyMigrationStageMarkers(destination); err != nil {
 			return MigrationResult{}, err
 		}
+		if err := recordEmptyMigrationFinalization(destination); err != nil {
+			return MigrationResult{}, err
+		}
 	} else {
 		if err := removeMigrationOwnership(destination); err != nil {
 			return MigrationResult{}, err
@@ -392,6 +405,42 @@ func finishMigration(source, destination string, sourceRetained bool) (Migration
 		Destination:    destination,
 		SourceRetained: sourceRetained,
 	}, nil
+}
+
+func recordEmptyMigrationFinalization(destination string) error {
+	hasCurrentDB, err := hasCurrentDatabaseFile(destination)
+	if err != nil {
+		return err
+	}
+	hasLegacyDB, err := hasLegacyDatabaseFiles(destination)
+	if err != nil {
+		return err
+	}
+	if hasCurrentDB || hasLegacyDB {
+		return nil
+	}
+
+	marker, markerExists, err := readMigrationMarker(destination)
+	if err != nil {
+		return err
+	}
+	if markerExists && !marker.NoDatabase {
+		marker.NoDatabase = true
+		if err := replaceMigrationMarker(destination, marker); err != nil {
+			return err
+		}
+	}
+	ownership, ownershipExists, err := readMigrationOwnership(destination)
+	if err != nil {
+		return err
+	}
+	if ownershipExists && !ownership.NoDatabase {
+		ownership.NoDatabase = true
+		if err := replaceMigrationOwnership(destination, ownership); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func removeMigratedLegacyState(source string) error {
@@ -414,8 +463,16 @@ func discardIncompleteCopiedState(destination string) error {
 	return nil
 }
 
-func stateDirectoryExists(path, kind string) (bool, error) {
-	info, err := os.Lstat(path)
+func inspectDirectoryExists(path, kind string, followSymlink bool) (bool, error) {
+	var (
+		info os.FileInfo
+		err  error
+	)
+	if followSymlink {
+		info, err = os.Stat(path)
+	} else {
+		info, err = os.Lstat(path)
+	}
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
@@ -428,12 +485,20 @@ func stateDirectoryExists(path, kind string) (bool, error) {
 	return true, nil
 }
 
+func stateDirectoryExists(path, kind string) (bool, error) {
+	return inspectDirectoryExists(path, kind, false)
+}
+
+func runtimeStateDirectoryExists(path, kind string) (bool, error) {
+	return inspectDirectoryExists(path, kind, true)
+}
+
 func ensureDefaultLegacyStateMigrated(overrideStateDir, stateDir string) error {
 	if overrideStateDir != "" || os.Getenv("WAYPOST_STATE_DIR") != "" {
 		return nil
 	}
 
-	stateExists, err := stateDirectoryExists(stateDir, "current")
+	stateExists, err := runtimeStateDirectoryExists(stateDir, "current")
 	if err != nil {
 		return err
 	}
@@ -607,6 +672,14 @@ func writeMigrationOwnership(destination string, marker migrationMarker) error {
 		return fmt.Errorf("encode migration ownership: %w", err)
 	}
 	return writeMigrationFile(migrationOwnershipPath(destination), contents, false)
+}
+
+func replaceMigrationOwnership(destination string, ownership migrationOwnership) error {
+	contents, err := json.Marshal(ownership)
+	if err != nil {
+		return fmt.Errorf("encode migration ownership: %w", err)
+	}
+	return writeMigrationFile(migrationOwnershipPath(destination), contents, true)
 }
 
 func writeMigrationCopyingMarker(destination string) error {
@@ -816,7 +889,7 @@ func ensureMigrationComplete(stateDir string) error {
 		return fmt.Errorf("inspect incomplete migration for state directory %q: %w", stateDir, err)
 	}
 	if ownershipExists {
-		completed, err := databaseRenameCompleted(stateDir)
+		completed, err := migrationDatabaseFinalized(stateDir, ownership.NoDatabase)
 		if err != nil {
 			return fmt.Errorf("inspect incomplete migration for state directory %q: %w", stateDir, err)
 		}
@@ -825,11 +898,11 @@ func ensureMigrationComplete(stateDir string) error {
 		}
 	}
 
-	hasLegacyFiles, err := hasLegacyDatabaseFiles(stateDir)
+	hasLegacyDBFiles, err := hasLegacyDatabaseFiles(stateDir)
 	if err != nil {
-		return err
+		return fmt.Errorf("inspect incomplete migration for state directory %q: %w", stateDir, err)
 	}
-	if hasLegacyFiles {
+	if hasLegacyDBFiles {
 		return fmt.Errorf("state directory %q still contains legacy database files; rerun waypost --state-dir %q migrate before using it", stateDir, stateDir)
 	}
 	return nil
@@ -839,11 +912,41 @@ func recoveryMarkerAllowsRuntime(marker migrationMarker, stateDir string) (bool,
 	if !keepMigrationRecoveryMarker() || marker.Version != migrationMarkerVersion || marker.Stage != migrationStageCopyCommitted {
 		return false, nil
 	}
-	exists, err := stateDirectoryExists(stateDir, "current")
+	exists, err := runtimeStateDirectoryExists(stateDir, "current")
 	if err != nil || !exists {
 		return false, err
 	}
-	return databaseRenameCompleted(stateDir)
+	return migrationDatabaseFinalized(stateDir, marker.NoDatabase)
+}
+
+func migrationDatabaseFinalized(stateDir string, noDatabase bool) (bool, error) {
+	completed, err := databaseRenameCompleted(stateDir)
+	if err != nil || completed {
+		return completed, err
+	}
+	if !noDatabase {
+		return false, nil
+	}
+	hasLegacyFiles, err := hasLegacyDatabaseFiles(stateDir)
+	if err != nil {
+		return false, err
+	}
+	return !hasLegacyFiles, nil
+}
+
+func hasCurrentDatabaseFile(stateDir string) (bool, error) {
+	path := filepath.Join(stateDir, databaseFilename)
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect current database %q: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return false, fmt.Errorf("current database %q is not a regular file", path)
+	}
+	return true, nil
 }
 
 func hasLegacyDatabaseFiles(stateDir string) (bool, error) {
@@ -862,16 +965,9 @@ func hasLegacyDatabaseFiles(stateDir string) (bool, error) {
 // version 2 compatibility path. A copied legacy state still has mailbox.db;
 // only finishMigration replaces it with waypost.db before marker cleanup.
 func databaseRenameCompleted(stateDir string) (bool, error) {
-	path := filepath.Join(stateDir, databaseFilename)
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("inspect current database %q: %w", path, err)
-	}
-	if !info.Mode().IsRegular() {
-		return false, fmt.Errorf("current database %q is not a regular file", path)
+	hasCurrentDB, err := hasCurrentDatabaseFile(stateDir)
+	if err != nil || !hasCurrentDB {
+		return false, err
 	}
 
 	hasLegacyFiles, err := hasLegacyDatabaseFiles(stateDir)

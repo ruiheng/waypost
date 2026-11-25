@@ -300,3 +300,95 @@ func TestListReadsQueuedDeliveryWhileAnotherRuntimeHoldsWriterLock(t *testing.T)
 		t.Fatalf("list delivery id = %q, want %q", deliveries[0].DeliveryID, sent.DeliveryID)
 	}
 }
+
+func TestWatchReEmitsDeliveryOnRepeatedLeaseExpiry(t *testing.T) {
+	t.Parallel()
+
+	runtime, store := newLeaseTestStore(t)
+	defer runtime.Close()
+
+	base := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	now := base
+	store.now = func() time.Time { return now }
+
+	const address = "workflow/watch-reexpire"
+	sent := mustSendMessage(t, store, address, "agent/sender", "reexpire", "body")
+
+	// Consumer A claims then lets lease expire.
+	now = base.Add(time.Second)
+	if _, err := store.ReceiveBatch(context.Background(), ReceiveBatchParams{Address: address, Max: 1}); err != nil {
+		t.Fatalf("first ReceiveBatch() error = %v", err)
+	}
+
+	now = now.Add(defaultLeaseTimeout + time.Second)
+	var emitted []string
+	var claim2Once bool
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err := store.Watch(ctx, WatchParams{Address: address, Timeout: time.Second}, func(d ListedDelivery) error {
+		emitted = append(emitted, d.DeliveryID)
+		if len(emitted) == 1 && !claim2Once {
+			claim2Once = true
+			// Consumer B reclaims with a new lease_token, then lets THAT lease expire too.
+			now = now.Add(time.Second)
+			if _, err := store.ReceiveBatch(context.Background(), ReceiveBatchParams{Address: address, Max: 1}); err != nil {
+				return err
+			}
+			now = now.Add(defaultLeaseTimeout + time.Second)
+		} else if len(emitted) >= 2 {
+			cancel()
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Watch() error = %v", err)
+	}
+	if len(emitted) != 2 || emitted[0] != sent.DeliveryID || emitted[1] != sent.DeliveryID {
+		t.Fatalf("emitted = %v, want [%q, %q] across two expirations", emitted, sent.DeliveryID, sent.DeliveryID)
+	}
+}
+
+func TestWatchLeasedDoesNotReEmitOnLeaseRenewal(t *testing.T) {
+	t.Parallel()
+
+	runtime, store := newLeaseTestStore(t)
+	defer runtime.Close()
+
+	base := time.Date(2026, 8, 13, 13, 0, 0, 0, time.UTC)
+	now := base
+	store.now = func() time.Time { return now }
+
+	const address = "workflow/watch-renew"
+	receivedCh := make(chan ReceivedMessage, 1)
+	sent := mustSendMessage(t, store, address, "agent/sender", "leased", "body")
+	msg, err := store.Receive(context.Background(), ReceiveParams{Address: address})
+	if err != nil {
+		t.Fatalf("Receive() error = %v", err)
+	}
+	receivedCh <- msg
+
+	var emitted []string
+	var renewedOnce bool
+	err = store.Watch(context.Background(), WatchParams{
+		Address: address,
+		State:   "leased",
+		Timeout: 150 * time.Millisecond,
+	}, func(d ListedDelivery) error {
+		emitted = append(emitted, d.DeliveryID)
+		if !renewedOnce {
+			renewedOnce = true
+			claimed := <-receivedCh
+			now = now.Add(time.Minute)
+			if _, err := store.Renew(context.Background(), claimed.DeliveryID, claimed.LeaseToken, 10*time.Minute); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Watch(leased) error = %v, want clean idle timeout", err)
+	}
+	if len(emitted) != 1 || emitted[0] != sent.DeliveryID {
+		t.Fatalf("emitted = %v, want [%q] once without renewal duplicate", emitted, sent.DeliveryID)
+	}
+}

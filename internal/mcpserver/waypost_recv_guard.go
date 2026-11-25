@@ -13,16 +13,18 @@ import (
 const (
 	waypostRecvNoMessageMinInterval   = 15 * time.Second
 	waypostRecvNoMessageWarningWindow = 3 * time.Minute
+	waypostRecvGuardTTL               = 2 * waypostRecvNoMessageWarningWindow
 )
 
 const waypostRecvPollingWarning = "The previous waypost_recv result was no_message; avoid meaningless polling and wait for a delivery notification before calling waypost_recv again."
 
 type waypostRecvSessionState struct {
-	mu            sync.Mutex
-	lastNoMessage time.Time
-	hasNoMessage  bool
-	resultVersion atomic.Uint64
-	inFlight      atomic.Int32
+	mu                   sync.Mutex
+	lastNoMessage        time.Time
+	hasNoMessage         bool
+	resultVersion        atomic.Uint64
+	inFlight             atomic.Int32
+	lastActivityUnixNano atomic.Int64
 }
 
 // waypostRecvGuard tracks receive results per MCP connection. A connection
@@ -44,24 +46,7 @@ func newWaypostRecvGuard() *waypostRecvGuard {
 	}
 }
 
-func (s *Service) waypostRecvActiveSessions() map[*mcp.ServerSession]struct{} {
-	s.serverMu.Lock()
-	server := s.server
-	s.serverMu.Unlock()
-	if server == nil {
-		// An uninitialized Service has no live MCP sessions. Returning an empty
-		// snapshot lets the guard discard states for other synthetic/old
-		// sessions while preserving the current request's state.
-		return map[*mcp.ServerSession]struct{}{}
-	}
-	active := make(map[*mcp.ServerSession]struct{})
-	for session := range server.Sessions() {
-		active[session] = struct{}{}
-	}
-	return active
-}
-
-func (g *waypostRecvGuard) begin(req *mcp.CallToolRequest, now func() time.Time, activeSessions map[*mcp.ServerSession]struct{}) (*waypostRecvGuardLease, error) {
+func (g *waypostRecvGuard) begin(req *mcp.CallToolRequest, now func() time.Time) (*waypostRecvGuardLease, error) {
 	if now == nil {
 		now = func() time.Time { return time.Now().UTC() }
 	}
@@ -72,9 +57,9 @@ func (g *waypostRecvGuard) begin(req *mcp.CallToolRequest, now func() time.Time,
 		session = req.Session
 	}
 	key := weak.Make(session)
-	g.prune(session, activeSessions)
 
 	g.mu.Lock()
+	g.pruneLocked(key, current)
 	state := g.sessions[key]
 	if state == nil {
 		state = &waypostRecvSessionState{}
@@ -88,6 +73,7 @@ func (g *waypostRecvGuard) begin(req *mcp.CallToolRequest, now func() time.Time,
 	// Pin the state in the map before releasing the global lock. The timing
 	// mutex below is deliberately not nested under g.mu and is released before
 	// the caller starts reconciliation or receive I/O.
+	state.lastActivityUnixNano.Store(current.UnixNano())
 	state.inFlight.Add(1)
 	g.mu.Unlock()
 
@@ -107,26 +93,20 @@ func (g *waypostRecvGuard) begin(req *mcp.CallToolRequest, now func() time.Time,
 	}, nil
 }
 
-func (g *waypostRecvGuard) prune(currentSession *mcp.ServerSession, activeSessions map[*mcp.ServerSession]struct{}) {
+var nilSessionGuardKey weak.Pointer[mcp.ServerSession]
+
+func (g *waypostRecvGuard) pruneLocked(currentKey weak.Pointer[mcp.ServerSession], now time.Time) {
+	cutoffUnixNano := now.Add(-waypostRecvGuardTTL).UnixNano()
 	// Do not acquire a session mutex while holding g.mu. An in-flight receive
 	// must never delay map access for another connection.
-	g.mu.Lock()
 	for key, state := range g.sessions {
-		session := key.Value()
-		inactive := false
-		if session == nil {
-			inactive = true
-		} else if activeSessions != nil && session != currentSession {
-			_, active := activeSessions[session]
-			inactive = !active
+		if key == currentKey || state.inFlight.Load() != 0 {
+			continue
 		}
-		if inactive {
-			if state.inFlight.Load() == 0 {
-				delete(g.sessions, key)
-			}
+		if (key != nilSessionGuardKey && key.Value() == nil) || state.lastActivityUnixNano.Load() <= cutoffUnixNano {
+			delete(g.sessions, key)
 		}
 	}
-	g.mu.Unlock()
 }
 
 func (l *waypostRecvGuardLease) finish(status string, now time.Time) bool {
@@ -152,6 +132,7 @@ func (l *waypostRecvGuardLease) finish(status string, now time.Time) bool {
 		l.state.resultVersion.Add(1)
 	}
 	l.state.mu.Unlock()
+	l.state.lastActivityUnixNano.Store(now.UnixNano())
 	l.state.inFlight.Add(-1)
 	l.active = false
 	return warn

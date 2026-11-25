@@ -1548,7 +1548,7 @@ func TestThurboxWakeFollowsDurableSendAndFailureKeepsDelivery(t *testing.T) {
 	defer service.Close()
 	service.state.boundAddresses = []string{"agent-deck/sender"}
 	service.state.defaultSender = "agent-deck/sender"
-	service.state.autoBindAttempted = true
+	service.state.mode = bindingModeAutoHostBound
 
 	// The real durable store is used here. The check is intentionally after the
 	// send has returned, just before the wake command can run.
@@ -1604,7 +1604,7 @@ func TestNestedThurboxWakeTargetsOnlyImmediateSession(t *testing.T) {
 	})
 	service.state.boundAddresses = []string{"thurbox/" + thurboxAuthorID, "agent-deck/outer-agent-deck"}
 	service.state.defaultSender = "thurbox/" + thurboxAuthorID
-	service.state.autoBindAttempted = true
+	service.state.mode = bindingModeAutoHostBound
 	service.state.detectedThurboxSession = thurboxAuthorID
 	service.state.detectedAgentDeckSession = "outer-agent-deck"
 

@@ -66,6 +66,8 @@ type SendBatchResult struct {
 // Status returns the durable aggregate status for a completed batch.
 func (r SendBatchResult) Status() string {
 	switch {
+	case r.SentCount == 0 && r.FailedCount == 0:
+		return "not_attempted"
 	case r.FailedCount == 0:
 		return "sent"
 	case r.SentCount == 0:

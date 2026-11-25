@@ -129,3 +129,28 @@ func TestNormalizePropagatesStandardizeError(t *testing.T) {
 		t.Fatal("Normalize() error = nil, want single-quote rejection")
 	}
 }
+
+func TestStandardizeStage3Fixes(t *testing.T) {
+	for _, invalid := range []string{
+		`true/*c*/false`,
+		`[,]`,
+		`{,}`,
+		`[1,,]`,
+	} {
+		out, err := Standardize([]byte(invalid))
+		if err != nil {
+			continue
+		}
+		if json.Valid(out) {
+			t.Fatalf("Standardize(%q) = %q unexpectedly became valid JSON", invalid, out)
+		}
+	}
+
+	_, changed, err := Normalize([]byte(`{broken`))
+	if err != nil {
+		t.Fatalf("Normalize(plain broken) error = %v", err)
+	}
+	if changed {
+		t.Fatal("Normalize(plain broken non-JSONC) changed = true, want false")
+	}
+}

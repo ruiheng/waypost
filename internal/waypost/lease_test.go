@@ -916,6 +916,9 @@ END;
 	if !errors.As(err, &recovery) {
 		t.Fatalf("ReceiveBatch(incomplete rollback) error = %v, want ReceiveRecoveryRequiredError", err)
 	}
+	if recovery.Phase != ReceiveRecoveryPhaseRemainingState {
+		t.Fatalf("recovery.Phase = %q, want %q", recovery.Phase, ReceiveRecoveryPhaseRemainingState)
+	}
 	if !errors.Is(err, countErr) {
 		t.Fatalf("ReceiveBatch(incomplete rollback) error = %v, want count failure", err)
 	}
@@ -983,6 +986,10 @@ func TestReceiveBatchReturnsRecoveryFailureAndReleasesEarlierClaims(t *testing.T
 	}
 	if !errors.Is(err, ErrBodyIntegrity) {
 		t.Fatalf("ReceiveBatch(recovery failure) error = %v, want ErrBodyIntegrity", err)
+	}
+	var recoveryRequired *ReceiveRecoveryRequiredError
+	if errors.As(err, &recoveryRequired) {
+		t.Fatalf("ReceiveBatch(stolen lease) unexpectedly returned ReceiveRecoveryRequiredError: %+v", recoveryRequired)
 	}
 
 	firstState, firstAttempts := readDeliveryStateAndAttemptCount(t, runtime, firstSent.DeliveryID)
@@ -1737,4 +1744,460 @@ func assertStringSlicesEqual(t *testing.T, got, want []string) {
 			t.Fatalf("got[%d] = %q, want %q (got=%v want=%v)", i, got[i], want[i], got, want)
 		}
 	}
+}
+
+func TestDeliveriesSchemaRejectsIllegalStateCombinations(t *testing.T) {
+	t.Parallel()
+
+	runtime, store := newLeaseTestStore(t)
+	defer runtime.Close()
+
+	sent := mustSendMessage(t, store, "workflow/check", "agent/sender", "check", "body")
+	var endpointID string
+	if err := runtime.DB().QueryRow(`SELECT recipient_endpoint_id FROM deliveries WHERE delivery_id = ?`, sent.DeliveryID).Scan(&endpointID); err != nil {
+		t.Fatalf("query recipient_endpoint_id: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		sql  string
+		args []any
+	}{
+		{
+			name: "invalid state",
+			sql: `INSERT INTO deliveries (delivery_id, message_id, recipient_endpoint_id, state, visible_at, lease_token, lease_expires_at, acked_at, attempt_count)
+			      VALUES ('dlv_bad_state', ?, ?, 'bogus', '2026-01-01T00:00:00Z', NULL, NULL, NULL, 0)`,
+			args: []any{sent.MessageID, endpointID},
+		},
+		{
+			name: "leased without lease token",
+			sql: `INSERT INTO deliveries (delivery_id, message_id, recipient_endpoint_id, state, visible_at, lease_token, lease_expires_at, acked_at, attempt_count)
+			      VALUES ('dlv_bad_lease', ?, ?, 'leased', '2026-01-01T00:00:00Z', NULL, '2026-01-01T00:05:00Z', NULL, 0)`,
+			args: []any{sent.MessageID, endpointID},
+		},
+		{
+			name: "queued with lease token",
+			sql: `INSERT INTO deliveries (delivery_id, message_id, recipient_endpoint_id, state, visible_at, lease_token, lease_expires_at, acked_at, attempt_count)
+			      VALUES ('dlv_bad_queued', ?, ?, 'queued', '2026-01-01T00:00:00Z', 'lease_1', '2026-01-01T00:05:00Z', NULL, 0)`,
+			args: []any{sent.MessageID, endpointID},
+		},
+		{
+			name: "acked without acked_at",
+			sql: `INSERT INTO deliveries (delivery_id, message_id, recipient_endpoint_id, state, visible_at, lease_token, lease_expires_at, acked_at, attempt_count)
+			      VALUES ('dlv_bad_acked', ?, ?, 'acked', '2026-01-01T00:00:00Z', NULL, NULL, NULL, 0)`,
+			args: []any{sent.MessageID, endpointID},
+		},
+		{
+			name: "negative attempt count",
+			sql: `INSERT INTO deliveries (delivery_id, message_id, recipient_endpoint_id, state, visible_at, lease_token, lease_expires_at, acked_at, attempt_count)
+			      VALUES ('dlv_bad_attempt', ?, ?, 'queued', '2026-01-01T00:00:00Z', NULL, NULL, NULL, -1)`,
+			args: []any{sent.MessageID, endpointID},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := runtime.DB().Exec(tc.sql, tc.args...); err == nil {
+				t.Fatalf("Exec(%s) succeeded, want SQLite CHECK constraint failure", tc.name)
+			}
+		})
+	}
+}
+
+func TestWaitAndWatchObserveExpiredClaimableLeasesAndNormalizeStateFilters(t *testing.T) {
+	t.Parallel()
+
+	runtime, store := newLeaseTestStore(t)
+	defer runtime.Close()
+
+	current := time.Date(2026, 4, 5, 10, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return current }
+
+	const address = "workflow/expired-watch"
+	sent := mustSendMessage(t, store, address, "agent/sender", "subject", "body")
+	if _, err := store.Receive(context.Background(), ReceiveParams{Address: address}); err != nil {
+		t.Fatalf("Receive() error = %v", err)
+	}
+
+	current = current.Add(defaultLeaseTimeout + time.Second)
+
+	waited, err := store.Wait(context.Background(), WaitParams{
+		Address: address,
+		Timeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Wait(expired lease) error = %v", err)
+	}
+	if waited.DeliveryID != sent.DeliveryID || waited.State != "leased" {
+		t.Fatalf("Wait(expired lease) = %+v, want leased delivery %q", waited, sent.DeliveryID)
+	}
+
+	for _, stateFilter := range []string{"", "claimed"} {
+		ctx, cancel := context.WithCancel(context.Background())
+		var got []ListedDelivery
+		err := store.Watch(ctx, WatchParams{
+			Address: address,
+			State:   stateFilter,
+			Timeout: time.Second,
+		}, func(delivery ListedDelivery) error {
+			got = append(got, delivery)
+			cancel()
+			return nil
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Watch(state=%q) error = %v", stateFilter, err)
+		}
+		if len(got) != 1 || got[0].DeliveryID != sent.DeliveryID {
+			t.Fatalf("Watch(state=%q) deliveries = %+v, want [%q]", stateFilter, got, sent.DeliveryID)
+		}
+	}
+
+	page, err := store.ReadLatestDeliveriesPage(context.Background(), ReadLatestParams{
+		Addresses: []string{address},
+		State:     "claimed",
+		Limit:     10,
+	})
+	if err != nil {
+		t.Fatalf("ReadLatestDeliveriesPage(claimed) error = %v", err)
+	}
+	if len(page.Items) != 1 || page.Items[0].DeliveryID != sent.DeliveryID {
+		t.Fatalf("ReadLatestDeliveriesPage(claimed) = %+v, want [%q]", page.Items, sent.DeliveryID)
+	}
+
+	if _, err := store.Wait(context.Background(), WaitParams{Address: address, Timeout: -time.Second}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("Wait(negative timeout) error = %v, want ErrInvalidArgument", err)
+	}
+	if err := store.Watch(context.Background(), WatchParams{Address: address, Timeout: -time.Second}, func(ListedDelivery) error { return nil }); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("Watch(negative timeout) error = %v, want ErrInvalidArgument", err)
+	}
+	if err := store.Watch(context.Background(), WatchParams{Address: address, State: "bogus"}, func(ListedDelivery) error { return nil }); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("Watch(invalid state) error = %v, want ErrInvalidArgument", err)
+	}
+	if _, err := store.ReadLatestDeliveriesPage(context.Background(), ReadLatestParams{Addresses: []string{address}, State: "bogus", Limit: 10}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("ReadLatestDeliveriesPage(invalid state) error = %v, want ErrInvalidArgument", err)
+	}
+}
+
+func TestReceiveBatchReturnsRecoveryRequiredWhenReceiveRecoveryRollbackFails(t *testing.T) {
+	t.Parallel()
+
+	runtime, store := newLeaseTestStore(t)
+	defer runtime.Close()
+
+	current := time.Date(2026, 7, 25, 9, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return current }
+
+	const address = "workflow/blob-recovery-rollback"
+	first := mustSendMessage(t, store, address, "agent/sender", "first", "first body")
+	current = current.Add(time.Second)
+	second := mustSendMessage(t, store, address, "agent/sender", "second", "second body")
+
+	var blob2 string
+	if err := runtime.DB().QueryRow(`SELECT body_blob_ref FROM messages WHERE message_id = ?`, second.MessageID).Scan(&blob2); err != nil {
+		t.Fatalf("query second blob ref: %v", err)
+	}
+	if err := os.Remove(filepath.Join(store.blobDir, blob2)); err != nil {
+		t.Fatalf("remove second blob: %v", err)
+	}
+	if _, err := runtime.DB().Exec(`
+CREATE TRIGGER reject_leased_to_queued_rollback
+BEFORE UPDATE OF state ON deliveries
+WHEN OLD.state = 'leased' AND NEW.state = 'queued'
+BEGIN
+  SELECT RAISE(ABORT, 'reject leased->queued');
+END;
+`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err := store.ReceiveBatch(context.Background(), ReceiveBatchParams{
+		Address: address,
+		Max:     2,
+	})
+	var recovery *ReceiveRecoveryRequiredError
+	if !errors.As(err, &recovery) {
+		t.Fatalf("ReceiveBatch() error = %v, want *ReceiveRecoveryRequiredError", err)
+	}
+	if recovery.Phase != "claim_recovery" {
+		t.Fatalf("recovery.Phase = %q, want %q", recovery.Phase, "claim_recovery")
+	}
+	if len(recovery.Claims) != 2 || recovery.Claims[0].DeliveryID != first.DeliveryID || recovery.Claims[1].DeliveryID != second.DeliveryID {
+		t.Fatalf("recovery.Claims = %+v, want [%q %q]", recovery.Claims, first.DeliveryID, second.DeliveryID)
+	}
+}
+
+func TestReceiveReturnsRecoveryRequiredWhenSingleClaimRecoveryFails(t *testing.T) {
+	t.Parallel()
+
+	runtime, store := newLeaseTestStore(t)
+	defer runtime.Close()
+
+	const address = "workflow/single-claim-recovery"
+	sent := mustSendMessage(t, store, address, "agent/sender", "only", "body")
+	second := mustSendMessage(t, store, address, "agent/sender", "second", "body2")
+
+	for _, messageID := range []string{sent.MessageID, second.MessageID} {
+		var blobRef string
+		if err := runtime.DB().QueryRow(`SELECT body_blob_ref FROM messages WHERE message_id = ?`, messageID).Scan(&blobRef); err != nil {
+			t.Fatalf("query blob ref(%s): %v", messageID, err)
+		}
+		if err := os.Remove(filepath.Join(store.blobDir, blobRef)); err != nil {
+			t.Fatalf("remove blob(%s): %v", messageID, err)
+		}
+	}
+	if _, err := runtime.DB().Exec(`
+CREATE TRIGGER reject_leased_to_queued
+BEFORE UPDATE OF state ON deliveries
+WHEN OLD.state = 'leased' AND NEW.state = 'queued'
+BEGIN
+  SELECT RAISE(ABORT, 'reject leased->queued');
+END;
+`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err := store.ReceiveBatch(context.Background(), ReceiveBatchParams{
+		Address: address,
+		Max:     1,
+	})
+	var recovery *ReceiveRecoveryRequiredError
+	if !errors.As(err, &recovery) {
+		t.Fatalf("ReceiveBatch(Max=1) error = %v, want *ReceiveRecoveryRequiredError", err)
+	}
+	if len(recovery.Claims) != 1 || recovery.Claims[0].DeliveryID != sent.DeliveryID || recovery.Claims[0].LeaseToken == "" {
+		t.Fatalf("recovery.Claims = %+v, want leaked single claim %q", recovery.Claims, sent.DeliveryID)
+	}
+	if recovery.Claims[0].SenderAddress == nil || *recovery.Claims[0].SenderAddress != "agent/sender" {
+		t.Fatalf("recovery.Claims[0].SenderAddress = %v, want agent/sender", recovery.Claims[0].SenderAddress)
+	}
+	if !strings.Contains(recovery.Error(), "receive recovery failed") {
+		t.Fatalf("recovery.Error() = %q, want claim recovery failure text", recovery.Error())
+	}
+
+	_, singleErr := store.Receive(context.Background(), ReceiveParams{Address: address})
+	var singleRecovery *ReceiveRecoveryRequiredError
+	if !errors.As(singleErr, &singleRecovery) || singleRecovery.Phase != ReceiveRecoveryPhaseClaimRecovery {
+		t.Fatalf("Receive() error = %v, want *ReceiveRecoveryRequiredError(claim_recovery)", singleErr)
+	}
+	if len(singleRecovery.Claims) != 1 || singleRecovery.Claims[0].DeliveryID != second.DeliveryID {
+		t.Fatalf("Receive() recovery claims = %+v, want %q", singleRecovery.Claims, second.DeliveryID)
+	}
+}
+
+func TestReceiveBatchPreservesPrimaryErrorWithoutSentinelHijackWhenRollbackLosesOwnership(t *testing.T) {
+	t.Parallel()
+
+	runtime, store := newLeaseTestStore(t)
+	defer runtime.Close()
+
+	const address = "workflow/count-rollback-lost-ownership"
+	mustSendMessage(t, store, address, "agent/sender", "subject", "body")
+	primaryErr := errors.New("primary remaining-state query failure")
+
+	_, err := store.receiveBatchWithLeasePolicyAndRemainingCounter(
+		context.Background(),
+		[]string{address},
+		1,
+		legacyReceiveLeasePolicy,
+		func(ctx context.Context, _ personalAvailabilityScope, claimedIDs []string) (map[string]int, error) {
+			if len(claimedIDs) != 1 {
+				t.Fatalf("claimedIDs = %v, want 1 claimed delivery", claimedIDs)
+			}
+			var token string
+			if qErr := runtime.DB().QueryRowContext(ctx, `SELECT lease_token FROM deliveries WHERE delivery_id = ?`, claimedIDs[0]).Scan(&token); qErr != nil {
+				t.Fatalf("query claimed lease token: %v", qErr)
+			}
+			if _, ackErr := store.Ack(ctx, claimedIDs[0], token); ackErr != nil {
+				t.Fatalf("concurrent Ack() error = %v", ackErr)
+			}
+			return nil, primaryErr
+		},
+	)
+	if !errors.Is(err, primaryErr) {
+		t.Fatalf("ReceiveBatch() error = %v, want primary error %v preserved", err, primaryErr)
+	}
+	var recovery *ReceiveRecoveryRequiredError
+	if errors.As(err, &recovery) {
+		t.Fatalf("ReceiveBatch() returned *ReceiveRecoveryRequiredError (%+v), want none when ownership definitely lost", recovery)
+	}
+	if !strings.Contains(err.Error(), "rollback failed:") {
+		t.Fatalf("ReceiveBatch() error = %q, want rollback failure context", err.Error())
+	}
+	if doc := cliErrorFor(err); doc.ErrorCode != "internal" {
+		t.Fatalf("cliErrorFor(err).ErrorCode = %q, want internal without rollback sentinel hijack", doc.ErrorCode)
+	}
+}
+
+func TestClaimNextDeliveryDoesNotRetrySQLiteBusyInsideReceiveRecoveryError(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	rt1, err := OpenRuntime(ctx, filepath.Join(t.TempDir(), "state1"))
+	if err != nil {
+		t.Fatalf("OpenRuntime(rt1) error = %v", err)
+	}
+	defer rt1.Close()
+
+	rt2, err := OpenRuntime(ctx, filepath.Join(t.TempDir(), "state2"))
+	if err != nil {
+		t.Fatalf("OpenRuntime(rt2) error = %v", err)
+	}
+	defer rt2.Close()
+
+	lockTx, err := rt2.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("rt2.DB().BeginTx() error = %v", err)
+	}
+	defer func() { _ = lockTx.Rollback() }()
+
+	lockedWriteDB, err := openDatabase(ctx, rt2.dbPath, "immediate", 0)
+	if err != nil {
+		t.Fatalf("openDatabase(lockedWriteDB) error = %v", err)
+	}
+	defer lockedWriteDB.Close()
+
+	base := time.Date(2026, 8, 1, 11, 0, 0, 0, time.UTC)
+	rt1.Store().now = func() time.Time { return base }
+
+	const address = "workflow/busy-recovery"
+	first := mustSendMessage(t, rt1.Store(), address, "agent/sender", "first", "body1")
+	rt1.Store().now = func() time.Time { return base.Add(time.Second) }
+	second := mustSendMessage(t, rt1.Store(), address, "agent/sender", "second", "body2")
+
+	var firstBlobRef string
+	if err := rt1.DB().QueryRow(`SELECT body_blob_ref FROM messages WHERE message_id = ?`, first.MessageID).Scan(&firstBlobRef); err != nil {
+		t.Fatalf("query first blob ref: %v", err)
+	}
+	if err := os.Remove(filepath.Join(rt1.blobDir, firstBlobRef)); err != nil {
+		t.Fatalf("remove first blob: %v", err)
+	}
+
+	store := NewStore(rt1.readDB, lockedWriteDB, rt1.claimDB, rt1.blobDir)
+	store.now = func() time.Time { return base.Add(2 * time.Second) }
+	_, recvErr := store.Receive(ctx, ReceiveParams{Address: address})
+	var recovery *ReceiveRecoveryRequiredError
+	if !errors.As(recvErr, &recovery) || recovery.Phase != ReceiveRecoveryPhaseClaimRecovery {
+		t.Fatalf("Receive() error = %v, want *ReceiveRecoveryRequiredError(claim_recovery)", recvErr)
+	}
+	if !isSQLiteBusy(recvErr) {
+		t.Fatalf("Receive() error = %v, want underlying SQLITE_BUSY recovery failure", recvErr)
+	}
+	if len(recovery.Claims) != 1 || recovery.Claims[0].DeliveryID != first.DeliveryID {
+		t.Fatalf("recovery.Claims = %+v, want only leaked claim %q", recovery.Claims, first.DeliveryID)
+	}
+
+	var secondState string
+	if err := rt1.DB().QueryRow(`SELECT state FROM deliveries WHERE delivery_id = ?`, second.DeliveryID).Scan(&secondState); err != nil {
+		t.Fatalf("query second state: %v", err)
+	}
+	if secondState != "queued" {
+		t.Fatalf("second delivery state = %q, want queued (must not claim via busy retry after recovery failure)", secondState)
+	}
+}
+
+func TestReceiveBatchClaimLoopCancelUsesClaimRecoveryPhaseAndSkipsRemainingCounter(t *testing.T) {
+	t.Parallel()
+
+	t.Run("successful rollback on second claim cancellation preserves context.Canceled", func(t *testing.T) {
+		t.Parallel()
+
+		runtime, store := newLeaseTestStore(t)
+		defer runtime.Close()
+
+		base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+		store.now = func() time.Time { return base }
+
+		const address = "workflow/cancel-mid-batch-ok"
+		first := mustSendMessage(t, store, address, "agent/sender", "one", "body1")
+		store.now = func() time.Time { return base.Add(time.Second) }
+		mustSendMessage(t, store, address, "agent/sender", "two", "body2")
+
+		ctx, cancel := context.WithCancel(context.Background())
+		calls := 0
+		store.now = func() time.Time {
+			calls++
+			if calls == 3 {
+				cancel()
+			}
+			return base.Add(2 * time.Second)
+		}
+
+		_, err := store.receiveBatchWithLeasePolicyAndRemainingCounter(
+			ctx,
+			[]string{address},
+			2,
+			legacyReceiveLeasePolicy,
+			func(context.Context, personalAvailabilityScope, []string) (map[string]int, error) {
+				t.Fatal("remainingCounter must not be called after claim-loop cancellation")
+				return nil, nil
+			},
+		)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ReceiveBatch(canceled mid-loop) error = %v, want context.Canceled", err)
+		}
+
+		var firstState string
+		if qErr := runtime.DB().QueryRow(`SELECT state FROM deliveries WHERE delivery_id = ?`, first.DeliveryID).Scan(&firstState); qErr != nil {
+			t.Fatalf("query first state: %v", qErr)
+		}
+		if firstState != "queued" {
+			t.Fatalf("first delivery state = %q, want queued after clean rollback", firstState)
+		}
+	})
+
+	t.Run("failed rollback on second claim cancellation reports claim_recovery phase", func(t *testing.T) {
+		t.Parallel()
+
+		runtime, store := newLeaseTestStore(t)
+		defer runtime.Close()
+
+		base := time.Date(2026, 8, 1, 12, 5, 0, 0, time.UTC)
+		store.now = func() time.Time { return base }
+
+		const address = "workflow/cancel-mid-batch-recovery"
+		first := mustSendMessage(t, store, address, "agent/sender", "one", "body1")
+		store.now = func() time.Time { return base.Add(time.Second) }
+		mustSendMessage(t, store, address, "agent/sender", "two", "body2")
+
+		ctx, cancel := context.WithCancel(context.Background())
+		calls := 0
+		store.now = func() time.Time {
+			calls++
+			if calls == 3 {
+				if _, execErr := runtime.DB().Exec(`
+CREATE TRIGGER reject_cancel_rollback
+BEFORE UPDATE OF state ON deliveries
+WHEN OLD.state = 'leased' AND NEW.state = 'queued'
+BEGIN
+  SELECT RAISE(ABORT, 'reject cancel rollback');
+END;
+`); execErr != nil {
+					t.Fatalf("create trigger: %v", execErr)
+				}
+				cancel()
+			}
+			return base.Add(2 * time.Second)
+		}
+
+		_, err := store.receiveBatchWithLeasePolicyAndRemainingCounter(
+			ctx,
+			[]string{address},
+			2,
+			legacyReceiveLeasePolicy,
+			func(context.Context, personalAvailabilityScope, []string) (map[string]int, error) {
+				t.Fatal("remainingCounter must not be called after claim-loop cancellation")
+				return nil, nil
+			},
+		)
+		var recovery *ReceiveRecoveryRequiredError
+		if !errors.As(err, &recovery) || recovery.Phase != ReceiveRecoveryPhaseClaimRecovery {
+			t.Fatalf("ReceiveBatch(canceled mid-loop, failed rollback) error = %v, want *ReceiveRecoveryRequiredError(claim_recovery)", err)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ReceiveBatch() error = %v, want underlying context.Canceled", err)
+		}
+		if len(recovery.Claims) != 1 || recovery.Claims[0].DeliveryID != first.DeliveryID {
+			t.Fatalf("recovery.Claims = %+v, want %q", recovery.Claims, first.DeliveryID)
+		}
+	})
 }

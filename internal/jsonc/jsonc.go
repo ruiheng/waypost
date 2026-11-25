@@ -23,7 +23,7 @@ func Normalize(contents []byte) (normalized []byte, changed bool, err error) {
 	if err != nil {
 		return nil, false, err
 	}
-	return normalized, true, nil
+	return normalized, !bytes.Equal(normalized, contents), nil
 }
 
 // Standardize strips comments and trailing commas from JSONC contents while
@@ -78,13 +78,25 @@ func stripComments(in []byte) ([]byte, error) {
 				if end < 0 {
 					return nil, fmt.Errorf("jsonc: unterminated block comment (byte %d)", i)
 				}
-				// Keep comment newlines so positions stay stable.
+				// Keep comment newlines so positions stay stable; emit a single
+				// space when a single-line block comment sits between two
+				// non-delimiter tokens so adjacent words cannot fuse.
+				wroteNewline := false
 				for _, c := range in[i+2 : i+2+end] {
 					if c == '\n' {
 						out.WriteByte('\n')
+						wroteNewline = true
 					}
 				}
-				i += 2 + end + 2
+				after := i + 2 + end + 2
+				if !wroteNewline && out.Len() > 0 && after < len(in) {
+					prev := out.Bytes()[out.Len()-1]
+					next := in[after]
+					if !isJSONPunctOrSpace(prev) && !isJSONPunctOrSpace(next) {
+						out.WriteByte(' ')
+					}
+				}
+				i = after
 			default:
 				out.WriteByte(in[i])
 				i++
@@ -97,10 +109,20 @@ func stripComments(in []byte) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
+func isJSONPunctOrSpace(c byte) bool {
+	switch c {
+	case ' ', '\t', '\n', '\r', '{', '}', '[', ']', ':', ',', '"':
+		return true
+	default:
+		return false
+	}
+}
+
 func stripTrailingCommas(in []byte) []byte {
 	var out bytes.Buffer
 	out.Grow(len(in))
 	inString := false
+	canHaveTrailingComma := false
 	for i := 0; i < len(in); i++ {
 		c := in[i]
 		switch {
@@ -113,6 +135,7 @@ func stripTrailingCommas(in []byte) []byte {
 			}
 			if c == '"' {
 				inString = false
+				canHaveTrailingComma = true
 			}
 		case c == '"':
 			inString = true
@@ -122,11 +145,19 @@ func stripTrailingCommas(in []byte) []byte {
 			for j < len(in) && (in[j] == ' ' || in[j] == '\t' || in[j] == '\n' || in[j] == '\r') {
 				j++
 			}
-			if j < len(in) && (in[j] == '}' || in[j] == ']') {
+			if canHaveTrailingComma && j < len(in) && (in[j] == '}' || in[j] == ']') {
+				canHaveTrailingComma = false
 				continue
 			}
+			canHaveTrailingComma = false
+			out.WriteByte(c)
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
+			out.WriteByte(c)
+		case c == '{' || c == '[' || c == ':':
+			canHaveTrailingComma = false
 			out.WriteByte(c)
 		default:
+			canHaveTrailingComma = true
 			out.WriteByte(c)
 		}
 	}

@@ -28,6 +28,9 @@ type GroupWaitParams struct {
 }
 
 func (s *Store) Wait(ctx context.Context, params WaitParams) (ListedDelivery, error) {
+	if params.Timeout < 0 {
+		return ListedDelivery{}, invalidArgumentError(errors.New("timeout must not be negative"))
+	}
 	addresses, err := normalizeAddresses(params.Address, params.Addresses, "--for")
 	if err != nil {
 		return ListedDelivery{}, err
@@ -86,12 +89,18 @@ func (s *Store) Wait(ctx context.Context, params WaitParams) (ListedDelivery, er
 }
 
 func (s *Store) Watch(ctx context.Context, params WatchParams, emit func(ListedDelivery) error) error {
+	if params.Timeout < 0 {
+		return invalidArgumentError(errors.New("timeout must not be negative"))
+	}
 	addresses, err := normalizeAddresses(params.Address, params.Addresses, "--for")
 	if err != nil {
 		return err
 	}
 
-	state := strings.TrimSpace(params.State)
+	state, err := normalizeDeliveryStateFilter(params.State)
+	if err != nil {
+		return err
+	}
 	emitted := make(map[string]string)
 	idleDeadline := time.Time{}
 	if params.Timeout > 0 {
@@ -108,29 +117,36 @@ func (s *Store) Watch(ctx context.Context, params WatchParams, emit func(ListedD
 		observedNewDelivery := false
 		nowText := formatTimestamp(s.now())
 		var cursorKeys []string
+		seenInScan := make(map[string]struct{})
 		for {
-			deliveries, err := s.listPersonalDeliveriesPage(ctx, s.readDB, scope, state, nowText, "", cursorKeys, MaxPageSize, false)
+			items, err := s.listWatchDeliveriesPage(ctx, s.readDB, scope, state, nowText, cursorKeys, MaxPageSize)
 			if err != nil {
 				return err
 			}
 
-			for _, delivery := range deliveries {
-				fingerprint := watchFingerprint(delivery)
-				if emitted[delivery.DeliveryID] == fingerprint {
+			for _, item := range items {
+				seenInScan[item.delivery.DeliveryID] = struct{}{}
+				fingerprint := watchFingerprint(item)
+				if emitted[item.delivery.DeliveryID] == fingerprint {
 					continue
 				}
-				if err := emit(delivery); err != nil {
+				if err := emit(item.delivery); err != nil {
 					return err
 				}
-				emitted[delivery.DeliveryID] = fingerprint
+				emitted[item.delivery.DeliveryID] = fingerprint
 				observedNewDelivery = true
 			}
 
-			if len(deliveries) < MaxPageSize {
+			if len(items) < MaxPageSize {
 				break
 			}
-			last := deliveries[len(deliveries)-1]
+			last := items[len(items)-1].delivery
 			cursorKeys = []string{last.VisibleAt, last.MessageCreatedAt, last.DeliveryID}
+		}
+		for deliveryID := range emitted {
+			if _, ok := seenInScan[deliveryID]; !ok {
+				delete(emitted, deliveryID)
+			}
 		}
 
 		if observedNewDelivery {
@@ -174,7 +190,7 @@ func (s *Store) waitOnce(ctx context.Context, addresses []string) (ListedDeliver
 		return ListedDelivery{}, err
 	}
 
-	deliveries, err := s.listPersonalDeliveriesPage(ctx, s.readDB, scope, "", formatTimestamp(s.now()), "", nil, 1, false)
+	deliveries, err := s.listClaimablePersonalDeliveriesPage(ctx, s.readDB, scope, formatTimestamp(s.now()), nil, 1)
 	if err != nil {
 		return ListedDelivery{}, err
 	}
@@ -185,7 +201,8 @@ func (s *Store) waitOnce(ctx context.Context, addresses []string) (ListedDeliver
 	return deliveries[0], nil
 }
 
-func watchFingerprint(delivery ListedDelivery) string {
+func watchFingerprint(row personalDeliveryRow) string {
+	delivery := row.delivery
 	senderEndpointID := ""
 	if delivery.SenderEndpointID != nil {
 		senderEndpointID = *delivery.SenderEndpointID
@@ -199,6 +216,8 @@ func watchFingerprint(delivery ListedDelivery) string {
 		delivery.State,
 		delivery.VisibleAt,
 		delivery.MessageCreatedAt,
+		row.leaseToken,
+		strconv.Itoa(row.attemptCount),
 		delivery.Subject,
 		delivery.ContentType,
 		delivery.SchemaVersion,

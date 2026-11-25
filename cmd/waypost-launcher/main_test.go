@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -34,5 +35,33 @@ func TestNewChildCommandPublishesStableLauncherPath(t *testing.T) {
 	}
 	if got != current {
 		t.Fatalf("%s = %q, want current launcher %q", launchpath.StableExecutableEnv, got, current)
+	}
+}
+
+func TestExecutableNameForOS(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		goos  string
+		argv0 string
+		want  string
+	}{
+		{goos: "windows", argv0: `C:\bin\waypost-launcher`, want: "waypost.exe"},
+		{goos: "windows", argv0: `C:\bin\waypost-launcher.exe`, want: "waypost.exe"},
+		{goos: "linux", argv0: `/usr/local/bin/waypost-launcher`, want: "waypost"},
+		{goos: "darwin", argv0: `/opt/bin/waypost-launcher.EXE`, want: "waypost.exe"},
+	}
+	for _, tc := range cases {
+		if got := executableNameForOS(tc.goos, tc.argv0); got != tc.want {
+			t.Errorf("executableNameForOS(%q, %q) = %q, want %q", tc.goos, tc.argv0, got, tc.want)
+		}
+	}
+
+	wantCurrent := "waypost"
+	if runtime.GOOS == "windows" {
+		wantCurrent = "waypost.exe"
+	}
+	if got := executableName(); got != wantCurrent {
+		t.Fatalf("executableName() = %q, want %q", got, wantCurrent)
 	}
 }

@@ -13,7 +13,10 @@ type preparedCommand func(context.Context, *Store) error
 
 type stringListFlag []string
 
-var errFlagValueRequired = errors.New("flag value required")
+var (
+	errFlagValueRequired  = errors.New("flag value required")
+	errFlagSetInspected   = errors.New("flagset inspected")
+)
 
 type requiredFlagValueError struct {
 	flagName string
@@ -91,6 +94,10 @@ func normalizeFlagValues(values []string, flagName string) ([]string, error) {
 }
 
 func (a *App) parseCommandFlags(fs *flag.FlagSet, args []string, writeHelp func()) error {
+	if a.inspectFlagSet != nil {
+		a.inspectFlagSet(fs)
+		return errFlagSetInspected
+	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			writeHelp()

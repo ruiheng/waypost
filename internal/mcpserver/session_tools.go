@@ -98,7 +98,7 @@ func (s *Service) sessionRequire(ctx context.Context, req *mcp.CallToolRequest, 
 }
 
 func validateGenericRequireSessionArgs(req *mcp.CallToolRequest, input sessionRequireInput) (bool, error) {
-	if req == nil || len(req.Params.Arguments) == 0 {
+	if req == nil || req.Params == nil || len(req.Params.Arguments) == 0 {
 		return false, errors.New("session_require requires exactly one of session_id, session_ref, or sessions")
 	}
 

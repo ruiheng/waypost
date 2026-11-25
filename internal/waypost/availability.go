@@ -323,17 +323,58 @@ LIMIT 1
 	return record, nil
 }
 
+type personalDeliveryListMode int
+
+const (
+	personalDeliveryListQueued personalDeliveryListMode = iota
+	personalDeliveryListClaimable
+)
+
+type personalDeliveryRow struct {
+	delivery     ListedDelivery
+	leaseToken   string
+	attemptCount int
+}
+
 func (s *Store) listPersonalDeliveries(ctx context.Context, querier rowsQuerier, scope personalAvailabilityScope, state, nowText string) ([]ListedDelivery, error) {
 	return s.listPersonalDeliveriesPage(ctx, querier, scope, state, nowText, "", nil, DefaultPageSize, false)
 }
 
+func (s *Store) listWatchDeliveriesPage(ctx context.Context, querier rowsQuerier, scope personalAvailabilityScope, state, nowText string, cursorKeys []string, limit int) ([]personalDeliveryRow, error) {
+	mode := personalDeliveryListQueued
+	if state == "" {
+		mode = personalDeliveryListClaimable
+	}
+	return s.listPersonalDeliveryRowsPage(ctx, querier, scope, state, nowText, "", cursorKeys, limit, false, mode)
+}
+
+func (s *Store) listClaimablePersonalDeliveriesPage(ctx context.Context, querier rowsQuerier, scope personalAvailabilityScope, nowText string, cursorKeys []string, limit int) ([]ListedDelivery, error) {
+	return s.listPersonalDeliveriesPageWithMode(ctx, querier, scope, "", nowText, "", cursorKeys, limit, false, personalDeliveryListClaimable)
+}
+
 func (s *Store) listPersonalDeliveriesPage(ctx context.Context, querier rowsQuerier, scope personalAvailabilityScope, state, nowText, senderEndpointID string, cursorKeys []string, limit int, orderByCreated bool) ([]ListedDelivery, error) {
+	return s.listPersonalDeliveriesPageWithMode(ctx, querier, scope, state, nowText, senderEndpointID, cursorKeys, limit, orderByCreated, personalDeliveryListQueued)
+}
+
+func (s *Store) listPersonalDeliveriesPageWithMode(ctx context.Context, querier rowsQuerier, scope personalAvailabilityScope, state, nowText, senderEndpointID string, cursorKeys []string, limit int, orderByCreated bool, mode personalDeliveryListMode) ([]ListedDelivery, error) {
+	rows, err := s.listPersonalDeliveryRowsPage(ctx, querier, scope, state, nowText, senderEndpointID, cursorKeys, limit, orderByCreated, mode)
+	if err != nil {
+		return nil, err
+	}
+	deliveries := make([]ListedDelivery, len(rows))
+	for i, row := range rows {
+		deliveries[i] = row.delivery
+	}
+	return deliveries, nil
+}
+
+func (s *Store) listPersonalDeliveryRowsPage(ctx context.Context, querier rowsQuerier, scope personalAvailabilityScope, state, nowText, senderEndpointID string, cursorKeys []string, limit int, orderByCreated bool, mode personalDeliveryListMode) ([]personalDeliveryRow, error) {
 	if scope.empty() {
-		return []ListedDelivery{}, nil
+		return []personalDeliveryRow{}, nil
 	}
 
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(scope.recipientEndpointIDs)), ",")
-	args := make([]any, 0, len(scope.recipientEndpointIDs)+8)
+	args := make([]any, 0, len(scope.recipientEndpointIDs)+9)
 	for _, recipientEndpointID := range scope.recipientEndpointIDs {
 		args = append(args, recipientEndpointID)
 	}
@@ -356,6 +397,8 @@ SELECT
   d.state,
   d.visible_at,
   d.acked_at,
+  d.lease_token,
+  d.attempt_count,
   m.created_at,
   m.subject,
   m.content_type,
@@ -368,11 +411,16 @@ JOIN messages AS m ON m.message_id = d.message_id
 WHERE d.recipient_endpoint_id IN (%s)
 `, placeholders)
 	if state == "" {
-		query += `
+		if mode == personalDeliveryListClaimable {
+			query += "\n  AND " + claimableDeliveryFilter + "\n"
+			args = append(args, nowText, nowText)
+		} else {
+			query += `
   AND d.state = 'queued'
   AND d.visible_at <= ?
 `
-		args = append(args, nowText)
+			args = append(args, nowText)
+		}
 	} else {
 		query += `
   AND d.state = ?
@@ -424,10 +472,12 @@ LIMIT ?
 	}
 	defer rows.Close()
 
-	deliveries := make([]ListedDelivery, 0)
+	deliveries := make([]personalDeliveryRow, 0)
 	for rows.Next() {
+		var row personalDeliveryRow
 		var delivery ListedDelivery
 		var ackedAt sql.NullString
+		var leaseToken sql.NullString
 		var senderID sql.NullString
 		var senderAddress sql.NullString
 		var forwardedMessageID sql.NullString
@@ -443,6 +493,8 @@ LIMIT ?
 			&delivery.State,
 			&delivery.VisibleAt,
 			&ackedAt,
+			&leaseToken,
+			&row.attemptCount,
 			&delivery.MessageCreatedAt,
 			&delivery.Subject,
 			&delivery.ContentType,
@@ -469,7 +521,11 @@ LIMIT ?
 		if ackedAt.Valid {
 			delivery.AckedAt = &ackedAt.String
 		}
-		deliveries = append(deliveries, delivery)
+		if leaseToken.Valid {
+			row.leaseToken = leaseToken.String
+		}
+		row.delivery = delivery
+		deliveries = append(deliveries, row)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate delivery rows: %w", err)

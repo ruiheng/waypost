@@ -463,3 +463,46 @@ func TestHandleHookEventEmptyInputEmitsFallback(t *testing.T) {
 		t.Fatalf("additionalContext = %q, want compact guard", decoded.HookSpecificOutput.AdditionalContext)
 	}
 }
+
+func TestHandleHookEventStage3CompoundCommands(t *testing.T) {
+	t.Parallel()
+
+	t.Run("denies enabled second tool when first tool disabled", func(t *testing.T) {
+		t.Parallel()
+		var out bytes.Buffer
+		err := HandleHookEvent(context.Background(), HookInput{
+			HookEventName: "PreToolUse",
+			SessionID:     "compound-session-1",
+			ToolName:      "exec",
+			ToolInput:     json.RawMessage(`{"command":"waypost recv && waypost send --to x"}`),
+		}, true, &out, transitionSpec, func(context.Context) (MCPProbeRecord, error) {
+			return MCPProbeRecord{Available: true, DisabledTools: []string{"waypost_recv"}}, nil
+		}, NewMemoryNudgeStore())
+		if err != nil {
+			t.Fatalf("HandleHookEvent() error = %v", err)
+		}
+		if !strings.Contains(out.String(), "waypost_send") {
+			t.Fatalf("output = %q, want denial naming waypost_send", out.String())
+		}
+	})
+
+	t.Run("waypost mcp in compound command always denied without probe", func(t *testing.T) {
+		t.Parallel()
+		var out bytes.Buffer
+		err := HandleHookEvent(context.Background(), HookInput{
+			HookEventName: "PreToolUse",
+			SessionID:     "compound-session-2",
+			ToolName:      "exec",
+			ToolInput:     json.RawMessage(`{"command":"waypost recv && waypost mcp"}`),
+		}, true, &out, transitionSpec, func(context.Context) (MCPProbeRecord, error) {
+			t.Fatal("unexpected MCP probe when waypost mcp is in command")
+			return MCPProbeRecord{}, nil
+		}, NewMemoryNudgeStore())
+		if err != nil {
+			t.Fatalf("HandleHookEvent() error = %v", err)
+		}
+		if !strings.Contains(out.String(), "deny: managed by harness") {
+			t.Fatalf("output = %q, want deny for waypost mcp", out.String())
+		}
+	})
+}

@@ -5,11 +5,21 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/ruiheng/waypost/internal/hideconsole"
 )
+
+var ansiEscapePattern = regexp.MustCompile("\x1b(?:\\[[0-?]*[ -/]*[@-~]|\\][^\x07\x1b]*(?:\x07|\x1b\\\\)|[PX^_][^\x1b]*\x1b\\\\|[ -/]+[0-~]|[0-OQ-WYZ\\\\`-~])")
+
+// StripANSI removes ANSI/ECMA-48 escape sequences (CSI, OSC, string sequences,
+// nF charset designations such as `\x1b(B`, and 2-byte ESC controls) so structured
+// line parsers see clean text regardless of TTY colorization or terminfo resets.
+func StripANSI(text string) string {
+	return ansiEscapePattern.ReplaceAllString(text, "")
+}
 
 // RunMCPGetProbe runs `<binary> mcp get waypost` (plus extraArgs) with the
 // given timeout and returns its standard output. A non-zero exit whose
@@ -40,7 +50,7 @@ func RunMCPGetProbe(
 	}
 	var exitErr *exec.ExitError
 	if errors.As(runErr, &exitErr) {
-		if missingServer != nil && missingServer(string(exitErr.Stderr)) {
+		if missingServer != nil && missingServer(StripANSI(string(exitErr.Stderr))) {
 			return nil, true, nil
 		}
 		if detail := boundedProbeErrorDetail(exitErr.Stderr); detail != "" {
@@ -53,7 +63,7 @@ func RunMCPGetProbe(
 // boundedProbeErrorDetail truncates captured stderr to a bounded prefix and
 // suffix so a chatty CLI cannot flood the hook payload.
 func boundedProbeErrorDetail(stderr []byte) string {
-	detail := strings.TrimSpace(string(stderr))
+	detail := strings.TrimSpace(StripANSI(string(stderr)))
 	const maxRunes = 500
 	runes := []rune(detail)
 	if len(runes) > maxRunes {

@@ -147,6 +147,14 @@ func TestExecuteSendBatchDoesNotSerializeCanceledSendAsItemFailure(t *testing.T)
 	}
 }
 
+func TestSendBatchResultEmptyStatusIsNotAttempted(t *testing.T) {
+	t.Parallel()
+
+	if got := (SendBatchResult{}).Status(); got != "not_attempted" {
+		t.Fatalf("SendBatchResult{}.Status() = %q, want not_attempted", got)
+	}
+}
+
 func makeRecipientValues(count int) []string {
 	values := make([]string, count)
 	for index := range values {

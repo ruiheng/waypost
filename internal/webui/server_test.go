@@ -613,3 +613,275 @@ func TestEventsEndpointReplaysBoundedHistoryForUnknownAfter(t *testing.T) {
 		})
 	}
 }
+
+func TestEventsEndpointReturns404BeforeStreamingAndHonorsLastEventIDAndClose(t *testing.T) {
+	t.Parallel()
+
+	stateDir := filepath.Join(t.TempDir(), "waypost-state")
+	runtime, err := waypost.OpenRuntime(context.Background(), stateDir)
+	if err != nil {
+		t.Fatalf("OpenRuntime() error = %v", err)
+	}
+	store := runtime.Store()
+	group, err := store.CreateGroup(context.Background(), "group/web-events-resume")
+	if err != nil {
+		t.Fatalf("CreateGroup() error = %v", err)
+	}
+	first, err := store.Send(context.Background(), waypost.SendParams{
+		ToAddress:     group.Address,
+		FromAddress:   "agent/sse",
+		Subject:       "first",
+		ContentType:   "text/plain",
+		SchemaVersion: "v1",
+		Body:          []byte("first-body"),
+		Group:         true,
+	})
+	if err != nil {
+		t.Fatalf("Send(first) error = %v", err)
+	}
+	second, err := store.Send(context.Background(), waypost.SendParams{
+		ToAddress:     group.Address,
+		FromAddress:   "agent/sse",
+		Subject:       "second",
+		ContentType:   "text/plain",
+		SchemaVersion: "v1",
+		Body:          []byte("second-body"),
+		Group:         true,
+	})
+	if err != nil {
+		t.Fatalf("Send(second) error = %v", err)
+	}
+	runtime.Close()
+
+	handler := NewServer(stateDir, "")
+	defer handler.Close()
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	// Missing group returns 404 JSON before SSE headers.
+	missingResp, err := http.Get(server.URL + "/api/groups/" + url.PathEscape("group/does-not-exist") + "/events")
+	if err != nil {
+		t.Fatalf("GET missing events error = %v", err)
+	}
+	missingResp.Body.Close()
+	if missingResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing group /events status = %d, want 404", missingResp.StatusCode)
+	}
+
+	// Last-Event-ID header overrides missing ?after query and emits id: lines.
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/api/groups/"+url.PathEscape(group.Address)+"/events", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Last-Event-ID", first.MessageID)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET events with Last-Event-ID error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	lineCh := make(chan string, 16)
+	eofCh := make(chan struct{})
+	go func() {
+		defer close(eofCh)
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			lineCh <- scanner.Text()
+		}
+	}()
+
+	gotID := false
+	gotSecond := false
+	deadline := time.After(3 * time.Second)
+	for !(gotID && gotSecond) {
+		select {
+		case line := <-lineCh:
+			if line == "id: "+second.MessageID {
+				gotID = true
+			}
+			if strings.HasPrefix(line, "data: ") && strings.Contains(line, `"body":"second-body"`) {
+				gotSecond = true
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for SSE id/data after Last-Event-ID (gotID=%v, gotSecond=%v)", gotID, gotSecond)
+		}
+	}
+
+	// Calling handler.Close() unblocks the active SSE handler immediately
+	// (no hang waiting for poll/shutdown) and blocks reopening runtime.
+	if err := handler.Close(); err != nil {
+		t.Fatalf("handler.Close() error = %v", err)
+	}
+	select {
+	case <-eofCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active SSE stream did not terminate promptly after handler.Close()")
+	}
+	if _, err := handler.waypostRuntime(context.Background()); err == nil {
+		t.Fatal("waypostRuntime() after Close() = nil, want closed error")
+	}
+}
+
+func TestTranscriptHTMLStage4StateFixes(t *testing.T) {
+	t.Parallel()
+
+	for _, fragment := range []string{
+		`transcriptCursor = "";`,
+		`latestMessageID = "";`,
+		`(event && event.data) || eventSource.readyState === EventSource.CLOSED`,
+		`closeSource();`,
+		`button.dataset.defaultLabel`,
+	} {
+		if !strings.Contains(indexHTML, fragment) {
+			t.Fatalf("indexHTML missing Stage 4 fix fragment %q", fragment)
+		}
+	}
+}
+
+func TestStatusForWaypostErrorMapping(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{name: "server closed", err: fmt.Errorf("wrap: %w", errServerClosed), status: http.StatusServiceUnavailable},
+		{name: "group not found", err: fmt.Errorf("wrap: %w", waypost.ErrGroupNotFound), status: http.StatusNotFound},
+		{name: "invalid cursor", err: fmt.Errorf("wrap: %w", waypost.ErrInvalidPaginationCursor), status: http.StatusBadRequest},
+		{name: "invalid argument", err: fmt.Errorf("wrap: %w", waypost.ErrInvalidArgument), status: http.StatusBadRequest},
+		{name: "unexpected storage error", err: errors.New("sqlite busy"), status: http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := statusForWaypostError(tc.err); got != tc.status {
+				t.Fatalf("statusForWaypostError(%v) = %d, want %d", tc.err, got, tc.status)
+			}
+		})
+	}
+
+	handler := NewServer(filepath.Join(t.TempDir(), "waypost-state"), "")
+	if err := handler.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	for _, path := range []string{
+		"/api/groups",
+		"/api/groups/" + url.PathEscape("group/any") + "/transcript",
+		"/api/groups/" + url.PathEscape("group/any") + "/events",
+	} {
+		resp, err := http.Get(server.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s error = %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("closed GET %s status = %d, want 503", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestCancelStreamsUnblocksSSEWithoutClosingRuntime(t *testing.T) {
+	t.Parallel()
+
+	stateDir := filepath.Join(t.TempDir(), "waypost-state")
+	runtime, err := waypost.OpenRuntime(context.Background(), stateDir)
+	if err != nil {
+		t.Fatalf("OpenRuntime() error = %v", err)
+	}
+	if _, err := runtime.Store().CreateGroup(context.Background(), "group/web-cancel-streams"); err != nil {
+		t.Fatalf("CreateGroup() error = %v", err)
+	}
+	runtime.Close()
+
+	handler := NewServer(stateDir, "")
+	defer handler.Close()
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/api/groups/"+url.PathEscape("group/web-cancel-streams")+"/events", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("GET events error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET events status = %d, want 200", resp.StatusCode)
+	}
+
+	lineCh := make(chan string, 8)
+	eofCh := make(chan struct{})
+	go func() {
+		defer close(eofCh)
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			lineCh <- scanner.Text()
+		}
+	}()
+
+	select {
+	case line := <-lineCh:
+		if line != ": connected" {
+			t.Fatalf("first SSE line = %q, want : connected", line)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for SSE connected prelude")
+	}
+
+	handler.CancelStreams()
+	select {
+	case <-eofCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("SSE stream did not close promptly after CancelStreams()")
+	}
+
+	// SQLite runtime must remain usable for in-flight non-streaming requests until Close().
+	groupsResp, err := http.Get(server.URL + "/api/groups")
+	if err != nil {
+		t.Fatalf("GET /api/groups after CancelStreams() error = %v", err)
+	}
+	groupsResp.Body.Close()
+	if groupsResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/groups after CancelStreams() status = %d, want 200", groupsResp.StatusCode)
+	}
+
+	// New /events connections arriving after CancelStreams() must deterministically return 503
+	// instead of streaming 200 text/event-stream or failing with 500.
+	postCancelEventsResp, err := http.Get(server.URL + "/api/groups/" + url.PathEscape("group/web-cancel-streams") + "/events")
+	if err != nil {
+		t.Fatalf("GET /events after CancelStreams() error = %v", err)
+	}
+	postCancelEventsResp.Body.Close()
+	if postCancelEventsResp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("GET /events after CancelStreams() status = %d, want 503", postCancelEventsResp.StatusCode)
+	}
+}
+
+func TestTranscriptHTMLSurfacesPaginationErrorsWhileLive(t *testing.T) {
+	t.Parallel()
+
+	for _, fragment := range []string{
+		`id="groups-error"`,
+		`id="messages-error"`,
+		`showInlineError(messagesErrorEl,`,
+		`showInlineError(groupsErrorEl,`,
+	} {
+		if !strings.Contains(indexHTML, fragment) {
+			t.Fatalf("indexHTML missing pagination inline error fragment %q", fragment)
+		}
+	}
+}

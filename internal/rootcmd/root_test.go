@@ -640,3 +640,72 @@ func TestRunSendNotifyUsesConfiguredNotifier(t *testing.T) {
 		t.Fatalf("send --notify output = %q", stdout.String())
 	}
 }
+
+func TestRunGroupWebFlagErrorCarriesAuthoritativeJSONDecision(t *testing.T) {
+	t.Parallel()
+
+	app := New(strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+	app.runWeb = func(context.Context, webui.Options) error {
+		t.Fatal("runWeb should not be called on flag parse error")
+		return nil
+	}
+
+	errBogus := app.Run(context.Background(), []string{"group", "web", "--bogus", "--json"})
+	if errBogus == nil {
+		t.Fatal("Run(group web --bogus --json) = nil, want error")
+	}
+	var jsonBuf bytes.Buffer
+	if !waypost.WriteCLIJSONError(&jsonBuf, []string{"group", "web", "--bogus", "--json"}, errBogus) {
+		t.Fatalf("WriteCLIJSONError(group web --bogus --json) = false, want true")
+	}
+
+	errMissingAfterValue := app.Run(context.Background(), []string{"group", "web", "--bogus", "--group", "--json"})
+	if errMissingAfterValue == nil {
+		t.Fatal("Run(group web --bogus --group --json) = nil, want error")
+	}
+	var textBuf bytes.Buffer
+	if waypost.WriteCLIJSONError(&textBuf, []string{"group", "web", "--bogus", "--group", "--json"}, errMissingAfterValue) {
+		t.Fatalf("WriteCLIJSONError(group web --bogus --group --json) = true (%q), want false", textBuf.String())
+	}
+
+	errGlobalBogus := app.Run(context.Background(), []string{"--bogus", "group", "web", "--json"})
+	if errGlobalBogus == nil {
+		t.Fatal("Run(--bogus group web --json) = nil, want error")
+	}
+	jsonBuf.Reset()
+	if !waypost.WriteCLIJSONError(&jsonBuf, []string{"--bogus", "group", "web", "--json"}, errGlobalBogus) {
+		t.Fatal("WriteCLIJSONError(--bogus group web --json) = false, want true")
+	}
+	if !strings.Contains(jsonBuf.String(), `"error_code":"invalid_argument"`) {
+		t.Fatalf("WriteCLIJSONError(--bogus group web --json) = %q, want invalid_argument JSON error", jsonBuf.String())
+	}
+
+	errGlobalBogusValueJSON := app.Run(context.Background(), []string{"--bogus", "group", "web", "--group", "--json"})
+	if errGlobalBogusValueJSON == nil {
+		t.Fatal("Run(--bogus group web --group --json) = nil, want error")
+	}
+	textBuf.Reset()
+	if waypost.WriteCLIJSONError(&textBuf, []string{"--bogus", "group", "web", "--group", "--json"}, errGlobalBogusValueJSON) {
+		t.Fatalf("WriteCLIJSONError(--bogus group web --group --json) = true (%q), want false", textBuf.String())
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) {
+	return 0, errors.New("broken pipe")
+}
+
+func TestVersionStdoutWriteFailureDoesNotEmitJSONEvenBeforeJSONCommandArgs(t *testing.T) {
+	t.Parallel()
+
+	app := New(strings.NewReader(""), failingWriter{}, &bytes.Buffer{})
+	err := app.Run(context.Background(), []string{"-version", "list", "--json"})
+	if err == nil {
+		t.Fatal("Run(-version list --json) = nil, want stdout write error")
+	}
+	var jsonBuf bytes.Buffer
+	if waypost.WriteCLIJSONError(&jsonBuf, []string{"-version", "list", "--json"}, err) {
+		t.Fatalf("WriteCLIJSONError(-version list --json) = true (%q), want false", jsonBuf.String())
+	}
+}

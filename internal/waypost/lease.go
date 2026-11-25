@@ -68,21 +68,31 @@ func (e *ClaimContentionError) Unwrap() []error {
 	return []error{ErrClaimContention, e.Cause}
 }
 
+const (
+	ReceiveRecoveryPhaseRemainingState = "remaining_state"
+	ReceiveRecoveryPhaseClaimRecovery  = "claim_recovery"
+)
+
 type ReceiveRecoveryError struct {
 	DeliveryID  string
 	ReceiveErr  error
 	RecoveryErr error
+	Claim       *ReceivedMessage
 }
 
-// ReceiveRecoveryRequiredError reports the only receive failure that can leave
-// a newly claimed delivery leased. Callers must settle every claim before
+// ReceiveRecoveryRequiredError reports a receive failure that left one or more
+// newly claimed deliveries leased. Callers must settle every claim before
 // attempting another receive.
 type ReceiveRecoveryRequiredError struct {
 	Cause  error
 	Claims []ReceivedMessage
+	Phase  string
 }
 
 func (e *ReceiveRecoveryRequiredError) Error() string {
+	if e.Phase == ReceiveRecoveryPhaseClaimRecovery {
+		return "receive recovery failed and left claimed deliveries leased"
+	}
 	return "remaining-state query failed and claim rollback was incomplete"
 }
 
@@ -223,7 +233,19 @@ func (s *Store) Receive(ctx context.Context, params ReceiveParams) (ReceivedMess
 		return ReceivedMessage{}, err
 	}
 
-	return s.receiveOnceWithLeasePolicy(ctx, addresses, legacyReceiveLeasePolicy)
+	message, err := s.receiveOnceWithLeasePolicy(ctx, addresses, legacyReceiveLeasePolicy)
+	if err != nil {
+		var recoveryErr *ReceiveRecoveryError
+		if errors.As(err, &recoveryErr) && recoveryErr.Claim != nil {
+			return ReceivedMessage{}, &ReceiveRecoveryRequiredError{
+				Cause:  recoveryErr,
+				Claims: []ReceivedMessage{*recoveryErr.Claim},
+				Phase:  ReceiveRecoveryPhaseClaimRecovery,
+			}
+		}
+		return ReceivedMessage{}, err
+	}
+	return message, nil
 }
 
 func (s *Store) ReceiveBatch(ctx context.Context, params ReceiveBatchParams) (ReceiveResult, error) {
@@ -265,9 +287,22 @@ func (s *Store) receiveBatchWithLeasePolicyAndRemainingCounter(ctx context.Conte
 			if errors.Is(err, ErrNoMessage) {
 				break
 			}
-			if errors.Is(err, ErrReceiveRecovery) || errors.Is(err, ErrClaimContention) {
-				if _, releaseErr := s.rollbackReceivedBatchMessages(ctx, messages); releaseErr != nil {
-					return ReceiveResult{}, errors.Join(err, releaseErr)
+			if errors.Is(err, ErrReceiveRecovery) || errors.Is(err, ErrClaimContention) ||
+				errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				unreleased, releaseErr := s.rollbackReceivedBatchMessages(ctx, messages)
+				var recoveryErr *ReceiveRecoveryError
+				if errors.As(err, &recoveryErr) && recoveryErr.Claim != nil {
+					unreleased = append(unreleased, *recoveryErr.Claim)
+				}
+				if len(unreleased) > 0 {
+					return ReceiveResult{}, &ReceiveRecoveryRequiredError{
+						Cause:  errors.Join(err, releaseErr),
+						Claims: unreleased,
+						Phase:  ReceiveRecoveryPhaseClaimRecovery,
+					}
+				}
+				if releaseErr != nil {
+					return ReceiveResult{}, fmt.Errorf("%w (rollback failed: %v)", err, releaseErr)
 				}
 				return ReceiveResult{}, err
 			}
@@ -285,7 +320,11 @@ func (s *Store) receiveBatchWithLeasePolicyAndRemainingCounter(ctx context.Conte
 			return ReceiveResult{}, &ReceiveRecoveryRequiredError{
 				Cause:  errors.Join(err, rollbackErr),
 				Claims: unreleased,
+				Phase:  ReceiveRecoveryPhaseRemainingState,
 			}
+		}
+		if rollbackErr != nil {
+			return ReceiveResult{}, fmt.Errorf("%w (rollback failed: %v)", err, rollbackErr)
 		}
 		return ReceiveResult{}, err
 	}
@@ -619,6 +658,9 @@ func normalizeReceiveLeasePolicy(policy receiveLeasePolicy) (receiveLeasePolicy,
 
 func (s *Store) claimNextDelivery(ctx context.Context, scope personalAvailabilityScope, policy receiveLeasePolicy) (ReceivedMessage, error) {
 	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return ReceivedMessage{}, err
+		}
 		nowText := formatTimestamp(s.now())
 		candidate, err := s.claimablePersonalDelivery(ctx, s.readDB, scope, nowText)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -632,7 +674,7 @@ func (s *Store) claimNextDelivery(ctx context.Context, scope personalAvailabilit
 		if err == nil {
 			return message, nil
 		}
-		if !isSQLiteBusy(err) {
+		if errors.Is(err, ErrReceiveRecovery) || !isSQLiteBusy(err) {
 			return ReceivedMessage{}, err
 		}
 		if attempt > maxClaimRetryCount {
@@ -649,6 +691,9 @@ func (s *Store) claimNextDelivery(ctx context.Context, scope personalAvailabilit
 
 func (s *Store) claimNextDeliveryOnce(ctx context.Context, scope personalAvailabilityScope, candidate personalDeliveryRecord, nowText string, policy receiveLeasePolicy) (ReceivedMessage, error) {
 	for {
+		if err := ctx.Err(); err != nil {
+			return ReceivedMessage{}, err
+		}
 		tx, err := s.claimDB.BeginTx(ctx, nil)
 		if err != nil {
 			return ReceivedMessage{}, fmt.Errorf("begin receive transaction: %w", err)
@@ -703,18 +748,17 @@ WHERE delivery_id = ?
 			_ = tx.Rollback()
 			return ReceivedMessage{}, err
 		}
+		if err := ctx.Err(); err != nil {
+			_ = tx.Rollback()
+			return ReceivedMessage{}, err
+		}
 
 		if err := tx.Commit(); err != nil {
 			_ = tx.Rollback()
 			return ReceivedMessage{}, fmt.Errorf("commit receive transaction: %w", err)
 		}
 
-		body, err := s.readBlob(candidate.BodyBlobRef, candidate.BodySize, candidate.BodySHA256)
-		if err != nil {
-			return ReceivedMessage{}, s.recoverReceiveFailure(ctx, candidate.DeliveryID, leaseToken, err)
-		}
-
-		message := ReceivedMessage{
+		claim := ReceivedMessage{
 			DeliveryID:          candidate.DeliveryID,
 			MessageID:           candidate.MessageID,
 			RecipientAddress:    address,
@@ -731,21 +775,27 @@ WHERE delivery_id = ?
 			BodyBlobRef:         candidate.BodyBlobRef,
 			BodySize:            candidate.BodySize,
 			BodySHA256:          candidate.BodySHA256,
-			Body:                string(body),
 		}
 		if candidate.ForwardedMessageID.Valid {
-			message.ForwardedMessageID = &candidate.ForwardedMessageID.String
+			claim.ForwardedMessageID = &candidate.ForwardedMessageID.String
 		}
 		if candidate.ForwardedFromAddress.Valid {
-			message.ForwardedFromAddress = &candidate.ForwardedFromAddress.String
+			claim.ForwardedFromAddress = &candidate.ForwardedFromAddress.String
 		}
 		if candidate.SenderEndpointID.Valid {
-			message.SenderEndpointID = &candidate.SenderEndpointID.String
+			claim.SenderEndpointID = &candidate.SenderEndpointID.String
 		}
 		if candidate.SenderAddress.Valid {
-			message.SenderAddress = &candidate.SenderAddress.String
+			claim.SenderAddress = &candidate.SenderAddress.String
 		}
-		return message, nil
+
+		body, err := s.readBlob(candidate.BodyBlobRef, candidate.BodySize, candidate.BodySHA256)
+		if err != nil {
+			return ReceivedMessage{}, s.recoverReceiveFailure(ctx, claim, err)
+		}
+
+		claim.Body = string(body)
+		return claim, nil
 	}
 }
 
@@ -801,12 +851,20 @@ func receivedDeliveryIDs(messages []ReceivedMessage) []string {
 	return ids
 }
 
+const leaseRecoveryCleanupTimeout = 5 * time.Second
+
+func leaseOwnershipDefinitelyLost(err error) bool {
+	return errors.Is(err, ErrLeaseTokenMismatch) ||
+		errors.Is(err, ErrLeaseNotLeased) ||
+		errors.Is(err, ErrLeaseNotFound)
+}
+
 func (s *Store) rollbackReceivedBatchMessages(ctx context.Context, messages []ReceivedMessage) ([]ReceivedMessage, error) {
 	var rollbackErrs []error
 	unreleased := make([]ReceivedMessage, 0)
-	for i := len(messages) - 1; i >= 0; i-- {
-		message := messages[i]
-		if _, err := s.transitionLeasedDelivery(ctx, message.DeliveryID, message.LeaseToken, func(_ time.Time, delivery leasedDeliveryRecord) (deliveryTransitionSpec, error) {
+	for _, message := range messages {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), leaseRecoveryCleanupTimeout)
+		_, err := s.transitionLeasedDelivery(cleanupCtx, message.DeliveryID, message.LeaseToken, func(_ time.Time, delivery leasedDeliveryRecord) (deliveryTransitionSpec, error) {
 			return deliveryTransitionSpec{
 				State:            "queued",
 				VisibleAt:        message.VisibleAt,
@@ -820,9 +878,13 @@ func (s *Store) rollbackReceivedBatchMessages(ctx context.Context, messages []Re
 					"visible_at":     message.VisibleAt,
 				},
 			}, nil
-		}); err != nil {
+		})
+		cancel()
+		if err != nil {
 			rollbackErrs = append(rollbackErrs, fmt.Errorf("rollback received batch delivery %q: %w", message.DeliveryID, err))
-			unreleased = append(unreleased, message)
+			if !leaseOwnershipDefinitelyLost(err) {
+				unreleased = append(unreleased, message)
+			}
 		}
 	}
 	if len(rollbackErrs) == 0 {
@@ -831,12 +893,21 @@ func (s *Store) rollbackReceivedBatchMessages(ctx context.Context, messages []Re
 	return unreleased, errors.Join(rollbackErrs...)
 }
 
-func (s *Store) recoverReceiveFailure(ctx context.Context, deliveryID, leaseToken string, readErr error) error {
-	if _, err := s.Fail(ctx, deliveryID, leaseToken, readErr.Error()); err != nil {
+func (s *Store) recoverReceiveFailure(ctx context.Context, claim ReceivedMessage, readErr error) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), leaseRecoveryCleanupTimeout)
+	defer cancel()
+
+	if _, err := s.Fail(cleanupCtx, claim.DeliveryID, claim.LeaseToken, readErr.Error()); err != nil {
+		var unreleasedClaim *ReceivedMessage
+		if !leaseOwnershipDefinitelyLost(err) {
+			claimCopy := claim
+			unreleasedClaim = &claimCopy
+		}
 		return &ReceiveRecoveryError{
-			DeliveryID:  deliveryID,
+			DeliveryID:  claim.DeliveryID,
 			ReceiveErr:  readErr,
 			RecoveryErr: err,
+			Claim:       unreleasedClaim,
 		}
 	}
 	return readErr
@@ -956,6 +1027,10 @@ func validateDeliveryIDInput(deliveryID string) (string, error) {
 	return deliveryID, nil
 }
 
+// loadCurrentLease intentionally allows renewing or settling an expired lease
+// as long as the delivery is still in the leased state and its lease_token
+// matches. Another consumer may reclaim the expired lease before then, at
+// which point ErrLeaseTokenMismatch is returned to the stale holder.
 func loadCurrentLease(ctx context.Context, tx *sql.Tx, deliveryID, leaseToken string) (leasedDeliveryRecord, error) {
 	delivery, err := loadDeliveryRecord(ctx, tx, deliveryID)
 	if err != nil {

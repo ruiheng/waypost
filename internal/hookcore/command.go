@@ -37,20 +37,41 @@ var WaypostMCPCommandBlacklist = map[string]string{
 	"mcp":     "",
 }
 
+// WaypostMCPTools returns the deduplicated MCP tool names guarding direct
+// `waypost <subcommand>` invocations in source order. An empty string entry
+// marks a command (`waypost mcp`) that has no MCP equivalent and must always be
+// denied.
+func WaypostMCPTools(command string) []string {
+	var tools []string
+	seen := make(map[string]bool)
+	for _, subcommand := range WaypostCommands(command) {
+		var tool string
+		guarded := false
+		if subcommand == "status" {
+			tool = "waypost_status"
+			guarded = true
+		} else {
+			tool, guarded = WaypostMCPCommandBlacklist[subcommand]
+		}
+		if !guarded || seen[tool] {
+			continue
+		}
+		seen[tool] = true
+		tools = append(tools, tool)
+	}
+	return tools
+}
+
 // WaypostMCPTool reports the MCP tool guarding a direct `waypost
 // <subcommand>` invocation. guarded is false for unrelated or unguarded
 // commands; an empty tool with guarded set marks a command that has no MCP
 // equivalent and must always be denied (`waypost mcp`).
 func WaypostMCPTool(command string) (tool string, guarded bool) {
-	for _, subcommand := range WaypostCommands(command) {
-		if subcommand == "status" {
-			return "waypost_status", true
-		}
-		if tool, guarded = WaypostMCPCommandBlacklist[subcommand]; guarded {
-			return tool, true
-		}
+	tools := WaypostMCPTools(command)
+	if len(tools) == 0 {
+		return "", false
 	}
-	return "", false
+	return tools[0], true
 }
 
 // WaypostCommandDenialReason renders the deny reason for a guarded command.

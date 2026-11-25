@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/BurntSushi/toml"
 	"github.com/ruiheng/waypost/internal/devinconfig"
 	"github.com/ruiheng/waypost/internal/testenv"
 )
@@ -1183,16 +1184,14 @@ func TestInstallWithDependenciesReportsCodexConfiguredOnConfigWriteFailure(t *te
 	t.Parallel()
 
 	home := t.TempDir()
-	// config.toml exists as a directory: detection succeeds, the CLI registers
-	// the server, then the direct config write fails.
-	if err := os.MkdirAll(filepath.Join(home, configFileName), 0o700); err != nil {
-		t.Fatalf("MkdirAll(config.toml) error = %v", err)
-	}
 	var calls [][]string
 	deps := dependencies{
 		lookPath:          func(string) (string, error) { return "/usr/local/bin/codex", nil },
 		resolveHome:       func() (string, error) { return home, nil },
 		resolveExecutable: func() (string, error) { return "/opt/waypost", nil },
+		writeConfig: func(string, []byte, os.FileMode) error {
+			return errors.New("disk full")
+		},
 		run: func(_ context.Context, name string, args ...string) (commandOutput, error) {
 			calls = append(calls, append([]string{name}, args...))
 			if len(calls) == 1 {
@@ -1212,6 +1211,31 @@ func TestInstallWithDependenciesReportsCodexConfiguredOnConfigWriteFailure(t *te
 	want := []ConfiguredAgent{{Name: "Codex", Path: filepath.Join(home, configFileName)}}
 	if !reflect.DeepEqual(result.Configured, want) {
 		t.Fatalf("result.Configured = %#v, want %v", result.Configured, want)
+	}
+}
+
+func TestInstallWithDependenciesDoesNotReportCodexConfiguredWhenGetSucceedsAndConfigWriteFails(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	deps := dependencies{
+		lookPath:          func(string) (string, error) { return "/usr/local/bin/codex", nil },
+		resolveHome:       func() (string, error) { return home, nil },
+		resolveExecutable: func() (string, error) { return "/opt/waypost", nil },
+		writeConfig: func(string, []byte, os.FileMode) error {
+			return errors.New("disk full")
+		},
+		run: func(context.Context, string, ...string) (commandOutput, error) {
+			return commandOutput{stdout: []byte(`{"name":"waypost","transport":{"type":"stdio","command":"/old/waypost","args":["mcp"]}}`)}, nil
+		},
+	}
+
+	result, err := installWithDependencies(context.Background(), deps)
+	if err == nil || strings.Contains(err.Error(), "configured for Codex") {
+		t.Fatalf("installWithDependencies() error = %v, want failure without false Codex configured claim", err)
+	}
+	if result.Changed || len(result.Configured) != 0 {
+		t.Fatalf("result = %+v, want Changed=false and empty Configured", result)
 	}
 }
 
@@ -1289,4 +1313,303 @@ func TestInstallWithDependenciesSkipsGetwdWarningWithoutDevin(t *testing.T) {
 			t.Fatalf("result.Warnings = %v, want no Devin override warning without Devin", result.Warnings)
 		}
 	}
+}
+
+func TestEnsureWaypostSectionStage3Fixes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("array table closes waypost section and array waypost is rejected", func(t *testing.T) {
+		input := "[mcp_servers.waypost]\ncommand = \"old\"\n[[items]]\nname = \"x\"\n"
+		updated, changed, err := ensureWaypostSection(input, "/opt/waypost")
+		if err != nil {
+			t.Fatalf("ensureWaypostSection() error = %v", err)
+		}
+		if !changed {
+			t.Fatal("changed = false, want true")
+		}
+		itemsIdx := strings.Index(updated, "[[items]]")
+		reqIdx := strings.Index(updated, "required = true")
+		if itemsIdx < 0 || reqIdx < 0 || reqIdx > itemsIdx {
+			t.Fatalf("required = true was not flushed before [[items]]:\n%s", updated)
+		}
+
+		// [[mcp_servers.waypost]] is invalid for a single server table and must fail closed.
+		arrInput := "[[mcp_servers.waypost]]\nname = \"other\"\n"
+		if _, _, err := ensureWaypostSection(arrInput, "/opt/waypost"); err == nil || !strings.Contains(err.Error(), "[[mcp_servers.waypost]]") {
+			t.Fatalf("ensureWaypostSection([[mcp_servers.waypost]]) error = %v, want array table rejection", err)
+		}
+	})
+
+	t.Run("header trailing comment with bracket is parsed", func(t *testing.T) {
+		input := "[mcp_servers.waypost] # ]\ncommand = \"old\"\n"
+		updated, _, err := ensureWaypostSection(input, "/opt/waypost")
+		if err != nil {
+			t.Fatalf("ensureWaypostSection() error = %v", err)
+		}
+		if strings.Count(updated, "[mcp_servers.waypost]") != 1 {
+			t.Fatalf("expected existing [mcp_servers.waypost] header reused:\n%s", updated)
+		}
+	})
+
+	t.Run("multiline removed key skips continuation lines", func(t *testing.T) {
+		input := "[mcp_servers.waypost]\ncommand = \"/opt/waypost\"\nhttp_headers = [\n  \"X-A\",\n  \"X-B\",\n]\nargs = [\"mcp\"]\n"
+		updated, _, err := ensureWaypostSection(input, "/opt/waypost")
+		if err != nil {
+			t.Fatalf("ensureWaypostSection() error = %v", err)
+		}
+		if strings.Contains(updated, "http_headers") || strings.Contains(updated, "X-A") || strings.Contains(updated, "]\"") {
+			t.Fatalf("orphaned multiline http_headers lines remained:\n%s", updated)
+		}
+	})
+
+	t.Run("duplicate keys in waypost section rejected by TOML parser", func(t *testing.T) {
+		input := "[mcp_servers.waypost]\ncommand = \"/opt/waypost\"\nargs = [\"mcp\", \"--state-dir\", \"/x\"]\nargs = [\"mcp\"]\n"
+		if _, _, err := ensureWaypostSection(input, "/opt/waypost"); err == nil {
+			t.Fatal("ensureWaypostSection(duplicate args) = nil error, want TOML duplicate key rejection")
+		}
+	})
+
+	t.Run("malformed env_vars arrays rejected", func(t *testing.T) {
+		for _, bad := range []string{
+			"[\"A\" \"B\"]",
+			"[, \"A\"]",
+			"[\"A\",, \"B\"]",
+			"[\"A\n]",
+		} {
+			input := "[mcp_servers.waypost]\nenv_vars = " + bad + "\n"
+			if _, _, err := ensureWaypostSection(input, "/opt/waypost"); err == nil {
+				t.Fatalf("ensureWaypostSection(%q) = nil error, want rejection", bad)
+			}
+		}
+	})
+
+	t.Run("regular file TOML validated before codex mcp add", func(t *testing.T) {
+		home := t.TempDir()
+		if err := os.WriteFile(filepath.Join(home, configFileName), []byte("mcp_servers = {}\n"), 0o600); err != nil {
+			t.Fatalf("WriteFile(config.toml) error = %v", err)
+		}
+		calls := 0
+		deps := dependencies{
+			lookPath:          func(string) (string, error) { return "/usr/local/bin/codex", nil },
+			resolveHome:       func() (string, error) { return home, nil },
+			resolveExecutable: func() (string, error) { return "/opt/waypost", nil },
+			run: func(context.Context, string, ...string) (commandOutput, error) {
+				calls++
+				return commandOutput{}, nil
+			},
+		}
+		if _, err := installWithDependencies(context.Background(), deps); err == nil {
+			t.Fatal("installWithDependencies() = nil error, want malformed TOML rejection")
+		}
+		if calls != 0 {
+			t.Fatalf("codex CLI called %d times on malformed config.toml, want 0", calls)
+		}
+	})
+
+	t.Run("non-regular config directory fails pre-validation before codex mcp add", func(t *testing.T) {
+		home := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(home, configFileName), 0o700); err != nil {
+			t.Fatalf("MkdirAll(config.toml) error = %v", err)
+		}
+		calls := 0
+		deps := dependencies{
+			lookPath:          func(string) (string, error) { return "/usr/local/bin/codex", nil },
+			resolveHome:       func() (string, error) { return home, nil },
+			resolveExecutable: func() (string, error) { return "/opt/waypost", nil },
+			run: func(context.Context, string, ...string) (commandOutput, error) {
+				calls++
+				return commandOutput{}, nil
+			},
+		}
+		if _, err := installWithDependencies(context.Background(), deps); err == nil {
+			t.Fatal("installWithDependencies() = nil error, want config directory read failure")
+		}
+		if calls != 0 {
+			t.Fatalf("codex CLI called %d times when config.toml is a directory, want 0", calls)
+		}
+	})
+
+	t.Run("section header inside multiline developer_instructions string is preserved", func(t *testing.T) {
+		input := "model = \"gpt-5\"\ndeveloper_instructions = \"\"\"\nExample:\n[mcp_servers.waypost]\nurl = \"https://fake.example\"\n\"\"\"\n"
+		updated, changed, err := ensureWaypostSection(input, "/opt/waypost")
+		if err != nil {
+			t.Fatalf("ensureWaypostSection() error = %v", err)
+		}
+		if !changed {
+			t.Fatal("changed = false, want true")
+		}
+		if !strings.Contains(updated, "url = \"https://fake.example\"") {
+			t.Fatalf("multiline developer_instructions string was corrupted:\n%s", updated)
+		}
+		if strings.Count(updated, "[mcp_servers.waypost]") != 2 {
+			t.Fatalf("expected fake string header preserved and real [mcp_servers.waypost] appended:\n%s", updated)
+		}
+	})
+
+	t.Run("removes multiline inline tables, dotted transport keys, and triple-quoted url", func(t *testing.T) {
+		input := `[mcp_servers.waypost]
+command = "/opt/waypost"
+http_headers = {
+  Authorization = "Bearer secret", # trailing comment
+  X-Custom = "1"
+}
+env_http_headers.Authorization = "Bearer dotted"
+oauth.client_id = "c"
+url = """
+https://example.com
+"""
+args = ["mcp"]
+`
+		updated, changed, err := ensureWaypostSection(input, "/opt/waypost")
+		if err != nil {
+			t.Fatalf("ensureWaypostSection() error = %v", err)
+		}
+		if !changed {
+			t.Fatal("changed = false, want true")
+		}
+		for _, undesired := range []string{"http_headers", "env_http_headers", "Authorization", "Bearer", "X-Custom", "oauth", "client_id", "https://example.com", "url ="} {
+			if strings.Contains(updated, undesired) {
+				t.Fatalf("undesired token %q remained in updated TOML:\n%s", undesired, updated)
+			}
+		}
+		if _, _, err := ensureWaypostSection(updated, "/opt/waypost"); err != nil {
+			t.Fatalf("re-parse updated config error = %v", err)
+		}
+	})
+
+	t.Run("rejects dotted mcp_servers.waypost and duplicate [mcp_servers.waypost] headers", func(t *testing.T) {
+		for _, input := range []string{
+			"mcp_servers.waypost.command = \"/old\"\n",
+			"[mcp_servers]\nwaypost.command = \"/old\"\n",
+			"[mcp_servers.waypost]\ncommand = \"/a\"\n\n[mcp_servers.waypost]\nargs = [\"mcp\"]\n",
+		} {
+			if _, _, err := ensureWaypostSection(input, "/opt/waypost"); err == nil {
+				t.Fatalf("ensureWaypostSection(%q) = nil error, want rejection", input)
+			}
+		}
+	})
+
+	t.Run("preserves quoted dotted table names and handles BOM empty keys and TOML 1.1 escapes", func(t *testing.T) {
+		input := "\xef\xbb\xbf" + strings.Join([]string{
+			`["mcp_servers.waypost"]`,
+			`note = "user top-level table with literal dot"`,
+			"",
+			`[mcp_servers."waypost.oauth"]`,
+			`command = "/usr/local/bin/unrelated"`,
+			"",
+			`[other]`,
+			`"" = "empty-quoted-key"`,
+			`"\e" = "esc-key"`,
+			`"\x80" = "u80-key"`,
+		}, "\n") + "\n"
+
+		updated, changed, err := ensureWaypostSection(input, "/opt/waypost")
+		if err != nil {
+			t.Fatalf("ensureWaypostSection() error = %v", err)
+		}
+		if !changed {
+			t.Fatal("ensureWaypostSection() changed = false, want true")
+		}
+
+		var doc map[string]any
+		if _, err := toml.Decode(updated, &doc); err != nil {
+			t.Fatalf("Decode(updated) error = %v", err)
+		}
+		if dottedTop, ok := doc["mcp_servers.waypost"].(map[string]any); !ok || dottedTop["note"] != "user top-level table with literal dot" {
+			t.Fatalf("doc[mcp_servers.waypost] = %#v, want preserved unrelated table", doc["mcp_servers.waypost"])
+		}
+		servers := doc["mcp_servers"].(map[string]any)
+		if dottedChild, ok := servers["waypost.oauth"].(map[string]any); !ok || dottedChild["command"] != "/usr/local/bin/unrelated" {
+			t.Fatalf("mcp_servers[waypost.oauth] = %#v, want preserved unrelated server", servers["waypost.oauth"])
+		}
+		waypostTable, ok := servers["waypost"].(map[string]any)
+		if !ok || waypostTable["command"] != "/opt/waypost" {
+			t.Fatalf("mcp_servers[waypost] = %#v, want installed", servers["waypost"])
+		}
+		other := doc["other"].(map[string]any)
+		if other[""] != "empty-quoted-key" || other["\x1b"] != "esc-key" || other["\u0080"] != "u80-key" {
+			t.Fatalf("doc[other] = %#v, want empty/BOM/TOML-1.1 keys preserved", other)
+		}
+	})
+
+	t.Run("config-only resets empty or non-mcp args, preserves valid mcp args, and rejects invalid args types", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			argsLine string
+			wantArgs []any
+			wantErr  string
+		}{
+			{
+				name:     "empty args resets to mcp",
+				argsLine: `args = []`,
+				wantArgs: []any{"mcp"},
+			},
+			{
+				name:     "wrong subcommand args resets to mcp",
+				argsLine: `args = ["serve", "--port", "8080"]`,
+				wantArgs: []any{"mcp"},
+			},
+			{
+				name:     "valid mcp args with extras preserved",
+				argsLine: `args = ["mcp", "--include-debug-tool"]`,
+				wantArgs: []any{"mcp", "--include-debug-tool"},
+			},
+			{
+				name:     "non-string element in args rejected even without env_vars",
+				argsLine: `args = [123]`,
+				wantErr:  "must contain only strings",
+			},
+			{
+				name:     "scalar args rejected even without env_vars",
+				argsLine: `args = "mcp"`,
+				wantErr:  "must be an array of strings",
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				input := "[mcp_servers.waypost]\ncommand = \"/opt/waypost\"\n" + tc.argsLine + "\nrequired = true\ntool_timeout_sec = 660\n"
+				updated, _, err := ensureWaypostSection(input, "/opt/waypost")
+				if tc.wantErr != "" {
+					if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+						t.Fatalf("ensureWaypostSection() error = %v, want substring %q", err, tc.wantErr)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("ensureWaypostSection() error = %v", err)
+				}
+				var doc map[string]any
+				if _, err := toml.Decode(updated, &doc); err != nil {
+					t.Fatalf("toml.Decode(updated) error = %v", err)
+				}
+				waypostTable := doc["mcp_servers"].(map[string]any)[serverName].(map[string]any)
+				if !reflect.DeepEqual(waypostTable["args"], tc.wantArgs) {
+					t.Fatalf("updated args = %#v, want %#v", waypostTable["args"], tc.wantArgs)
+				}
+			})
+		}
+	})
+
+	t.Run("escapes control chars using TOML 1.0 \\u00XX and deduplicates existing env_vars", func(t *testing.T) {
+		input := "[mcp_servers.waypost]\ncommand = \"/opt/waypost\"\nargs = [\"mcp\"]\nrequired = true\nenv_vars = [\"\\u0007\", \"\\u001b\", \"TMUX\", \"TMUX\"]\ntool_timeout_sec = 660\n"
+		updated, changed, err := ensureWaypostSection(input, "/opt/waypost")
+		if err != nil {
+			t.Fatalf("ensureWaypostSection() error = %v", err)
+		}
+		if !changed {
+			t.Fatal("ensureWaypostSection() changed = false, want true")
+		}
+		if strings.Contains(updated, `\a`) || strings.Contains(updated, `\v`) || strings.Contains(updated, `\x1b`) {
+			t.Fatalf("updated TOML used non-TOML-1.0 Go escapes:\n%s", updated)
+		}
+		if !strings.Contains(updated, `\u0007`) || !strings.Contains(updated, `\u001B`) {
+			t.Fatalf("updated TOML = %q, want \\u0007 and \\u001B", updated)
+		}
+		if strings.Count(updated, `"TMUX"`) != 1 {
+			t.Fatalf("updated TOML = %q, want duplicate TMUX deduplicated", updated)
+		}
+		var doc map[string]any
+		if _, err := toml.Decode(updated, &doc); err != nil {
+			t.Fatalf("toml.Decode(updated) error = %v", err)
+		}
+	})
 }

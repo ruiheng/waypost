@@ -71,27 +71,40 @@ func probeWaypostMCPWithTimeout(ctx context.Context, timeout time.Duration) (way
 }
 
 func isMissingWaypostMCPError(detail string) bool {
-	detail = strings.ToLower(detail)
+	detail = strings.ToLower(hookcore.StripANSI(detail))
 	return strings.Contains(detail, "server '"+waypostMCPServerName+"' not found") ||
 		strings.Contains(detail, `server "`+waypostMCPServerName+`" not found`)
 }
 
 var (
+	serverHeaderPattern   = regexp.MustCompile(`(?i)^server:\s*(.*?)\s*$`)
 	disabledStatusPattern = regexp.MustCompile(`(?i)^status:\s*disabled\b`)
-	disabledFlagPattern   = regexp.MustCompile(`(?i)disabled["']?\s*:\s*true\b`)
-	enabledFlagPattern    = regexp.MustCompile(`(?i)enabled["']?\s*:\s*false\b`)
+	disabledFlagPattern   = regexp.MustCompile(`(?i)^["']?disabled["']?\s*:\s*true\b`)
+	enabledFlagPattern    = regexp.MustCompile(`(?i)^["']?enabled["']?\s*:\s*false\b`)
 	// Devin prints `Disabled tools: waypost_recv, ...` for entries listed in
 	// the server's disabledTools configuration array.
 	disabledToolsPattern = regexp.MustCompile(`(?i)^disabled tools?:\s*(.+?)\s*$`)
 )
 
 func parseWaypostMCPStatus(output []byte) (waypostMCPStatus, error) {
+	clean := hookcore.StripANSI(string(output))
 	found := false
+	inWaypostSection := false
 	status := waypostMCPStatus{disabledTools: map[string]bool{}}
-	for _, line := range strings.Split(string(output), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "Server: "+waypostMCPServerName {
-			found = true
+	for _, line := range strings.Split(clean, "\n") {
+		lineWithoutCR := strings.TrimSuffix(line, "\r")
+		trimmed := strings.TrimSpace(lineWithoutCR)
+		isUnindented := lineWithoutCR != "" && lineWithoutCR[0] != ' ' && lineWithoutCR[0] != '\t'
+		if isUnindented {
+			if match := serverHeaderPattern.FindStringSubmatch(lineWithoutCR); match != nil {
+				inWaypostSection = strings.TrimSpace(match[1]) == waypostMCPServerName
+				if inWaypostSection {
+					found = true
+				}
+				continue
+			}
+		}
+		if !inWaypostSection {
 			continue
 		}
 		if disabledStatusPattern.MatchString(trimmed) ||

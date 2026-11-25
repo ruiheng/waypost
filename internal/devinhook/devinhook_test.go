@@ -1597,6 +1597,86 @@ func TestParseWaypostMCPStatusCanonicalizesNamespacedDisabledTools(t *testing.T)
 	}
 }
 
+func TestParseWaypostMCPStatusScopesToWaypostSection(t *testing.T) {
+	t.Parallel()
+
+	payload := strings.Join([]string{
+		"Server: other",
+		"  Disabled: true",
+		"  Disabled tools: waypost_recv",
+		"Server: waypost",
+		"  Command: waypost mcp",
+		"Server: third",
+		"Status: Disabled — disabled by user",
+		"Disabled tools: waypost_send",
+	}, "\n")
+	status, err := parseWaypostMCPStatus([]byte(payload))
+	if err != nil {
+		t.Fatalf("parseWaypostMCPStatus() error = %v", err)
+	}
+	if !status.available || len(status.disabledTools) != 0 {
+		t.Fatalf("status = %+v, want available=true and empty disabledTools", status)
+	}
+}
+
+func TestParseWaypostMCPStatusHandlesANSIAnchoredFlagsAndColumnZeroServer(t *testing.T) {
+	t.Parallel()
+
+	// ANSI escapes on column-0 header + disabled tools.
+	ansiPayload := "\x1b[1mServer:\x1b[0m \x1b[32mwaypost\x1b[0m\n\x1b[33mDisabled tools:\x1b[0m waypost_recv\n"
+	status, err := parseWaypostMCPStatus([]byte(ansiPayload))
+	if err != nil {
+		t.Fatalf("parseWaypostMCPStatus(ANSI) error = %v", err)
+	}
+	if !status.available || !status.disabledTools["waypost_recv"] {
+		t.Fatalf("status(ANSI) = %+v, want available=true and waypost_recv disabled", status)
+	}
+
+	// ANSI-colored Status: Disabled disables the server.
+	disabledPayload := "\x1b[1mServer: waypost\x1b[0m\n\x1b[31mStatus: Disabled — disabled by user\x1b[0m\n"
+	status, err = parseWaypostMCPStatus([]byte(disabledPayload))
+	if err != nil {
+		t.Fatalf("parseWaypostMCPStatus(ANSI disabled) error = %v", err)
+	}
+	if status.available {
+		t.Fatalf("status(ANSI disabled) = %+v, want available=false", status)
+	}
+
+	// Case-insensitive column-0 header and embedded disabled/enabled substrings do not false-trigger.
+	embeddedPayload := strings.Join([]string{
+		"server: waypost",
+		"    Command: waypost mcp --note 'disabled: true'",
+		"    Args: --flag enabled: false",
+	}, "\n")
+	status, err = parseWaypostMCPStatus([]byte(embeddedPayload))
+	if err != nil {
+		t.Fatalf("parseWaypostMCPStatus(embedded) error = %v", err)
+	}
+	if !status.available {
+		t.Fatalf("status(embedded) = %+v, want available=true (embedded substrings ignored)", status)
+	}
+
+	// Indented Server: waypost inside another server section is ignored.
+	indentedPayload := "Server: other\n    Server: waypost\n    Command: waypost mcp\n"
+	if _, err := parseWaypostMCPStatus([]byte(indentedPayload)); err == nil {
+		t.Fatal("parseWaypostMCPStatus(indented Server:) error = nil, want error")
+	}
+
+	// Column-0 empty Server: resets section before indented mimic.
+	resetPayload := "Server: waypost\nServer:\n    Disabled: true\n"
+	status, err = parseWaypostMCPStatus([]byte(resetPayload))
+	if err != nil {
+		t.Fatalf("parseWaypostMCPStatus(column-0 empty Server reset) error = %v", err)
+	}
+	if !status.available {
+		t.Fatalf("status(column-0 empty Server reset) = %+v, want available=true", status)
+	}
+
+	if !isMissingWaypostMCPError("\x1b[31mError: server \"waypost\" not found\x1b[0m") {
+		t.Fatal("isMissingWaypostMCPError(ANSI) = false, want true")
+	}
+}
+
 func TestCurrentDirectoryWaypostMCPAvailableTreatsMissingServerAsUnavailable(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test helper is a POSIX shell script")

@@ -120,7 +120,8 @@ func (m *sessionManager) selectSessionHost(ctx context.Context, override string)
 	if override != "" {
 		return parseSessionHost(override)
 	}
-	if sessionID, _ := detectCurrentThurboxSessionID(); sessionID != "" {
+	sessionID, thurboxWarnings := detectCurrentThurboxSessionID()
+	if sessionID != "" {
 		return sessionHostThurbox, nil
 	}
 
@@ -128,12 +129,16 @@ func (m *sessionManager) selectSessionHost(ctx context.Context, override string)
 	if strings.TrimSpace(snapshot.DetectedAgentDeckSession) != "" {
 		return sessionHostAgentDeck, nil
 	}
-	agentDeckSessionID, _, _, _, err := m.detectCurrentAgentDeckSessionID(ctx, snapshot.DetectedToolSessions["codex"], snapshot.DefaultWorkdir)
+	agentDeckSessionID, _, _, agentDeckWarnings, err := m.detectCurrentAgentDeckSessionID(ctx, snapshot.DetectedToolSessions["codex"], snapshot.DefaultWorkdir)
 	if err != nil {
 		return "", err
 	}
 	if strings.TrimSpace(agentDeckSessionID) != "" {
 		return sessionHostAgentDeck, nil
+	}
+	warnings := append(append([]string(nil), thurboxWarnings...), agentDeckWarnings...)
+	if len(warnings) > 0 {
+		return "", fmt.Errorf("session host is unknown; set host explicitly (%s)", strings.Join(warnings, "; "))
 	}
 	return "", errors.New("session host is unknown; set host explicitly")
 }
@@ -438,11 +443,11 @@ func (m *sessionManager) reverifyStartedHostSession(ctx context.Context, host se
 		return readyUnverifiedResult(previous, sessionRef, canonicalWorkdir, "post_start_output_unparseable", "", fmt.Sprintf("refreshed session id %q does not match started session id %q", refreshed.ID, previous.ID)), nil
 	}
 	if !hostSessionIsReady(host, refreshed) {
-		return readyUnverifiedResult(previous, sessionRef, canonicalWorkdir, "post_start_not_ready", refreshed.Path, "target session is not ready after start"), nil
+		return readyUnverifiedResult(refreshed, sessionRef, canonicalWorkdir, "post_start_not_ready", refreshed.Path, "target session is not ready after start"), nil
 	}
 	verification := verifyHostSessionWorkdir(refreshed, requestedWorkdir, canonicalWorkdir)
 	if verification.State != "verified" {
-		return readyUnverifiedResult(previous, sessionRef, canonicalWorkdir, postStartVerificationState(verification.State), verification.ObservedPath, verification.Err.Error()), nil
+		return readyUnverifiedResult(refreshed, sessionRef, canonicalWorkdir, postStartVerificationState(verification.State), verification.ObservedPath, verification.Err.Error()), nil
 	}
 	return readyVerifiedResult(refreshed, sessionRef, canonicalWorkdir, true), nil
 }

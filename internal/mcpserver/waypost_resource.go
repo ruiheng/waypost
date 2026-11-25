@@ -32,8 +32,12 @@ func (s *Service) registerWaypostOverviewResource(server *mcp.Server) {
 }
 
 func (s *Service) readWaypostOverviewResource(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
-	if req.Params.URI != waypostOverviewURI {
-		return nil, mcp.ResourceNotFoundError(req.Params.URI)
+	if req == nil || req.Params == nil || req.Params.URI != waypostOverviewURI {
+		uri := ""
+		if req != nil && req.Params != nil {
+			uri = req.Params.URI
+		}
+		return nil, mcp.ResourceNotFoundError(uri)
 	}
 
 	overview, err := s.waypostOverviewSnapshot(ctx)
@@ -54,18 +58,30 @@ func (s *Service) readWaypostOverviewResource(ctx context.Context, req *mcp.Read
 }
 
 func (s *Service) subscribeResource(_ context.Context, req *mcp.SubscribeRequest) error {
-	if req.Params.URI != waypostOverviewURI {
-		return mcp.ResourceNotFoundError(req.Params.URI)
+	if req == nil || req.Params == nil || req.Params.URI != waypostOverviewURI {
+		uri := ""
+		if req != nil && req.Params != nil {
+			uri = req.Params.URI
+		}
+		return mcp.ResourceNotFoundError(uri)
 	}
-	s.overviewSubscriptions.add(req.Session)
+	if req.Session != nil {
+		s.overviewSubscriptions.add(req.Session)
+	}
 	return nil
 }
 
 func (s *Service) unsubscribeResource(_ context.Context, req *mcp.UnsubscribeRequest) error {
-	if req.Params.URI != waypostOverviewURI {
-		return mcp.ResourceNotFoundError(req.Params.URI)
+	if req == nil || req.Params == nil || req.Params.URI != waypostOverviewURI {
+		uri := ""
+		if req != nil && req.Params != nil {
+			uri = req.Params.URI
+		}
+		return mcp.ResourceNotFoundError(uri)
 	}
-	s.overviewSubscriptions.remove(req.Session)
+	if req.Session != nil {
+		s.overviewSubscriptions.remove(req.Session)
+	}
 	return nil
 }
 
@@ -88,10 +104,11 @@ func (s *Service) waypostOverviewSnapshot(ctx context.Context) (map[string]any, 
 }
 
 func (s *Service) emitWaypostOverviewUpdated(ctx context.Context) notificationOutcome {
-	if !s.overviewSubscriptions.hasLiveSubscribers(s.Server()) {
+	server := s.existingServer()
+	if !s.overviewSubscriptions.hasLiveSubscribers(server) {
 		return notificationOutcome{Status: "unsupported", Scheme: string(WakeHintMCPResourceUpdated)}
 	}
-	if err := s.Server().ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: waypostOverviewURI}); err != nil {
+	if err := server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: waypostOverviewURI}); err != nil {
 		log.Printf("mcpserver waypost_overview_update_failed uri=%s err=%v", waypostOverviewURI, err)
 		return notificationOutcome{
 			Status: "failed",
@@ -122,6 +139,9 @@ func (s *resourceSubscriptionState) hasLiveSubscribers(server *mcp.Server) bool 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.sessions) == 0 {
+		return false
+	}
+	if server == nil {
 		return false
 	}
 	activeSessions := slices.Collect(server.Sessions())

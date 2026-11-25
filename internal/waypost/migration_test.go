@@ -908,6 +908,10 @@ func TestMigrateLegacyStateCopiesReadOnlyDatabaseAcrossFilesystems(t *testing.T)
 	root := t.TempDir()
 	source := filepath.Join(root, "legacy-state")
 	destination := filepath.Join(root, "waypost-state")
+	t.Cleanup(func() {
+		_ = os.Chmod(filepath.Join(source, legacyDatabaseFilename), 0o600)
+		_ = os.Chmod(filepath.Join(destination, databaseFilename), 0o600)
+	})
 	if err := os.MkdirAll(source, 0o700); err != nil {
 		t.Fatalf("MkdirAll(source) error = %v", err)
 	}
@@ -923,5 +927,194 @@ func TestMigrateLegacyStateCopiesReadOnlyDatabaseAcrossFilesystems(t *testing.T)
 	}
 	if got, err := os.ReadFile(filepath.Join(destination, databaseFilename)); err != nil || string(got) != "database" {
 		t.Fatalf("ReadFile(current database) = %q, %v; want database, nil", got, err)
+	}
+}
+
+func TestMigrateLegacyStateAllowsOpeningRetainedCopyWithoutDatabase(t *testing.T) {
+	if !keepMigrationRecoveryMarker() {
+		t.Skip("only platforms retaining a recovery marker hit no-database finalization")
+	}
+
+	root := t.TempDir()
+	source := filepath.Join(root, "legacy-state")
+	destination := filepath.Join(root, "waypost-state")
+	if err := os.MkdirAll(filepath.Join(source, blobsDirName), 0o700); err != nil {
+		t.Fatalf("MkdirAll(source) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, blobsDirName, "blob"), []byte("body"), 0o600); err != nil {
+		t.Fatalf("WriteFile(blob) error = %v", err)
+	}
+
+	result, err := migrateLegacyState(destination, source, crossDeviceRenameError)
+	if err != nil {
+		t.Fatalf("migrateLegacyState() error = %v", err)
+	}
+	if !result.SourceRetained {
+		t.Fatal("SourceRetained = false, want true")
+	}
+	marker, exists, err := readMigrationMarker(destination)
+	if err != nil {
+		t.Fatalf("readMigrationMarker() error = %v", err)
+	}
+	if !exists || marker.Stage != migrationStageCopyCommitted || !marker.NoDatabase {
+		t.Fatalf("marker = %+v (exists=%t), want stage=%q no_database=true", marker, exists, migrationStageCopyCommitted)
+	}
+
+	if err := ensureMigrationComplete(destination); err != nil {
+		t.Fatalf("ensureMigrationComplete() error = %v, want nil", err)
+	}
+	runtime, err := OpenRuntime(context.Background(), destination)
+	if err != nil {
+		t.Fatalf("OpenRuntime() error = %v", err)
+	}
+	_ = runtime.Close()
+}
+
+func TestEnsureMigrationCompleteAllowsSymlinkedStateDir(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	realDir := filepath.Join(base, "real-state")
+	if err := os.MkdirAll(realDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll(real) error = %v", err)
+	}
+	linkDir := filepath.Join(base, "link-state")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Skipf("os.Symlink unavailable on this environment: %v", err)
+	}
+
+	exists, err := runtimeStateDirectoryExists(linkDir, "current")
+	if err != nil || !exists {
+		t.Fatalf("runtimeStateDirectoryExists(symlink) = (%t, %v), want (true, nil)", exists, err)
+	}
+	if keepMigrationRecoveryMarker() {
+		marker := migrationMarker{
+			Version:     migrationMarkerVersion,
+			Source:      filepath.Join(base, "legacy"),
+			Destination: linkDir,
+			Stage:       migrationStageCopyCommitted,
+			NoDatabase:  true,
+		}
+		if err := writeMigrationMarker(linkDir, marker); err != nil {
+			t.Fatalf("writeMigrationMarker() error = %v", err)
+		}
+	}
+	if err := ensureMigrationComplete(linkDir); err != nil {
+		t.Fatalf("ensureMigrationComplete(symlink) error = %v, want nil", err)
+	}
+	runtime, err := OpenRuntime(context.Background(), linkDir)
+	if err != nil {
+		t.Fatalf("OpenRuntime(symlink) error = %v", err)
+	}
+	_ = runtime.Close()
+}
+
+func TestEnsureDefaultLegacyStateMigratedAllowsSymlinkedStateDir(t *testing.T) {
+	t.Setenv("WAYPOST_STATE_DIR", "")
+
+	base := t.TempDir()
+	realDir := filepath.Join(base, "real-state")
+	if err := os.MkdirAll(realDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll(real) error = %v", err)
+	}
+	linkDir := filepath.Join(base, "link-state")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Skipf("os.Symlink unavailable on this environment: %v", err)
+	}
+	if err := ensureDefaultLegacyStateMigrated("", linkDir); err != nil {
+		t.Fatalf("ensureDefaultLegacyStateMigrated(symlink) error = %v, want nil", err)
+	}
+}
+
+func TestMigrateLegacyStateIgnoresCorruptOwnershipWhenPrimaryMarkerExists(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	source := filepath.Join(base, "legacy")
+	destination := filepath.Join(base, "current")
+	if err := os.MkdirAll(filepath.Join(source, "blobs"), 0o700); err != nil {
+		t.Fatalf("MkdirAll(source) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "blobs", "sample.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatalf("WriteFile(source blob) error = %v", err)
+	}
+	if err := os.MkdirAll(destination, 0o700); err != nil {
+		t.Fatalf("MkdirAll(destination) error = %v", err)
+	}
+	marker := migrationMarker{
+		Version:     migrationMarkerVersion,
+		Source:      source,
+		Destination: destination,
+		Stage:       migrationStageCopying,
+	}
+	if err := writeMigrationMarker(destination, marker); err != nil {
+		t.Fatalf("writeMigrationMarker() error = %v", err)
+	}
+	if err := os.WriteFile(migrationOwnershipPath(destination), []byte("{corrupt"), 0o600); err != nil {
+		t.Fatalf("WriteFile(corrupt ownership) error = %v", err)
+	}
+
+	result, err := migrateLegacyState(destination, source, crossDeviceRenameError)
+	if err != nil {
+		t.Fatalf("migrateLegacyState() with corrupt ownership error = %v", err)
+	}
+	if result.Destination != destination {
+		t.Fatalf("Destination = %q, want %q", result.Destination, destination)
+	}
+	got, err := os.ReadFile(filepath.Join(destination, "blobs", "sample.txt"))
+	if err != nil || string(got) != "hello" {
+		t.Fatalf("copied blob = (%q, %v), want %q", string(got), err, "hello")
+	}
+}
+
+func TestRestartCopiedMigrationResetsNoDatabaseAndOwnershipDoesNotSeedIt(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	source := filepath.Join(base, "legacy")
+	destination := filepath.Join(base, "current")
+	if err := os.MkdirAll(source, 0o700); err != nil {
+		t.Fatalf("MkdirAll(source) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, legacyDatabaseFilename), []byte("placeholder"), 0o600); err != nil {
+		t.Fatalf("WriteFile(legacy db) error = %v", err)
+	}
+	if err := os.MkdirAll(destination, 0o700); err != nil {
+		t.Fatalf("MkdirAll(destination) error = %v", err)
+	}
+
+	seededMarker := migrationMarker{
+		Version:     migrationMarkerVersion,
+		Source:      source,
+		Destination: destination,
+		Stage:       migrationStageCopying,
+		NoDatabase:  true,
+	}
+	if err := writeMigrationOwnership(destination, seededMarker); err != nil {
+		t.Fatalf("writeMigrationOwnership() error = %v", err)
+	}
+	ownership, exists, err := readMigrationOwnership(destination)
+	if err != nil || !exists || ownership.NoDatabase {
+		t.Fatalf("ownership = (%+v, exists=%t, err=%v), want NoDatabase=false", ownership, exists, err)
+	}
+
+	usable, err := recoveryMarkerAllowsRuntime(seededMarker, destination)
+	if err != nil || usable {
+		t.Fatalf("recoveryMarkerAllowsRuntime(copying+NoDatabase) = (%t, %v), want (false, nil)", usable, err)
+	}
+
+	seededMarker.Stage = migrationStageCopyCommitted
+	if err := writeMigrationMarker(destination, seededMarker); err != nil {
+		t.Fatalf("writeMigrationMarker() error = %v", err)
+	}
+	if _, err := restartCopiedMigrationFromSource(seededMarker, source, destination, true); err != nil {
+		t.Fatalf("restartCopiedMigrationFromSource() error = %v", err)
+	}
+	afterMarker, afterExists, err := readMigrationMarker(destination)
+	if err != nil {
+		t.Fatalf("readMigrationMarker(after) error = %v", err)
+	}
+	if afterExists && afterMarker.NoDatabase {
+		t.Fatalf("after marker = %+v, want NoDatabase=false after restart from source with database", afterMarker)
 	}
 }

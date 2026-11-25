@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -2241,4 +2242,185 @@ func mustSendGroupMessage(t *testing.T, store *Store, toAddress, fromAddress, su
 		t.Fatalf("Send(group) error = %v", err)
 	}
 	return result
+}
+
+func TestLookupLatestGroupMembershipPrefersActiveOverClosedSameTimestamp(t *testing.T) {
+	t.Parallel()
+
+	runtime, store := newLeaseTestStore(t)
+	defer runtime.Close()
+
+	group, err := store.CreateGroup(context.Background(), "group/rejoin-order")
+	if err != nil {
+		t.Fatalf("CreateGroup() error = %v", err)
+	}
+	current := time.Date(2026, 4, 6, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return current }
+
+	first, err := store.AddGroupMember(context.Background(), group.Address, "alice")
+	if err != nil {
+		t.Fatalf("AddGroupMember(first) error = %v", err)
+	}
+	if _, err := store.RemoveGroupMember(context.Background(), group.Address, "alice"); err != nil {
+		t.Fatalf("RemoveGroupMember(first) error = %v", err)
+	}
+	rejoined, err := store.AddGroupMember(context.Background(), group.Address, "alice")
+	if err != nil {
+		t.Fatalf("AddGroupMember(rejoined) error = %v", err)
+	}
+	// Force lexicographically smaller membership_id on the active row while
+	// keeping identical joined_at timestamps so tie-breaking depends on left_at.
+	if _, err := runtime.DB().Exec(`
+UPDATE group_memberships
+SET membership_id = CASE
+  WHEN membership_id = ? THEN 'gm_zzzz_closed'
+  WHEN membership_id = ? THEN 'gm_0000_active'
+  ELSE membership_id
+END
+`, first.MembershipID, rejoined.MembershipID); err != nil {
+		t.Fatalf("rename membership_ids: %v", err)
+	}
+
+	latest, found, err := lookupLatestGroupMembershipByPerson(context.Background(), runtime.readDB, group.GroupID, "alice")
+	if err != nil {
+		t.Fatalf("lookupLatestGroupMembershipByPerson() error = %v", err)
+	}
+	if !found {
+		t.Fatal("lookupLatestGroupMembershipByPerson() found = false, want true")
+	}
+	if !latest.Active || latest.LeftAt != nil || latest.MembershipID != "gm_0000_active" {
+		t.Fatalf("latest membership = %+v, want active gm_0000_active", latest)
+	}
+}
+
+func TestLookupLatestGroupMembershipClosedVsClosedTieBreaksByLeftAt(t *testing.T) {
+	t.Parallel()
+
+	runtime, err := OpenRuntime(context.Background(), filepath.Join(t.TempDir(), "waypost-state"))
+	if err != nil {
+		t.Fatalf("OpenRuntime() error = %v", err)
+	}
+	defer runtime.Close()
+
+	store := runtime.Store()
+	group, err := store.CreateGroup(context.Background(), "group/closed-tiebreak")
+	if err != nil {
+		t.Fatalf("CreateGroup() error = %v", err)
+	}
+
+	fixed := time.Date(2026, 7, 25, 10, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return fixed }
+
+	olderClosed, err := store.AddGroupMember(context.Background(), group.Address, "alice")
+	if err != nil {
+		t.Fatalf("AddGroupMember(older) error = %v", err)
+	}
+	fixed = fixed.Add(time.Minute)
+	if _, err := store.RemoveGroupMember(context.Background(), group.Address, "alice"); err != nil {
+		t.Fatalf("RemoveGroupMember(older) error = %v", err)
+	}
+
+	fixed = time.Date(2026, 7, 25, 10, 0, 0, 0, time.UTC)
+	newerClosed, err := store.AddGroupMember(context.Background(), group.Address, "alice")
+	if err != nil {
+		t.Fatalf("AddGroupMember(newer) error = %v", err)
+	}
+	fixed = fixed.Add(5 * time.Minute)
+	if _, err := store.RemoveGroupMember(context.Background(), group.Address, "alice"); err != nil {
+		t.Fatalf("RemoveGroupMember(newer) error = %v", err)
+	}
+
+	// Give the older closed row a larger membership_id while keeping identical
+	// joined_at so tie-breaking must prefer newer left_at.
+	if _, err := runtime.DB().Exec(`
+UPDATE group_memberships
+SET membership_id = CASE
+  WHEN membership_id = ? THEN 'gm_zzzz_older_closed'
+  WHEN membership_id = ? THEN 'gm_0000_newer_closed'
+  ELSE membership_id
+END
+`, olderClosed.MembershipID, newerClosed.MembershipID); err != nil {
+		t.Fatalf("rename membership_ids: %v", err)
+	}
+
+	latest, found, err := lookupLatestGroupMembershipByPerson(context.Background(), runtime.readDB, group.GroupID, "alice")
+	if err != nil {
+		t.Fatalf("lookupLatestGroupMembershipByPerson() error = %v", err)
+	}
+	if !found {
+		t.Fatal("lookupLatestGroupMembershipByPerson() found = false, want true")
+	}
+	if latest.Active || latest.LeftAt == nil || latest.MembershipID != "gm_0000_newer_closed" {
+		t.Fatalf("latest membership = %+v, want closed gm_0000_newer_closed", latest)
+	}
+}
+
+func TestReceiveGroupMessageConcurrentReadCountAccurate(t *testing.T) {
+	t.Parallel()
+
+	runtime, err := OpenRuntime(context.Background(), filepath.Join(t.TempDir(), "waypost-state"))
+	if err != nil {
+		t.Fatalf("OpenRuntime() error = %v", err)
+	}
+	defer runtime.Close()
+
+	store := runtime.Store()
+	group, err := store.CreateGroup(context.Background(), "group/concurrent-reads")
+	if err != nil {
+		t.Fatalf("CreateGroup() error = %v", err)
+	}
+	for _, person := range []string{"alice", "bob"} {
+		if _, err := store.AddGroupMember(context.Background(), group.Address, person); err != nil {
+			t.Fatalf("AddGroupMember(%s) error = %v", person, err)
+		}
+	}
+	if _, err := store.Send(context.Background(), SendParams{
+		ToAddress:     group.Address,
+		FromAddress:   "agent/sender",
+		Subject:       "sync read",
+		ContentType:   "text/plain",
+		SchemaVersion: "v1",
+		Body:          []byte("concurrent payload"),
+		Group:         true,
+	}); err != nil {
+		t.Fatalf("Send(group) error = %v", err)
+	}
+
+	counts := make(chan int, 2)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for _, person := range []string{"alice", "bob"} {
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			<-start
+			msg, err := store.ReceiveGroupMessage(context.Background(), GroupReceiveParams{
+				Address: group.Address,
+				Person:  p,
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+			counts <- msg.ReadCount
+		}(person)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	close(counts)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent ReceiveGroupMessage() error = %v", err)
+		}
+	}
+
+	got := make([]int, 0, 2)
+	for c := range counts {
+		got = append(got, c)
+	}
+	if len(got) != 2 || !((got[0] == 1 && got[1] == 2) || (got[0] == 2 && got[1] == 1)) {
+		t.Fatalf("concurrent ReadCount values = %v, want permutation of [1 2]", got)
+	}
 }

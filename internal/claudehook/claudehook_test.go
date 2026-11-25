@@ -689,6 +689,88 @@ To remove this server, run: claude mcp remove "waypost" -s user
 	}
 }
 
+func TestParseWaypostMCPAvailableScopesToWaypostSection(t *testing.T) {
+	t.Parallel()
+
+	output := "other:\n  Status: ✘ Failed\nwaypost:\n  Status: ✔ Connected\nanother:\n  Status: ✘ Failed\n"
+	available, err := parseWaypostMCPAvailable([]byte(output))
+	if err != nil {
+		t.Fatalf("parseWaypostMCPAvailable() error = %v", err)
+	}
+	if !available {
+		t.Fatal("parseWaypostMCPAvailable() = false, want true from waypost section only")
+	}
+}
+
+func TestParseWaypostMCPAvailableHandlesANSIAndIgnoresIndentedMimic(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		output    string
+		want      bool
+		wantError bool
+	}{
+		{
+			name:   "ansi colored connected",
+			output: "\x1b[1mwaypost:\x1b[0m\n  Scope: User config\n  \x1b[32mStatus:\x1b[0m \x1b[32m✔ Connected\x1b[0m\n",
+			want:   true,
+		},
+		{
+			name:   "ansi colored with tput sgr0 charset reset",
+			output: "\x1b[1mwaypost:\x1b(B\x1b[m\n  Scope: User config\n  \x1b[32mStatus:\x1b(B\x1b[m \x1b[32m✔ Connected\x1b(B\x1b[m\n",
+			want:   true,
+		},
+		{
+			name:   "ansi colored with tput reset RIS sequence",
+			output: "\x1bc\x1b[1mwaypost:\x1b[0m\n  Scope: User config\n  \x1b[32mStatus:\x1b[0m \x1b[32m✔ Connected\x1b[0m\n",
+			want:   true,
+		},
+		{
+			name:   "ansi colored with enacs DEC line-drawing final byte 0",
+			output: "\x1b(B\x1b)0waypost:\n  Scope: User config\n  Status: ✔ Connected\n",
+			want:   true,
+		},
+		{
+			name:   "ansi colored failed",
+			output: "\x1b[1mwaypost:\x1b[0m\n  \x1b[31mStatus: ✘ Failed to connect\x1b[0m\n",
+			want:   false,
+		},
+		{
+			name:   "ansi colored missing server",
+			output: "\x1b[31mNo MCP server found with name: waypost\x1b[0m\n",
+			want:   false,
+		},
+		{
+			name:      "indented mimic under another server is ignored",
+			output:    "other:\n  waypost:\n    Status: ✔ Connected\n",
+			wantError: true,
+		},
+		{
+			name:   "indented mimic before column-0 waypost section does not hijack",
+			output: "other:\n  waypost:\n    Status: ✔ Connected\nwaypost:\n  Status: ✘ Failed to connect\n",
+			want:   false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			available, err := parseWaypostMCPAvailable([]byte(tc.output))
+			if tc.wantError {
+				if err == nil {
+					t.Fatal("parseWaypostMCPAvailable() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseWaypostMCPAvailable() error = %v", err)
+			}
+			if available != tc.want {
+				t.Fatalf("parseWaypostMCPAvailable() = %v, want %v", available, tc.want)
+			}
+		})
+	}
+}
+
 func TestIsMissingWaypostMCPError(t *testing.T) {
 	t.Parallel()
 

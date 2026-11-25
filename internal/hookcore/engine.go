@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"slices"
 	"strings"
 )
 
@@ -225,28 +226,32 @@ func HandleHookEvent(
 		if err != nil {
 			return err
 		}
-		tool, guarded := WaypostMCPTool(command)
-		if !guarded {
+		tools := WaypostMCPTools(command)
+		if len(tools) == 0 {
 			if LooksLikeWaypostWaitCommand(command) {
 				return WriteHookContext(w, "PreToolUse", WaitPollingContext)
 			}
 			return nil
 		}
-		reason := WaypostCommandDenialReason(tool, spec.ServerDenialReason)
-		if tool == "" {
+		if slices.Contains(tools, "") {
 			// `waypost mcp` is always denied; the harness manages the server.
-			return spec.EmitDeny(w, reason)
+			return spec.EmitDeny(w, WaypostCommandDenialReason("", spec.ServerDenialReason))
 		}
 		record, err := ProbeAndCache(ctx, sessionID, probe, store)
 		if err != nil {
 			return spec.EmitProbeFailure(w, err)
 		}
-		if !MCPToolUsable(record, tool) {
-			// The MCP tool is absent or disabled; keep the CLI fallback
-			// usable.
-			return nil
+		for _, tool := range tools {
+			if MCPToolUsable(record, tool) {
+				return spec.EmitDeny(w, WaypostCommandDenialReason(tool, spec.ServerDenialReason))
+			}
 		}
-		return spec.EmitDeny(w, reason)
+		// None of the guarded MCP tools are usable; keep the CLI fallback
+		// usable (and still nudge against polling if `waypost wait` is present).
+		if LooksLikeWaypostWaitCommand(command) {
+			return WriteHookContext(w, "PreToolUse", WaitPollingContext)
+		}
+		return nil
 	case input.HookEventName == "SessionEnd":
 		if sessionID == "" {
 			return nil
